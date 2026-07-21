@@ -82,8 +82,12 @@ function VoiceboxView() {
       setVoices(await res.json());
 
       if (!skipConfig) {
-        const cfg = await window.hermesDesktop.api({ path: '/api/config', method: 'GET' });
-        setActiveVoiceId(cfg?.tts?.providers?.voicebox?.voice || '');
+        try {
+          const cfg = await window.hermesDesktop.api({ path: '/api/config', method: 'GET' });
+          setActiveVoiceId(cfg?.tts?.providers?.voicebox?.voice || '');
+        } catch (cfgErr) {
+          console.warn('Skipped initial config read (config store busy):', cfgErr);
+        }
       }
     } catch (err) {
       console.error(err);
