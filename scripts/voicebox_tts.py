@@ -183,12 +183,20 @@ def main():
     profile_id = args.voice
     if not profile_id or profile_id in ("default", "undefined", ""):
         try:
-            profiles = _get_json(f"{base_url}/profiles")
-            if profiles:
-                profile_id = profiles[0]["id"]
+            # Try to get the active voice from the backend
+            active_data = _get_json(f"{base_url}/settings/active-voice")
+            active_id = active_data.get("voice_id")
+            
+            if active_id:
+                profile_id = active_id
             else:
-                print("Error: No voice profiles available.", file=sys.stderr)
-                sys.exit(1)
+                # Fallback to the first available profile
+                profiles = _get_json(f"{base_url}/profiles")
+                if profiles:
+                    profile_id = profiles[0]["id"]
+                else:
+                    print("Error: No voice profiles available.", file=sys.stderr)
+                    sys.exit(1)
         except Exception as e:
             print(f"Error resolving fallback profile: {e}", file=sys.stderr)
             sys.exit(1)
