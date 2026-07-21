@@ -93,8 +93,15 @@ function VoiceboxView() {
   };
 
   useEffect(() => {
-    fetchProfilesAndConfig();
-    return () => { if (playbackAudioRef.current) playbackAudioRef.current.pause(); };
+    // Delay initial fetch to avoid clashes with Hermes's startup configuration transactions
+    const timer = setTimeout(() => {
+      fetchProfilesAndConfig();
+    }, 2000);
+
+    return () => {
+      clearTimeout(timer);
+      if (playbackAudioRef.current) playbackAudioRef.current.pause();
+    };
   }, []);
 
   // ── Active voice selection ───────────────────
