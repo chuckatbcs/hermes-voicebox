@@ -179,7 +179,25 @@ def main():
         print("Warning: Empty text, skipping generation.", file=sys.stderr)
         sys.exit(0)
 
-    # 2. Resolve profile ID
+    # 2. Ensure Voicebox service is running
+    import time
+    import subprocess
+    
+    def _ensure_service_running():
+        try:
+            _get_json(f"{base_url}/health")
+            return
+        except Exception:
+            # Try to start systemd service if available
+            try:
+                subprocess.run(["systemctl", "--user", "start", "voicebox"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(3)
+            except Exception:
+                pass
+
+    _ensure_service_running()
+
+    # 2b. Resolve profile ID
     profile_id = args.voice
     if not profile_id or profile_id in ("default", "undefined", "", "00000000-0000-0000-0000-000000000000"):
         try:
