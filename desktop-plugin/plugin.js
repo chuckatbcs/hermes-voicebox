@@ -433,7 +433,7 @@ function VoiceboxView() {
           React.createElement('span', { className: 'font-semibold text-foreground text-sm' }, '🎙️ Voice Cloning Guidelines'),
           React.createElement('ul', { className: 'list-disc pl-4 flex flex-col gap-1' }, [
             React.createElement('li', {}, 'Formats: .wav, .mp3, .m4a, .ogg, .flac, .aac, .webm, .opus — max 50 MB.'),
-            React.createElement('li', {}, 'Record a clean 10–30s audio sample using your OS recorder.'),
+            React.createElement('li', {}, 'Record a clean 10–120s audio sample using your OS recorder.'),
             React.createElement('li', {}, 'Ensure the reference text above matches the spoken audio exactly.')
           ])
         ]),
