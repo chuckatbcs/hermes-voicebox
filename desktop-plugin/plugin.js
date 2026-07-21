@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, host } from '@hermes/plugin-sdk';
 
 const BACKEND_URL = 'http://localhost:17493';
@@ -47,10 +47,45 @@ const CLONING_ENGINE_OPTIONS = [
   { value: 'chatterbox_turbo', label: 'Chatterbox Turbo',    badge: '🟡', vram: '~4 GB',    note: 'Fast English cloning' },
 ];
 
+// ── Helpers ────────────────────────────────────
+function getVoiceEngine(voice) {
+  return voice?.preset_engine || voice?.default_engine || (voice?.voice_type === 'preset' ? 'kokoro' : 'qwen');
+}
+
+function getEngineMeta(voice) {
+  const eng = getVoiceEngine(voice);
+  return { engine: eng, meta: ENGINE_META[eng] || { badge: '⚪', label: eng, vram: '' } };
+}
+
 function engineBadge(voice) {
-  const eng = voice.preset_engine || voice.default_engine || (voice.voice_type === 'preset' ? 'kokoro' : 'qwen');
-  const meta = ENGINE_META[eng] || { badge: '⚪', label: eng };
+  const { meta } = getEngineMeta(voice);
   return `${meta.badge} ${meta.label}`;
+}
+
+function formatDuration(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+// ─────────────────────────────────────────────
+// Resolve the scripts directory dynamically.
+// Uses hermesDesktop.getPath('home') if available,
+// falls back to a platform-aware $HOME/.hermes path.
+// ─────────────────────────────────────────────
+function buildTtsCommand(voiceId) {
+  // Use a portable {scripts_dir} approach: the installer places the script
+  // at ~/.hermes/scripts/voicebox_tts.py on every platform.
+  // We resolve ~ at runtime.
+  const home = typeof process !== 'undefined' && process.env?.HOME
+    ? process.env.HOME
+    : (typeof process !== 'undefined' && process.env?.USERPROFILE
+      ? process.env.USERPROFILE
+      : '~');
+  const sep = home.includes('\\') ? '\\' : '/';
+  const scriptPath = `${home}${sep}.hermes${sep}scripts${sep}voicebox_tts.py`;
+  const python = home.includes('\\') ? 'python' : 'python3';
+  return `${python} ${scriptPath} --text-file {input_path} --out {output_path} --voice {voice}`;
 }
 
 // ─────────────────────────────────────────────
@@ -69,32 +104,42 @@ function VoiceboxView() {
   const [fileName, setFileName]           = useState('');
   const [audioUrl, setAudioUrl]           = useState(null);
   const [audioBlob, setAudioBlob]         = useState(null);
+  const [audioDuration, setAudioDuration] = useState(null);
   const [isSaving, setIsSaving]           = useState(false);
   const [isPlaying, setIsPlaying]         = useState(false);
 
+  // Connection & loading state
+  const [isLoading, setIsLoading]         = useState(true);
+  const [isConnected, setIsConnected]     = useState(null); // null = unknown, true/false
+
   const playbackAudioRef = useRef(null);
+  const deleteTimerRef   = useRef(null);
 
   // ── Fetch profiles + active config ──────────
-  const fetchProfilesAndConfig = async (skipConfig = false) => {
+  const fetchProfilesAndConfig = useCallback(async (skipConfig = false) => {
     try {
       const res = await fetch(`${BACKEND_URL}/profiles`);
       if (!res.ok) throw new Error('Failed to fetch profiles');
       setVoices(await res.json());
+      setIsConnected(true);
 
       if (!skipConfig) {
         try {
           const cfg = await window.hermesDesktop.api({ path: '/api/config', method: 'GET' });
           setActiveVoiceId(cfg?.tts?.providers?.voicebox?.voice || '');
         } catch (cfgErr) {
-          console.warn('Skipped initial config read (config store busy):', cfgErr);
+          console.warn('Skipped config read (store busy):', cfgErr);
         }
       }
     } catch (err) {
       console.error(err);
+      setIsConnected(false);
       host.notify({ kind: 'error', title: 'Voicebox Connection Failed',
         message: 'Could not connect to Voicebox backend. Is it running?' });
+    } finally {
+      setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     // Delay initial fetch to avoid clashes with Hermes's startup configuration transactions
@@ -104,16 +149,25 @@ function VoiceboxView() {
 
     return () => {
       clearTimeout(timer);
+      if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
       if (playbackAudioRef.current) playbackAudioRef.current.pause();
     };
-  }, []);
+  }, [fetchProfilesAndConfig]);
+
+  // ── Auto-cancel delete confirmation after 5 seconds ──
+  useEffect(() => {
+    if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
+    if (deleteConfirmId) {
+      deleteTimerRef.current = setTimeout(() => setDeleteConfirmId(null), 5000);
+    }
+    return () => { if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current); };
+  }, [deleteConfirmId]);
 
   // ── Active voice selection ───────────────────
   const handleVoiceChange = async (voiceId) => {
     if (!voiceId) return;
     const voice = voices.find(v => v.id === voiceId);
-    const engine = voice?.preset_engine || voice?.default_engine || (voice?.voice_type === 'preset' ? 'kokoro' : 'qwen');
-    const meta = ENGINE_META[engine] || {};
+    const { engine, meta } = getEngineMeta(voice);
     try {
       setActiveVoiceId(voiceId);
       await window.hermesDesktop.api({
@@ -125,7 +179,7 @@ function VoiceboxView() {
               providers: {
                 voicebox: {
                   type: 'command',
-                  command: 'python3 /home/chuck/.hermes/scripts/voicebox_tts.py --text-file {input_path} --out {output_path} --voice {voice}',
+                  command: buildTtsCommand(voiceId),
                   voice: voiceId,
                   output_format: 'wav'
                 }
@@ -156,7 +210,11 @@ function VoiceboxView() {
       }
       setDeleteConfirmId(null);
       host.notify({ kind: 'success', title: 'Voice Deleted', message: 'Profile removed successfully.' });
-      await fetchProfilesAndConfig();
+
+      // Refresh list without touching the potentially busy config store
+      await fetchProfilesAndConfig(true);
+      // Delayed background sync for active state
+      setTimeout(() => { fetchProfilesAndConfig(false).catch(() => {}); }, 800);
     } catch (err) {
       host.notify({ kind: 'error', title: 'Delete Failed', message: err.message });
     } finally {
@@ -186,6 +244,7 @@ function VoiceboxView() {
       const baseName = nameWithExt.substring(0, nameWithExt.lastIndexOf('.')) || nameWithExt;
       
       setFileName(nameWithExt);
+      setAudioDuration(null);
       if (!cloneName.trim()) {
         setCloneName(baseName.replace(/[_-]/g, ' '));
       }
@@ -199,6 +258,17 @@ function VoiceboxView() {
 
       setAudioBlob(blob);
       setAudioUrl(dataUrl);
+
+      // Decode audio to get duration
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const arrayBuf = await blob.arrayBuffer();
+        const decoded = await audioCtx.decodeAudioData(arrayBuf);
+        setAudioDuration(decoded.duration);
+        audioCtx.close();
+      } catch (durErr) {
+        console.warn('Could not decode audio duration:', durErr);
+      }
     } catch (err) {
       console.error(err);
       host.notify({ kind: 'error', title: 'File Read Failed', message: err.message });
@@ -228,18 +298,22 @@ function VoiceboxView() {
       host.notify({ kind: 'warning', title: 'Audio Required', message: 'Upload a sample first.' }); return;
     }
     const engineMeta = ENGINE_META[cloneEngine] || {};
+    const savedName = cloneName.trim(); // Capture before state reset
     setIsSaving(true);
+
+    let createdProfileId = null;
     try {
       // 1. Create profile — set default_engine at creation time
       const createRes = await fetch(`${BACKEND_URL}/profiles`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: cloneName.trim(), default_engine: cloneEngine })
+        body: JSON.stringify({ name: savedName, default_engine: cloneEngine })
       });
       if (!createRes.ok) {
         const errData = await createRes.json().catch(() => ({}));
         throw new Error(errData.detail || `Server returned ${createRes.status}`);
       }
       const profile = await createRes.json();
+      createdProfileId = profile.id;
 
       // 2. Upload sample
       const form = new FormData();
@@ -251,22 +325,32 @@ function VoiceboxView() {
         throw new Error(errData.detail || `Audio upload returned ${uploadRes.status}`);
       }
 
+      // Upload succeeded — profile is no longer orphaned
+      createdProfileId = null;
+
       // 3. Set as active
       await handleVoiceChange(profile.id);
 
       // 4. Reset
-      setCloneName(''); setFileName(''); setAudioBlob(null); setAudioUrl(null);
+      setCloneName(''); setFileName(''); setAudioBlob(null); setAudioUrl(null); setAudioDuration(null);
       host.notify({ kind: 'success', title: 'Voice Cloned!',
-        message: `"${cloneName}" created using ${engineMeta.label || cloneEngine} (${engineMeta.vram || '?'} VRAM).` });
+        message: `"${savedName}" created using ${engineMeta.label || cloneEngine} (${engineMeta.vram || '?'} VRAM).` });
       
       // Load list immediately without touching the busy config store
       await fetchProfilesAndConfig(true);
       
       // Sync active state in the background after the config transaction finishes
-      setTimeout(() => {
-        fetchProfilesAndConfig(false).catch(() => {});
-      }, 800);
+      setTimeout(() => { fetchProfilesAndConfig(false).catch(() => {}); }, 800);
     } catch (err) {
+      // Clean up orphaned profile if it was created but sample upload failed
+      if (createdProfileId) {
+        try {
+          await fetch(`${BACKEND_URL}/profiles/${createdProfileId}`, { method: 'DELETE' });
+          console.warn(`Cleaned up orphaned profile ${createdProfileId}`);
+        } catch (cleanupErr) {
+          console.error('Failed to clean up orphaned profile:', cleanupErr);
+        }
+      }
       host.notify({ kind: 'error', title: 'Cloning Failed', message: err.message });
     } finally {
       setIsSaving(false);
@@ -275,14 +359,62 @@ function VoiceboxView() {
 
   const selectedEngineMeta = ENGINE_META[cloneEngine] || {};
 
+  // ── Loading state ────────────────────────────
+  if (isLoading) {
+    return React.createElement('div',
+      { className: 'flex flex-col items-center justify-center h-full gap-4 text-muted-foreground' },
+      React.createElement('div', { className: 'animate-pulse flex flex-col items-center gap-3' }, [
+        React.createElement('div', { key: 'icon', className: 'text-4xl' }, '🎙️'),
+        React.createElement('p', { key: 'msg', className: 'text-sm font-medium' }, 'Connecting to Voicebox...'),
+        React.createElement('div', { key: 'bar', className: 'w-32 h-1 bg-muted rounded-full overflow-hidden' },
+          React.createElement('div', { className: 'h-full w-1/2 bg-primary/40 rounded-full animate-pulse' })
+        )
+      ])
+    );
+  }
+
+  // ── Connection status dot ────────────────────
+  const statusDot = React.createElement('span', {
+    key: 'status-dot',
+    className: `inline-block w-2 h-2 rounded-full mr-2 ${
+      isConnected === true ? 'bg-green-500' : isConnected === false ? 'bg-red-500' : 'bg-yellow-500'
+    }`,
+    title: isConnected === true ? 'Connected to Voicebox' : isConnected === false ? 'Disconnected' : 'Checking...'
+  });
+
+  // ── Duration badge helper ────────────────────
+  const durationBadge = audioDuration != null
+    ? React.createElement('span', {
+        key: 'dur',
+        className: `text-xs px-2 py-0.5 rounded-full font-mono ${
+          audioDuration >= 2 && audioDuration <= 120
+            ? 'bg-green-500/10 text-green-400 border border-green-500/30'
+            : 'bg-red-500/10 text-red-400 border border-red-500/30'
+        }`
+      }, `${formatDuration(audioDuration)}${audioDuration < 2 ? ' (too short)' : audioDuration > 120 ? ' (too long)' : ''}`)
+    : null;
+
   return React.createElement('div',
     { className: 'flex flex-col gap-6 p-8 max-w-2xl mx-auto h-full overflow-y-auto' },
     [
       // ── Header ──────────────────────────────
       React.createElement('div', { key: 'header', className: 'flex flex-col gap-1 border-b border-border pb-4' }, [
-        React.createElement('h1', { className: 'text-3xl font-bold tracking-tight' }, 'Voicebox Control'),
-        React.createElement('p', { className: 'text-muted-foreground text-sm' },
-          'Smart engine routing — each voice uses the right model automatically.')
+        React.createElement('div', { key: 'title-row', className: 'flex items-center gap-2' }, [
+          statusDot,
+          React.createElement('h1', { key: 'title', className: 'text-3xl font-bold tracking-tight' }, 'Voicebox Control'),
+        ]),
+        React.createElement('p', { key: 'desc', className: 'text-muted-foreground text-sm' },
+          'Smart engine routing — each voice uses the right model automatically.'),
+        isConnected === false && React.createElement('div', {
+          key: 'reconnect',
+          className: 'flex items-center gap-2 mt-2 text-xs text-red-400'
+        }, [
+          React.createElement('span', { key: 'msg' }, 'Backend unreachable.'),
+          React.createElement(Button, {
+            key: 'retry', variant: 'outline', size: 'sm',
+            onClick: () => { setIsLoading(true); fetchProfilesAndConfig(); }
+          }, '🔄 Retry')
+        ])
       ]),
 
       // ── Engine legend ────────────────────────
@@ -300,13 +432,13 @@ function VoiceboxView() {
 
       // ── Active Voice Selection ───────────────
       React.createElement('div', { key: 'switcher-card', className: 'flex flex-col gap-4 bg-card border border-border rounded-lg p-6 shadow-sm' }, [
-        React.createElement('h2', { className: 'text-xl font-semibold' }, 'Active Voice'),
-        React.createElement('div', { className: 'flex flex-col gap-2' }, [
-          React.createElement('label', { className: 'text-sm font-medium text-muted-foreground' }, 'Select Voice Profile'),
-          React.createElement(Select, { value: activeVoiceId, onValueChange: handleVoiceChange },
-            React.createElement(SelectTrigger, { className: 'w-full h-10' }, [
+        React.createElement('h2', { key: 'h', className: 'text-xl font-semibold' }, 'Active Voice'),
+        React.createElement('div', { key: 'body', className: 'flex flex-col gap-2' }, [
+          React.createElement('label', { key: 'lbl', className: 'text-sm font-medium text-muted-foreground' }, 'Select Voice Profile'),
+          React.createElement(Select, { key: 'sel', value: activeVoiceId, onValueChange: handleVoiceChange },
+            React.createElement(SelectTrigger, { className: 'w-full h-10' },
               React.createElement(SelectValue, { placeholder: 'Select a voice...' })
-            ]),
+            ),
             React.createElement(SelectContent, {},
               voices.map(v =>
                 React.createElement(SelectItem, { key: v.id, value: v.id },
@@ -318,10 +450,9 @@ function VoiceboxView() {
           activeVoiceId && (() => {
             const v = voices.find(x => x.id === activeVoiceId);
             if (!v) return null;
-            const eng = v.preset_engine || v.default_engine || (v.voice_type === 'preset' ? 'kokoro' : 'qwen');
-            const meta = ENGINE_META[eng] || {};
+            const { engine, meta } = getEngineMeta(v);
             return React.createElement('p', { key: 'active-info', className: 'text-xs text-muted-foreground mt-1' },
-              `${meta.badge || '⚪'} Using ${meta.label || eng}  •  ${meta.vram || '?'} VRAM  •  ${meta.description || ''}`
+              `${meta.badge || '⚪'} Using ${meta.label || engine}  •  ${meta.vram || '?'} VRAM  •  ${meta.description || ''}`
             );
           })()
         ])
@@ -329,31 +460,38 @@ function VoiceboxView() {
 
       // ── Manage Voices ────────────────────────
       React.createElement('div', { key: 'manage-card', className: 'flex flex-col gap-4 bg-card border border-border rounded-lg p-6 shadow-sm' }, [
-        React.createElement('h2', { className: 'text-xl font-semibold' }, 'Manage Voices'),
+        React.createElement('h2', { key: 'h', className: 'text-xl font-semibold' }, 'Manage Voices'),
         voices.length === 0
-          ? React.createElement('p', { className: 'text-sm text-muted-foreground italic' }, 'No voice profiles found.')
-          : React.createElement('div', { className: 'flex flex-col gap-2' },
+          ? React.createElement('p', { key: 'empty', className: 'text-sm text-muted-foreground italic' }, 'No voice profiles found.')
+          : React.createElement('div', { key: 'list', className: 'flex flex-col gap-2' },
               voices.map(v => {
-                const eng  = v.preset_engine || v.default_engine || (v.voice_type === 'preset' ? 'kokoro' : 'qwen');
-                const meta = ENGINE_META[eng] || { badge: '⚪', label: eng, vram: '' };
+                const { engine, meta } = getEngineMeta(v);
                 return React.createElement('div', {
                   key: v.id,
-                  className: `flex items-center justify-between rounded-md px-4 py-3 border ${v.id === activeVoiceId ? 'border-primary bg-primary/5' : 'border-border bg-muted/20'}`
+                  className: `flex items-center justify-between rounded-md px-4 py-3 border transition-colors ${v.id === activeVoiceId ? 'border-primary bg-primary/5' : 'border-border bg-muted/20 hover:bg-muted/30'}`
                 }, [
                   React.createElement('div', { key: 'info', className: 'flex items-center gap-2 min-w-0 flex-wrap' }, [
-                    React.createElement('span', { className: 'font-medium text-sm truncate' }, v.name),
+                    React.createElement('span', { key: 'name', className: 'font-medium text-sm truncate' }, v.name),
                     v.id === activeVoiceId && React.createElement('span', {
+                      key: 'active',
                       className: 'text-xs bg-primary text-primary-foreground rounded-full px-2 py-0.5 shrink-0'
                     }, 'Active'),
                     React.createElement('span', {
+                      key: 'eng',
                       className: 'text-xs text-muted-foreground shrink-0 font-mono'
                     }, `${meta.badge} ${meta.label}`),
                     React.createElement('span', {
+                      key: 'vram',
                       className: 'text-xs text-muted-foreground/60 shrink-0'
                     }, meta.vram),
                     React.createElement('span', {
+                      key: 'type',
                       className: 'text-xs text-muted-foreground/50 shrink-0'
-                    }, v.voice_type === 'preset' ? '⭐ Preset' : '🎙️ Cloned')
+                    }, v.voice_type === 'preset' ? '⭐ Preset' : '🎙️ Cloned'),
+                    v.samples_count === 0 && React.createElement('span', {
+                      key: 'warn',
+                      className: 'text-xs text-red-400 shrink-0'
+                    }, '⚠️ No samples')
                   ]),
                   React.createElement('div', { key: 'actions', className: 'flex items-center gap-2 shrink-0 ml-3' },
                     deleteConfirmId === v.id
@@ -381,15 +519,15 @@ function VoiceboxView() {
 
       // ── Clone New Voice ──────────────────────
       React.createElement('div', { key: 'cloner-card', className: 'flex flex-col gap-4 bg-card border border-border rounded-lg p-6 shadow-sm' }, [
-        React.createElement('h2', { className: 'text-xl font-semibold' }, 'Clone New Voice'),
+        React.createElement('h2', { key: 'h', className: 'text-xl font-semibold' }, 'Clone New Voice'),
 
         // Engine selector
-        React.createElement('div', { className: 'flex flex-col gap-2' }, [
-          React.createElement('label', { className: 'text-sm font-medium text-muted-foreground' }, 'Cloning Model'),
-          React.createElement(Select, { value: cloneEngine, onValueChange: setCloneEngine },
-            React.createElement(SelectTrigger, { className: 'w-full h-10' }, [
+        React.createElement('div', { key: 'engine', className: 'flex flex-col gap-2' }, [
+          React.createElement('label', { key: 'lbl', className: 'text-sm font-medium text-muted-foreground' }, 'Cloning Model'),
+          React.createElement(Select, { key: 'sel', value: cloneEngine, onValueChange: setCloneEngine },
+            React.createElement(SelectTrigger, { className: 'w-full h-10' },
               React.createElement(SelectValue, { placeholder: 'Select cloning engine...' })
-            ]),
+            ),
             React.createElement(SelectContent, {},
               CLONING_ENGINE_OPTIONS.map(opt =>
                 React.createElement(SelectItem, { key: opt.value, value: opt.value },
@@ -399,6 +537,7 @@ function VoiceboxView() {
             )
           ),
           React.createElement('div', {
+            key: 'desc',
             className: `text-xs rounded-md px-3 py-2 mt-1 border ${
               cloneEngine === 'qwen' ? 'border-red-500/30 bg-red-500/5 text-red-400'
               : 'border-yellow-500/30 bg-yellow-500/5 text-yellow-400'
@@ -409,19 +548,21 @@ function VoiceboxView() {
         ]),
 
         // Voice name
-        React.createElement('div', { className: 'flex flex-col gap-2' }, [
-          React.createElement('label', { className: 'text-sm font-medium text-muted-foreground' }, 'Voice Profile Name'),
+        React.createElement('div', { key: 'name', className: 'flex flex-col gap-2' }, [
+          React.createElement('label', { key: 'lbl', className: 'text-sm font-medium text-muted-foreground' }, 'Voice Profile Name'),
           React.createElement(Input, {
+            key: 'input',
             value: cloneName, placeholder: 'e.g., My Voice',
             onChange: (e) => setCloneName(e.target.value)
           })
         ]),
 
         // Reference text
-        React.createElement('div', { className: 'flex flex-col gap-2 bg-muted/30 border border-border/50 rounded p-4' }, [
-          React.createElement('span', { className: 'text-xs font-bold text-muted-foreground uppercase tracking-wider' }, 'Read this aloud in your recording:'),
-          React.createElement('p', { className: 'text-lg italic font-medium leading-relaxed text-foreground' }, referenceText),
+        React.createElement('div', { key: 'reftext', className: 'flex flex-col gap-2 bg-muted/30 border border-border/50 rounded p-4' }, [
+          React.createElement('span', { key: 'lbl', className: 'text-xs font-bold text-muted-foreground uppercase tracking-wider' }, 'Read this aloud in your recording:'),
+          React.createElement('p', { key: 'txt', className: 'text-lg italic font-medium leading-relaxed text-foreground' }, referenceText),
           React.createElement(Input, {
+            key: 'edit',
             className: 'text-xs mt-2 text-muted-foreground bg-transparent border-none p-0 h-auto focus-visible:ring-0',
             value: referenceText, placeholder: 'Edit reference text if needed...',
             onChange: (e) => setReferenceText(e.target.value)
@@ -429,25 +570,27 @@ function VoiceboxView() {
         ]),
 
         // Guidelines
-        React.createElement('div', { className: 'flex flex-col gap-2 bg-muted/20 border border-border/50 rounded-md p-4 text-xs text-muted-foreground' }, [
-          React.createElement('span', { className: 'font-semibold text-foreground text-sm' }, '🎙️ Voice Cloning Guidelines'),
-          React.createElement('ul', { className: 'list-disc pl-4 flex flex-col gap-1' }, [
-            React.createElement('li', {}, 'Formats: .wav, .mp3, .m4a, .ogg, .flac, .aac, .webm, .opus — max 50 MB.'),
-            React.createElement('li', {}, 'Record a clean 10–120s audio sample using your OS recorder.'),
-            React.createElement('li', {}, 'Ensure the reference text above matches the spoken audio exactly.')
+        React.createElement('div', { key: 'guide', className: 'flex flex-col gap-2 bg-muted/20 border border-border/50 rounded-md p-4 text-xs text-muted-foreground' }, [
+          React.createElement('span', { key: 'title', className: 'font-semibold text-foreground text-sm' }, '🎙️ Voice Cloning Guidelines'),
+          React.createElement('ul', { key: 'list', className: 'list-disc pl-4 flex flex-col gap-1' }, [
+            React.createElement('li', { key: '1' }, 'Formats: .wav, .mp3, .m4a, .ogg, .flac, .aac, .webm, .opus — max 50 MB.'),
+            React.createElement('li', { key: '2' }, 'Record a clean 10–120s audio sample using your OS recorder.'),
+            React.createElement('li', { key: '3' }, 'Ensure the reference text above matches the spoken audio exactly.')
           ])
         ]),
 
         // Upload controls
-        React.createElement('div', { className: 'flex items-center gap-3 mt-1' }, [
+        React.createElement('div', { key: 'upload', className: 'flex items-center gap-3 mt-1 flex-wrap' }, [
           React.createElement(Button, { key: 'upl', variant: 'outline', onClick: handleNativeUpload }, '📁 Select Audio Sample File'),
           fileName && React.createElement('span', { key: 'fn', className: 'text-xs text-muted-foreground truncate max-w-xs' }, `Selected: ${fileName}`),
+          durationBadge,
           audioUrl && React.createElement(Button, { key: 'play', variant: 'secondary', size: 'sm', onClick: playPlayback },
             isPlaying ? '⏸️ Pause' : '▶️ Play Sample')
         ]),
 
         // Clone button
         React.createElement(Button, {
+          key: 'clone-btn',
           className: 'w-full mt-4 h-11 text-base font-semibold', variant: 'default',
           disabled: isSaving || !cloneName.trim() || !audioBlob,
           onClick: handleCloneSubmit
