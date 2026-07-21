@@ -75,14 +75,16 @@ function VoiceboxView() {
   const playbackAudioRef = useRef(null);
 
   // ── Fetch profiles + active config ──────────
-  const fetchProfilesAndConfig = async () => {
+  const fetchProfilesAndConfig = async (skipConfig = false) => {
     try {
       const res = await fetch(`${BACKEND_URL}/profiles`);
       if (!res.ok) throw new Error('Failed to fetch profiles');
       setVoices(await res.json());
 
-      const cfg = await window.hermesDesktop.api({ path: '/api/config', method: 'GET' });
-      setActiveVoiceId(cfg?.tts?.providers?.voicebox?.voice || '');
+      if (!skipConfig) {
+        const cfg = await window.hermesDesktop.api({ path: '/api/config', method: 'GET' });
+        setActiveVoiceId(cfg?.tts?.providers?.voicebox?.voice || '');
+      }
     } catch (err) {
       console.error(err);
       host.notify({ kind: 'error', title: 'Voicebox Connection Failed',
@@ -245,7 +247,14 @@ function VoiceboxView() {
       setCloneName(''); setFileName(''); setAudioBlob(null); setAudioUrl(null);
       host.notify({ kind: 'success', title: 'Voice Cloned!',
         message: `"${cloneName}" created using ${engineMeta.label || cloneEngine} (${engineMeta.vram || '?'} VRAM).` });
-      await fetchProfilesAndConfig();
+      
+      // Load list immediately without touching the busy config store
+      await fetchProfilesAndConfig(true);
+      
+      // Sync active state in the background after the config transaction finishes
+      setTimeout(() => {
+        fetchProfilesAndConfig(false).catch(() => {});
+      }, 800);
     } catch (err) {
       host.notify({ kind: 'error', title: 'Cloning Failed', message: err.message });
     } finally {
