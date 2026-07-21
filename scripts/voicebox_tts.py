@@ -14,10 +14,8 @@ import urllib.request
 import urllib.error
 
 # ---------------------------------------------------------------------------
-# Tunables
+# Tunables & Configuration
 # ---------------------------------------------------------------------------
-VOICEBOX_PORT   = int(os.environ.get("VOICEBOX_PORT", "17493"))
-BASE_URL        = f"http://127.0.0.1:{VOICEBOX_PORT}"
 # Per-chunk HTTP timeout (seconds).  Each chunk is ≤MAX_CHARS characters;
 # on Blackwell GPU a 800-char chunk takes ~30-60 s.
 CHUNK_TIMEOUT   = 300
@@ -25,6 +23,17 @@ CHUNK_TIMEOUT   = 300
 # The backend itself also splits at 800 chars, but we stay well under that
 # so we control the boundaries at sentence level.
 MAX_CHARS       = 600
+
+
+def get_base_url(cli_base_url: str = None) -> str:
+    """
+    Resolve Voicebox API base URL.
+    Precedence: --base-url flag > VOICEBOX_PORT env var > default 17493.
+    """
+    if cli_base_url:
+        return cli_base_url.rstrip("/")
+    port = os.environ.get("VOICEBOX_PORT", "17493")
+    return f"http://127.0.0.1:{port}"
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +162,10 @@ def main():
     parser.add_argument("--text-file", "-t", required=True, help="Path to temp text file")
     parser.add_argument("--out",       "-o", required=True, help="Path to write output audio file")
     parser.add_argument("--voice",     "-v", help="Voice profile ID")
+    parser.add_argument("--base-url",  "-b", default=None, help="Base URL of Voicebox API (e.g. http://127.0.0.1:17493)")
     args = parser.parse_args()
+
+    base_url = get_base_url(args.base_url)
 
     # 1. Read text
     try:
@@ -171,7 +183,7 @@ def main():
     profile_id = args.voice
     if not profile_id or profile_id in ("default", "undefined", ""):
         try:
-            profiles = _get_json(f"{BASE_URL}/profiles")
+            profiles = _get_json(f"{base_url}/profiles")
             if profiles:
                 profile_id = profiles[0]["id"]
             else:
@@ -184,7 +196,7 @@ def main():
     # 3. Resolve engine from profile metadata
     engine = None
     try:
-        profile = _get_json(f"{BASE_URL}/profiles/{profile_id}")
+        profile = _get_json(f"{base_url}/profiles/{profile_id}")
         engine  = profile.get("default_engine") or profile.get("preset_engine")
     except Exception as e:
         print(f"Warning: could not fetch profile details ({e}), engine left unset.", file=sys.stderr)
@@ -205,7 +217,7 @@ def main():
             payload["engine"] = engine
 
         try:
-            raw = _post_stream(f"{BASE_URL}/generate/stream", payload, CHUNK_TIMEOUT)
+            raw = _post_stream(f"{base_url}/generate/stream", payload, CHUNK_TIMEOUT)
         except urllib.error.HTTPError as e:
             msg = e.read().decode("utf-8", errors="ignore")
             print(f"HTTP {e.code} on chunk {i}: {msg}", file=sys.stderr)

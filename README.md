@@ -1,6 +1,6 @@
 # Hermes Voicebox Integration
 
-A powerful cross-platform integration between the **Hermes Desktop Client** and **Voicebox API**. Includes a desktop plugin for managing voice profiles (Select/Record/Upload/Delete) and an intelligent python-based execution bridge.
+A powerful cross-platform integration between the **Hermes Desktop Client** and **Voicebox API**. Includes a desktop plugin for managing voice profiles (Select/Upload/Delete) and an intelligent python-based execution bridge.
 
 ## 🚀 Features
 
@@ -9,8 +9,31 @@ A powerful cross-platform integration between the **Hermes Desktop Client** and 
   - 🟡 **Chatterbox 3B / Turbo** (~4 GB VRAM) for lightweight voice cloning.
   - 🔴 **Qwen TTS 1.7B** (~7.6 GB VRAM) for highest fidelity voice cloning.
 - **Sentence Chunking & WAV Merging**: The python bridge splits long responses into sentence-level chunks, generates them on GPU, and merges them back into a single WAV seamlessly. This avoids timeouts on long AI responses.
-- **Microphone Recording & Audio File Upload**: Fully supports cloning voices using either browser microphone recording or custom audio file upload.
+- **Native Audio File Upload**: Fully supports cloning voices using native OS audio file upload.
 - **Safe Voice Deletion**: Offers a 2-step verification delete mechanism that cleans database records and active configuration states to prevent errors.
+
+---
+
+## 🛠️ Prerequisites & Requirements
+
+### Voicebox Backend
+- A running **Voicebox API instance** with GPU support serving on `http://127.0.0.1:17493` (by default).
+
+### Desktop Client & Environment
+- **Hermes Desktop** with developer mode / custom plugins enabled.
+- Python 3.10+ in the environment executing the bridge script.
+
+---
+
+## ⚙️ Configuration & Environment Variables
+
+- **`VOICEBOX_PORT`**: Environment variable to set the port for the Voicebox API backend (default: `17493`).
+- **`--base-url`**: CLI argument for `voicebox_tts.py` to set the backend base URL directly (e.g. `--base-url http://127.0.0.1:17493`).
+
+The TTS bridge resolves the backend base URL using the following precedence order:
+1. `--base-url` CLI flag (highest precedence)
+2. `VOICEBOX_PORT` environment variable
+3. Default port `17493` (`http://127.0.0.1:17493`)
 
 ---
 
@@ -31,7 +54,7 @@ A powerful cross-platform integration between the **Hermes Desktop Client** and 
      providers:
        voicebox:
          type: command
-         command: python3 /home/YOUR_USERNAME/.hermes/scripts/voicebox_tts.py --text-file {input_path} --out {output_path} --voice {voice}
+         command: python3 $HOME/.hermes/scripts/voicebox_tts.py --text-file {input_path} --out {output_path} --voice {voice}
          voice: default
          output_format: wav
    ```
@@ -50,18 +73,7 @@ A powerful cross-platform integration between the **Hermes Desktop Client** and 
      providers:
        voicebox:
          type: command
-         command: python C:\Users\YOUR_USERNAME\.hermes\scripts\voicebox_tts.py --text-file {input_path} --out {output_path} --voice {voice}
+         command: python %USERPROFILE%\.hermes\scripts\voicebox_tts.py --text-file {input_path} --out {output_path} --voice {voice}
          voice: default
          output_format: wav
    ```
-
----
-
-## 🛠️ Requirements
-
-### Desktop Client
-- **Hermes Desktop** with developer mode / custom plugins enabled.
-
-### Voicebox API
-- A running **Voicebox API instance** serving on `http://127.0.0.1:17493`.
-- Python 3.10+ in the environment executing the bridge script.
