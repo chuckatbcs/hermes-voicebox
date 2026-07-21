@@ -69,23 +69,27 @@ function formatDuration(seconds) {
 }
 
 // ─────────────────────────────────────────────
-// Resolve the scripts directory dynamically.
-// Uses hermesDesktop.getPath('home') if available,
-// falls back to a platform-aware $HOME/.hermes path.
+// Voice selection persistence via Voicebox API
+// instead of Hermes config store (which crashes)
 // ─────────────────────────────────────────────
-function buildTtsCommand(voiceId) {
-  // Use a portable {scripts_dir} approach: the installer places the script
-  // at ~/.hermes/scripts/voicebox_tts.py on every platform.
-  // We resolve ~ at runtime.
-  const home = typeof process !== 'undefined' && process.env?.HOME
-    ? process.env.HOME
-    : (typeof process !== 'undefined' && process.env?.USERPROFILE
-      ? process.env.USERPROFILE
-      : '~');
-  const sep = home.includes('\\') ? '\\' : '/';
-  const scriptPath = `${home}${sep}.hermes${sep}scripts${sep}voicebox_tts.py`;
-  const python = home.includes('\\') ? 'python' : 'python3';
-  return `${python} ${scriptPath} --text-file {input_path} --out {output_path} --voice {voice}`;
+async function saveActiveVoice(voiceId) {
+  // Write to Voicebox backend's own config endpoint
+  await fetch(`${BACKEND_URL}/settings/active-voice`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ voice_id: voiceId })
+  });
+}
+
+async function loadActiveVoice() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/settings/active-voice`);
+    if (!res.ok) return '';
+    const data = await res.json();
+    return data.voice_id || '';
+  } catch {
+    return '';
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -110,27 +114,21 @@ function VoiceboxView() {
 
   // Connection & loading state
   const [isLoading, setIsLoading]         = useState(true);
-  const [isConnected, setIsConnected]     = useState(null); // null = unknown, true/false
+  const [isConnected, setIsConnected]     = useState(null);
 
   const playbackAudioRef = useRef(null);
   const deleteTimerRef   = useRef(null);
 
-  // ── Fetch profiles + active config ──────────
-  const fetchProfilesAndConfig = useCallback(async (skipConfig = false) => {
+  // ── Fetch profiles + active voice ──────────
+  const fetchProfilesAndConfig = useCallback(async () => {
     try {
       const res = await fetch(`${BACKEND_URL}/profiles`);
       if (!res.ok) throw new Error('Failed to fetch profiles');
       setVoices(await res.json());
       setIsConnected(true);
 
-      if (!skipConfig) {
-        try {
-          const cfg = await window.hermesDesktop.api({ path: '/api/config', method: 'GET' });
-          setActiveVoiceId(cfg?.tts?.providers?.voicebox?.voice || '');
-        } catch (cfgErr) {
-          console.warn('Skipped config read (store busy):', cfgErr);
-        }
-      }
+      const savedVoice = await loadActiveVoice();
+      if (savedVoice) setActiveVoiceId(savedVoice);
     } catch (err) {
       console.error(err);
       setIsConnected(false);
@@ -142,7 +140,6 @@ function VoiceboxView() {
   }, []);
 
   useEffect(() => {
-    // Delay initial fetch to avoid clashes with Hermes's startup configuration transactions
     const timer = setTimeout(() => {
       fetchProfilesAndConfig();
     }, 2000);
@@ -170,28 +167,11 @@ function VoiceboxView() {
     const { engine, meta } = getEngineMeta(voice);
     try {
       setActiveVoiceId(voiceId);
-      await window.hermesDesktop.api({
-        path: '/api/config', method: 'PUT',
-        body: {
-          config: {
-            tts: {
-              provider: 'voicebox',
-              providers: {
-                voicebox: {
-                  type: 'command',
-                  command: buildTtsCommand(voiceId),
-                  voice: voiceId,
-                  output_format: 'wav'
-                }
-              }
-            }
-          }
-        }
-      });
+      await saveActiveVoice(voiceId);
       host.notify({ kind: 'success', title: 'Voice Updated',
         message: `Active voice: ${voice?.name || voiceId}  •  ${meta.label || engine}  •  VRAM ${meta.vram || '?'}` });
     } catch (err) {
-      host.notify({ kind: 'error', title: 'Config Update Failed', message: err.message });
+      host.notify({ kind: 'error', title: 'Voice Update Failed', message: err.message });
     }
   };
 
@@ -203,18 +183,11 @@ function VoiceboxView() {
       if (!res.ok) throw new Error(`Delete failed: ${res.status}`);
       if (voiceId === activeVoiceId) {
         setActiveVoiceId('');
-        try {
-          await window.hermesDesktop.api({ path: '/api/config', method: 'PUT',
-            body: { config: { tts: { provider: 'none', providers: { voicebox: { voice: '' } } } } } });
-        } catch (_) {}
+        try { await saveActiveVoice(''); } catch (_) {}
       }
       setDeleteConfirmId(null);
       host.notify({ kind: 'success', title: 'Voice Deleted', message: 'Profile removed successfully.' });
-
-      // Refresh list without touching the potentially busy config store
-      await fetchProfilesAndConfig(true);
-      // Delayed background sync for active state
-      setTimeout(() => { fetchProfilesAndConfig(false).catch(() => {}); }, 800);
+      await fetchProfilesAndConfig();
     } catch (err) {
       host.notify({ kind: 'error', title: 'Delete Failed', message: err.message });
     } finally {
@@ -238,36 +211,37 @@ function VoiceboxView() {
       if (!paths || !paths.length) return;
       const filePath = paths[0];
 
-      // Extract filename for profile name suggestion
       const nameParts = filePath.split(/[/\\]/);
       const nameWithExt = nameParts[nameParts.length - 1];
       const baseName = nameWithExt.substring(0, nameWithExt.lastIndexOf('.')) || nameWithExt;
-      
+
       setFileName(nameWithExt);
       setAudioDuration(null);
       if (!cloneName.trim()) {
         setCloneName(baseName.replace(/[_-]/g, ' '));
       }
 
-      // Read file content safely outside Chromium sandbox as data url
       const dataUrl = await window.hermesDesktop.readFileDataUrl(filePath);
-      
-      // Convert in-memory data URL to Blob (CORS-safe)
       const fetchRes = await fetch(dataUrl);
       const blob = await fetchRes.blob();
 
       setAudioBlob(blob);
       setAudioUrl(dataUrl);
 
-      // Decode audio to get duration
+      // Get duration via an Audio element (safer than AudioContext in Electron)
       try {
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const arrayBuf = await blob.arrayBuffer();
-        const decoded = await audioCtx.decodeAudioData(arrayBuf);
-        setAudioDuration(decoded.duration);
-        audioCtx.close();
+        const tempAudio = new Audio(dataUrl);
+        await new Promise((resolve, reject) => {
+          tempAudio.onloadedmetadata = resolve;
+          tempAudio.onerror = reject;
+          setTimeout(reject, 5000);
+        });
+        if (isFinite(tempAudio.duration)) {
+          setAudioDuration(tempAudio.duration);
+        }
+        tempAudio.src = '';
       } catch (durErr) {
-        console.warn('Could not decode audio duration:', durErr);
+        console.warn('Could not read audio duration:', durErr);
       }
     } catch (err) {
       console.error(err);
@@ -298,12 +272,12 @@ function VoiceboxView() {
       host.notify({ kind: 'warning', title: 'Audio Required', message: 'Upload a sample first.' }); return;
     }
     const engineMeta = ENGINE_META[cloneEngine] || {};
-    const savedName = cloneName.trim(); // Capture before state reset
+    const savedName = cloneName.trim();
     setIsSaving(true);
 
     let createdProfileId = null;
     try {
-      // 1. Create profile — set default_engine at creation time
+      // 1. Create profile
       const createRes = await fetch(`${BACKEND_URL}/profiles`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: savedName, default_engine: cloneEngine })
@@ -325,7 +299,7 @@ function VoiceboxView() {
         throw new Error(errData.detail || `Audio upload returned ${uploadRes.status}`);
       }
 
-      // Upload succeeded — profile is no longer orphaned
+      // Upload succeeded — profile is not orphaned
       createdProfileId = null;
 
       // 3. Set as active
@@ -335,21 +309,13 @@ function VoiceboxView() {
       setCloneName(''); setFileName(''); setAudioBlob(null); setAudioUrl(null); setAudioDuration(null);
       host.notify({ kind: 'success', title: 'Voice Cloned!',
         message: `"${savedName}" created using ${engineMeta.label || cloneEngine} (${engineMeta.vram || '?'} VRAM).` });
-      
-      // Load list immediately without touching the busy config store
-      await fetchProfilesAndConfig(true);
-      
-      // Sync active state in the background after the config transaction finishes
-      setTimeout(() => { fetchProfilesAndConfig(false).catch(() => {}); }, 800);
+
+      await fetchProfilesAndConfig();
     } catch (err) {
-      // Clean up orphaned profile if it was created but sample upload failed
       if (createdProfileId) {
         try {
           await fetch(`${BACKEND_URL}/profiles/${createdProfileId}`, { method: 'DELETE' });
-          console.warn(`Cleaned up orphaned profile ${createdProfileId}`);
-        } catch (cleanupErr) {
-          console.error('Failed to clean up orphaned profile:', cleanupErr);
-        }
+        } catch (_) {}
       }
       host.notify({ kind: 'error', title: 'Cloning Failed', message: err.message });
     } finally {
@@ -373,7 +339,6 @@ function VoiceboxView() {
     );
   }
 
-  // ── Connection status dot ────────────────────
   const statusDot = React.createElement('span', {
     key: 'status-dot',
     className: `inline-block w-2 h-2 rounded-full mr-2 ${
@@ -382,7 +347,6 @@ function VoiceboxView() {
     title: isConnected === true ? 'Connected to Voicebox' : isConnected === false ? 'Disconnected' : 'Checking...'
   });
 
-  // ── Duration badge helper ────────────────────
   const durationBadge = audioDuration != null
     ? React.createElement('span', {
         key: 'dur',
@@ -465,7 +429,7 @@ function VoiceboxView() {
           ? React.createElement('p', { key: 'empty', className: 'text-sm text-muted-foreground italic' }, 'No voice profiles found.')
           : React.createElement('div', { key: 'list', className: 'flex flex-col gap-2' },
               voices.map(v => {
-                const { engine, meta } = getEngineMeta(v);
+                const { meta } = getEngineMeta(v);
                 return React.createElement('div', {
                   key: v.id,
                   className: `flex items-center justify-between rounded-md px-4 py-3 border transition-colors ${v.id === activeVoiceId ? 'border-primary bg-primary/5' : 'border-border bg-muted/20 hover:bg-muted/30'}`
@@ -487,11 +451,7 @@ function VoiceboxView() {
                     React.createElement('span', {
                       key: 'type',
                       className: 'text-xs text-muted-foreground/50 shrink-0'
-                    }, v.voice_type === 'preset' ? '⭐ Preset' : '🎙️ Cloned'),
-                    v.samples_count === 0 && React.createElement('span', {
-                      key: 'warn',
-                      className: 'text-xs text-red-400 shrink-0'
-                    }, '⚠️ No samples')
+                    }, v.voice_type === 'preset' ? '⭐ Preset' : '🎙️ Cloned')
                   ]),
                   React.createElement('div', { key: 'actions', className: 'flex items-center gap-2 shrink-0 ml-3' },
                     deleteConfirmId === v.id
@@ -521,7 +481,6 @@ function VoiceboxView() {
       React.createElement('div', { key: 'cloner-card', className: 'flex flex-col gap-4 bg-card border border-border rounded-lg p-6 shadow-sm' }, [
         React.createElement('h2', { key: 'h', className: 'text-xl font-semibold' }, 'Clone New Voice'),
 
-        // Engine selector
         React.createElement('div', { key: 'engine', className: 'flex flex-col gap-2' }, [
           React.createElement('label', { key: 'lbl', className: 'text-sm font-medium text-muted-foreground' }, 'Cloning Model'),
           React.createElement(Select, { key: 'sel', value: cloneEngine, onValueChange: setCloneEngine },
@@ -547,7 +506,6 @@ function VoiceboxView() {
           )
         ]),
 
-        // Voice name
         React.createElement('div', { key: 'name', className: 'flex flex-col gap-2' }, [
           React.createElement('label', { key: 'lbl', className: 'text-sm font-medium text-muted-foreground' }, 'Voice Profile Name'),
           React.createElement(Input, {
@@ -557,7 +515,6 @@ function VoiceboxView() {
           })
         ]),
 
-        // Reference text
         React.createElement('div', { key: 'reftext', className: 'flex flex-col gap-2 bg-muted/30 border border-border/50 rounded p-4' }, [
           React.createElement('span', { key: 'lbl', className: 'text-xs font-bold text-muted-foreground uppercase tracking-wider' }, 'Read this aloud in your recording:'),
           React.createElement('p', { key: 'txt', className: 'text-lg italic font-medium leading-relaxed text-foreground' }, referenceText),
@@ -569,7 +526,6 @@ function VoiceboxView() {
           })
         ]),
 
-        // Guidelines
         React.createElement('div', { key: 'guide', className: 'flex flex-col gap-2 bg-muted/20 border border-border/50 rounded-md p-4 text-xs text-muted-foreground' }, [
           React.createElement('span', { key: 'title', className: 'font-semibold text-foreground text-sm' }, '🎙️ Voice Cloning Guidelines'),
           React.createElement('ul', { key: 'list', className: 'list-disc pl-4 flex flex-col gap-1' }, [
@@ -579,7 +535,6 @@ function VoiceboxView() {
           ])
         ]),
 
-        // Upload controls
         React.createElement('div', { key: 'upload', className: 'flex items-center gap-3 mt-1 flex-wrap' }, [
           React.createElement(Button, { key: 'upl', variant: 'outline', onClick: handleNativeUpload }, '📁 Select Audio Sample File'),
           fileName && React.createElement('span', { key: 'fn', className: 'text-xs text-muted-foreground truncate max-w-xs' }, `Selected: ${fileName}`),
@@ -588,7 +543,6 @@ function VoiceboxView() {
             isPlaying ? '⏸️ Pause' : '▶️ Play Sample')
         ]),
 
-        // Clone button
         React.createElement(Button, {
           key: 'clone-btn',
           className: 'w-full mt-4 h-11 text-base font-semibold', variant: 'default',

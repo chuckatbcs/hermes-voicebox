@@ -181,7 +181,7 @@ def main():
 
     # 2. Resolve profile ID
     profile_id = args.voice
-    if not profile_id or profile_id in ("default", "undefined", ""):
+    if not profile_id or profile_id in ("default", "undefined", "", "00000000-0000-0000-0000-000000000000"):
         try:
             # Try to get the active voice from the backend
             active_data = _get_json(f"{base_url}/settings/active-voice")
