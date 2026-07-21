@@ -163,12 +163,27 @@ function VoiceboxView() {
   const startRecording = async () => {
     audioChunksRef.current = [];
     try {
-      const stream   = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      if (window.hermesDesktop?.requestMicrophoneAccess) {
+        const permitted = await window.hermesDesktop.requestMicrophoneAccess();
+        if (permitted === false) {
+          host.notify({ kind: 'error', title: 'Mic Access Denied', message: 'Microphone access was denied.' });
+          return;
+        }
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true }
+      });
+
+      const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/wav'].find(
+        type => MediaRecorder.isTypeSupported(type)
+      ) ?? '';
+
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       mediaRecorderRef.current = recorder;
       recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
       recorder.onstop = () => {
-        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const blob = new Blob(audioChunksRef.current, { type: mimeType || 'audio/webm' });
         setAudioBlob(blob);
         setAudioUrl(URL.createObjectURL(blob));
         setRecordingState('recorded');
@@ -177,8 +192,9 @@ function VoiceboxView() {
       recorder.start();
       setRecordingState('recording');
     } catch (err) {
+      console.error(err);
       host.notify({ kind: 'error', title: 'Mic Access Denied',
-        message: 'Allow microphone access in system settings.' });
+        message: 'Could not access microphone: ' + err.message });
     }
   };
 
