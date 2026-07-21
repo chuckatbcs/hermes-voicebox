@@ -104,6 +104,19 @@ function VoiceboxView() {
   const [deleteConfirmId, setDeleteConfirmId] = useState(null);
   const [isDeleting, setIsDeleting]       = useState(false);
 
+  // Persona state
+  const [personaMapping, setPersonaMapping] = useState(() => {
+    try {
+      const stored = localStorage.getItem('hermes_personas');
+      if (stored) return JSON.parse(stored);
+    } catch (e) {}
+    return {
+      'Default': 'You are a helpful AI assistant.',
+      'Jarvis': 'You are Jarvis. Be highly formal, polite, and efficient.',
+      'Sexy Girl': 'You are a playful, flirty, and provocative companion.'
+    };
+  });
+
   // File state
   const [fileName, setFileName]           = useState('');
   const [audioUrl, setAudioUrl]           = useState(null);
@@ -160,7 +173,7 @@ function VoiceboxView() {
     return () => { if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current); };
   }, [deleteConfirmId]);
 
-  // ── Active voice selection ───────────────────
+  // ── Active Voice Selection ───────────────────
   const handleVoiceChange = async (voiceId) => {
     if (!voiceId) return;
     const voice = voices.find(v => v.id === voiceId);
@@ -170,6 +183,21 @@ function VoiceboxView() {
       await saveActiveVoice(voiceId);
       host.notify({ kind: 'success', title: 'Voice Updated',
         message: `Active voice: ${voice?.name || voiceId}  •  ${meta.label || engine}  •  VRAM ${meta.vram || '?'}` });
+
+      const voiceName = voice?.name || voiceId;
+      const persona = personaMapping[voiceId] || personaMapping[voiceName] || personaMapping['Default'];
+      const sessionId = host.state.activeSessionId.get();
+      if (sessionId && persona) {
+        const text = `[SYSTEM NOTIFICATION] The user has changed your active voice profile to "${voiceName}". Effective immediately, you must adopt the following personality and tone for all future responses: "${persona}"`;
+        await host.request('prompt.submit', {
+          session_id: sessionId,
+          text
+        }).then(() => {
+          host.notify({ kind: 'success', title: 'Persona Injected', message: `Notified AI to switch persona to "${voiceName}".` });
+        }).catch(err => {
+          console.warn('Persona injection failed or timed out:', err);
+        });
+      }
     } catch (err) {
       host.notify({ kind: 'error', title: 'Voice Update Failed', message: err.message });
     }
@@ -415,9 +443,18 @@ function VoiceboxView() {
             const v = voices.find(x => x.id === activeVoiceId);
             if (!v) return null;
             const { engine, meta } = getEngineMeta(v);
-            return React.createElement('p', { key: 'active-info', className: 'text-xs text-muted-foreground mt-1' },
-              `${meta.badge || '⚪'} Using ${meta.label || engine}  •  ${meta.vram || '?'} VRAM  •  ${meta.description || ''}`
-            );
+            const personaText = personaMapping[v.id] || personaMapping[v.name] || personaMapping['Default'] || 'You are a helpful AI assistant.';
+            return React.createElement('div', { key: 'active-info', className: 'flex flex-col gap-1 mt-1 bg-muted/30 p-3 rounded-md border border-border/50' }, [
+              React.createElement('p', { key: 'v-info', className: 'text-xs text-muted-foreground' },
+                `${meta.badge || '⚪'} Using ${meta.label || engine}  •  ${meta.vram || '?'} VRAM  •  ${meta.description || ''}`
+              ),
+              React.createElement('p', { key: 'p-info', className: 'text-sm font-semibold text-foreground mt-2' },
+                `🎭 Active Persona:`
+              ),
+              React.createElement('p', { key: 'p-text', className: 'text-xs italic text-muted-foreground' },
+                `"${personaText}"`
+              )
+            ]);
           })()
         ])
       ]),
@@ -432,46 +469,61 @@ function VoiceboxView() {
                 const { meta } = getEngineMeta(v);
                 return React.createElement('div', {
                   key: v.id,
-                  className: `flex items-center justify-between rounded-md px-4 py-3 border transition-colors ${v.id === activeVoiceId ? 'border-primary bg-primary/5' : 'border-border bg-muted/20 hover:bg-muted/30'}`
+                  className: `flex flex-col gap-2 rounded-md px-4 py-3 border transition-colors ${v.id === activeVoiceId ? 'border-primary bg-primary/5' : 'border-border bg-muted/20 hover:bg-muted/30'}`
                 }, [
-                  React.createElement('div', { key: 'info', className: 'flex items-center gap-2 min-w-0 flex-wrap' }, [
-                    React.createElement('span', { key: 'name', className: 'font-medium text-sm truncate' }, v.name),
-                    v.id === activeVoiceId && React.createElement('span', {
-                      key: 'active',
-                      className: 'text-xs bg-primary text-primary-foreground rounded-full px-2 py-0.5 shrink-0'
-                    }, 'Active'),
-                    React.createElement('span', {
-                      key: 'eng',
-                      className: 'text-xs text-muted-foreground shrink-0 font-mono'
-                    }, `${meta.badge} ${meta.label}`),
-                    React.createElement('span', {
-                      key: 'vram',
-                      className: 'text-xs text-muted-foreground/60 shrink-0'
-                    }, meta.vram),
-                    React.createElement('span', {
-                      key: 'type',
-                      className: 'text-xs text-muted-foreground/50 shrink-0'
-                    }, v.voice_type === 'preset' ? '⭐ Preset' : '🎙️ Cloned')
+                  React.createElement('div', { key: 'top-row', className: 'flex items-center justify-between' }, [
+                    React.createElement('div', { key: 'info', className: 'flex items-center gap-2 min-w-0 flex-wrap' }, [
+                      React.createElement('span', { key: 'name', className: 'font-medium text-sm truncate' }, v.name),
+                      v.id === activeVoiceId && React.createElement('span', {
+                        key: 'active',
+                        className: 'text-xs bg-primary text-primary-foreground rounded-full px-2 py-0.5 shrink-0'
+                      }, 'Active'),
+                      React.createElement('span', {
+                        key: 'eng',
+                        className: 'text-xs text-muted-foreground shrink-0 font-mono'
+                      }, `${meta.badge} ${meta.label}`),
+                      React.createElement('span', {
+                        key: 'vram',
+                        className: 'text-xs text-muted-foreground/60 shrink-0'
+                      }, meta.vram),
+                      React.createElement('span', {
+                        key: 'type',
+                        className: 'text-xs text-muted-foreground/50 shrink-0'
+                      }, v.voice_type === 'preset' ? '⭐ Preset' : '🎙️ Cloned')
+                    ]),
+                    React.createElement('div', { key: 'actions', className: 'flex items-center gap-2 shrink-0 ml-3' },
+                      deleteConfirmId === v.id
+                        ? [
+                            React.createElement('span', { key: 'lbl', className: 'text-xs text-destructive font-medium' }, 'Delete?'),
+                            React.createElement(Button, {
+                              key: 'yes', variant: 'destructive', size: 'sm', disabled: isDeleting,
+                              onClick: () => handleDeleteVoice(v.id)
+                            }, isDeleting ? 'Deleting…' : 'Yes, Delete'),
+                            React.createElement(Button, {
+                              key: 'no', variant: 'outline', size: 'sm', disabled: isDeleting,
+                              onClick: () => setDeleteConfirmId(null)
+                            }, 'Cancel')
+                          ]
+                        : React.createElement(Button, {
+                            key: 'del', variant: 'ghost', size: 'sm',
+                            className: 'text-muted-foreground hover:text-destructive hover:bg-destructive/10',
+                            onClick: () => setDeleteConfirmId(v.id)
+                          }, '🗑️ Delete')
+                    )
                   ]),
-                  React.createElement('div', { key: 'actions', className: 'flex items-center gap-2 shrink-0 ml-3' },
-                    deleteConfirmId === v.id
-                      ? [
-                          React.createElement('span', { key: 'lbl', className: 'text-xs text-destructive font-medium' }, 'Delete?'),
-                          React.createElement(Button, {
-                            key: 'yes', variant: 'destructive', size: 'sm', disabled: isDeleting,
-                            onClick: () => handleDeleteVoice(v.id)
-                          }, isDeleting ? 'Deleting…' : 'Yes, Delete'),
-                          React.createElement(Button, {
-                            key: 'no', variant: 'outline', size: 'sm', disabled: isDeleting,
-                            onClick: () => setDeleteConfirmId(null)
-                          }, 'Cancel')
-                        ]
-                      : React.createElement(Button, {
-                          key: 'del', variant: 'ghost', size: 'sm',
-                          className: 'text-muted-foreground hover:text-destructive hover:bg-destructive/10',
-                          onClick: () => setDeleteConfirmId(v.id)
-                        }, '🗑️ Delete')
-                  )
+                  React.createElement('div', { key: 'persona-row', className: 'flex flex-col gap-1 mt-1 pt-2 border-t border-border/50' }, [
+                    React.createElement('label', { className: 'text-xs font-semibold text-muted-foreground' }, '🎭 AI Persona Prompt'),
+                    React.createElement(Input, {
+                      value: personaMapping[v.id] || personaMapping[v.name] || '',
+                      placeholder: 'e.g. You are a helpful assistant...',
+                      onChange: (e) => {
+                        const next = { ...personaMapping, [v.id]: e.target.value };
+                        setPersonaMapping(next);
+                        localStorage.setItem('hermes_personas', JSON.stringify(next));
+                      },
+                      className: 'h-8 text-xs bg-background/50'
+                    })
+                  ])
                 ]);
               })
             )
