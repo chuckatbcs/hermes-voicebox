@@ -222,7 +222,10 @@ function VoiceboxView() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: cloneName.trim(), default_engine: cloneEngine })
       });
-      if (!createRes.ok) throw new Error('Failed to create voice profile');
+      if (!createRes.ok) {
+        const errData = await createRes.json().catch(() => ({}));
+        throw new Error(errData.detail || `Server returned ${createRes.status}`);
+      }
       const profile = await createRes.json();
 
       // 2. Upload sample
@@ -230,7 +233,10 @@ function VoiceboxView() {
       form.append('file', audioBlob, 'sample.wav');
       form.append('reference_text', referenceText.trim() || 'The quick brown fox jumps over the lazy dog.');
       const uploadRes = await fetch(`${BACKEND_URL}/profiles/${profile.id}/samples`, { method: 'POST', body: form });
-      if (!uploadRes.ok) throw new Error('Failed to upload audio sample');
+      if (!uploadRes.ok) {
+        const errData = await uploadRes.json().catch(() => ({}));
+        throw new Error(errData.detail || `Audio upload returned ${uploadRes.status}`);
+      }
 
       // 3. Set as active
       await handleVoiceChange(profile.id);
