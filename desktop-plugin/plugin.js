@@ -4,7 +4,7 @@ import { Button, Input, Select, SelectContent, SelectItem, SelectTrigger, Select
 const BACKEND_URL = 'http://localhost:17493';
 
 // ─────────────────────────────────────────────
-// Engine metadata — resource cost & capabilities
+// Engine metadata
 // ─────────────────────────────────────────────
 const ENGINE_META = {
   kokoro: {
@@ -41,7 +41,6 @@ const ENGINE_META = {
   },
 };
 
-// Cloning engine choices shown in the UI (only downloaded ones shown)
 const CLONING_ENGINE_OPTIONS = [
   { value: 'qwen',             label: 'Qwen TTS 1.7B',      badge: '🔴', vram: '~7.6 GB',  note: 'Best quality' },
   { value: 'chatterbox',       label: 'Chatterbox 3B',       badge: '🟡', vram: '~4 GB',    note: 'Good quality, moderate GPU' },
@@ -52,11 +51,6 @@ function engineBadge(voice) {
   const eng = voice.preset_engine || voice.default_engine || (voice.voice_type === 'preset' ? 'kokoro' : 'qwen');
   const meta = ENGINE_META[eng] || { badge: '⚪', label: eng };
   return `${meta.badge} ${meta.label}`;
-}
-
-function engineVram(voice) {
-  const eng = voice.preset_engine || voice.default_engine || (voice.voice_type === 'preset' ? 'kokoro' : 'qwen');
-  return ENGINE_META[eng]?.vram || '';
 }
 
 // ─────────────────────────────────────────────
@@ -71,15 +65,13 @@ function VoiceboxView() {
   const [deleteConfirmId, setDeleteConfirmId] = useState(null);
   const [isDeleting, setIsDeleting]       = useState(false);
 
-  // Recording state
-  const [recordingState, setRecordingState] = useState('idle');
+  // File state
+  const [fileName, setFileName]           = useState('');
   const [audioUrl, setAudioUrl]           = useState(null);
   const [audioBlob, setAudioBlob]         = useState(null);
   const [isSaving, setIsSaving]           = useState(false);
   const [isPlaying, setIsPlaying]         = useState(false);
 
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef   = useRef([]);
   const playbackAudioRef = useRef(null);
 
   // ── Fetch profiles + active config ──────────
@@ -159,66 +151,53 @@ function VoiceboxView() {
     }
   };
 
-  // ── Recording ────────────────────────────────
-  const startRecording = async () => {
-    audioChunksRef.current = [];
-    try {
-      if (window.hermesDesktop?.requestMicrophoneAccess) {
-        const permitted = await window.hermesDesktop.requestMicrophoneAccess();
-        if (permitted === false) {
-          host.notify({ kind: 'error', title: 'Mic Access Denied', message: 'Microphone access was denied.' });
-          return;
-        }
-      }
+  // ── Native File Upload ───────────────────────
+  const handleNativeUpload = async () => {
+    if (!window.hermesDesktop?.selectPaths || !window.hermesDesktop?.readFileDataUrl) {
+      host.notify({ kind: 'error', title: 'Upload Unsupported', message: 'Desktop file API is unavailable.' });
+      return;
+    }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true }
+    try {
+      const paths = await window.hermesDesktop.selectPaths({
+        properties: ['openFile'],
+        filters: [{ name: 'Audio Files', extensions: ['wav', 'mp3', 'm4a', 'ogg', 'flac', 'aac', 'webm', 'opus'] }]
       });
 
-      const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/wav'].find(
-        type => MediaRecorder.isTypeSupported(type)
-      ) ?? '';
+      if (!paths || !paths.length) return;
+      const filePath = paths[0];
 
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      mediaRecorderRef.current = recorder;
-      recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
-      recorder.onstop = () => {
-        const blob = new Blob(audioChunksRef.current, { type: mimeType || 'audio/webm' });
-        setAudioBlob(blob);
-        setAudioUrl(URL.createObjectURL(blob));
-        setRecordingState('recorded');
-        stream.getTracks().forEach(t => t.stop());
-      };
-      recorder.start();
-      setRecordingState('recording');
+      // Extract filename for profile name suggestion
+      const nameParts = filePath.split(/[/\\]/);
+      const nameWithExt = nameParts[nameParts.length - 1];
+      const baseName = nameWithExt.substring(0, nameWithExt.lastIndexOf('.')) || nameWithExt;
+      
+      setFileName(nameWithExt);
+      if (!cloneName.trim()) {
+        setCloneName(baseName.replace(/[_-]/g, ' '));
+      }
+
+      // Read file content safely outside Chromium sandbox as data url
+      const dataUrl = await window.hermesDesktop.readFileDataUrl(filePath);
+      
+      // Convert in-memory data URL to Blob (CORS-safe)
+      const fetchRes = await fetch(dataUrl);
+      const blob = await fetchRes.blob();
+
+      setAudioBlob(blob);
+      setAudioUrl(dataUrl);
     } catch (err) {
       console.error(err);
-      host.notify({ kind: 'error', title: 'Mic Access Denied',
-        message: 'Could not access microphone: ' + err.message });
+      host.notify({ kind: 'error', title: 'File Read Failed', message: err.message });
     }
-  };
-
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && recordingState === 'recording')
-      mediaRecorderRef.current.stop();
-  };
-
-  const handleFileUpload = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    if (!cloneName.trim()) {
-      const base = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
-      setCloneName(base.replace(/[_-]/g, ' '));
-    }
-    setAudioBlob(file);
-    setAudioUrl(URL.createObjectURL(file));
-    setRecordingState('recorded');
   };
 
   const playPlayback = () => {
     if (!audioUrl) return;
-    if (isPlaying) { playbackAudioRef.current.pause(); setIsPlaying(false); }
-    else {
+    if (isPlaying) {
+      if (playbackAudioRef.current) playbackAudioRef.current.pause();
+      setIsPlaying(false);
+    } else {
       const audio = new Audio(audioUrl);
       playbackAudioRef.current = audio;
       audio.onended = () => setIsPlaying(false);
@@ -233,7 +212,7 @@ function VoiceboxView() {
       host.notify({ kind: 'warning', title: 'Name Required', message: 'Enter a name for the voice.' }); return;
     }
     if (!audioBlob) {
-      host.notify({ kind: 'warning', title: 'Audio Required', message: 'Record or upload a sample first.' }); return;
+      host.notify({ kind: 'warning', title: 'Audio Required', message: 'Upload a sample first.' }); return;
     }
     const engineMeta = ENGINE_META[cloneEngine] || {};
     setIsSaving(true);
@@ -248,7 +227,7 @@ function VoiceboxView() {
 
       // 2. Upload sample
       const form = new FormData();
-      form.append('file', audioBlob, 'sample.webm');
+      form.append('file', audioBlob, 'sample.wav');
       form.append('reference_text', referenceText.trim() || 'The quick brown fox jumps over the lazy dog.');
       const uploadRes = await fetch(`${BACKEND_URL}/profiles/${profile.id}/samples`, { method: 'POST', body: form });
       if (!uploadRes.ok) throw new Error('Failed to upload audio sample');
@@ -257,7 +236,7 @@ function VoiceboxView() {
       await handleVoiceChange(profile.id);
 
       // 4. Reset
-      setCloneName(''); setAudioBlob(null); setAudioUrl(null); setRecordingState('idle');
+      setCloneName(''); setFileName(''); setAudioBlob(null); setAudioUrl(null);
       host.notify({ kind: 'success', title: 'Voice Cloned!',
         message: `"${cloneName}" created using ${engineMeta.label || cloneEngine} (${engineMeta.vram || '?'} VRAM).` });
       await fetchProfilesAndConfig();
@@ -270,9 +249,6 @@ function VoiceboxView() {
 
   const selectedEngineMeta = ENGINE_META[cloneEngine] || {};
 
-  // ─────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────
   return React.createElement('div',
     { className: 'flex flex-col gap-6 p-8 max-w-2xl mx-auto h-full overflow-y-auto' },
     [
@@ -338,7 +314,6 @@ function VoiceboxView() {
                   key: v.id,
                   className: `flex items-center justify-between rounded-md px-4 py-3 border ${v.id === activeVoiceId ? 'border-primary bg-primary/5' : 'border-border bg-muted/20'}`
                 }, [
-                  // Left: name + badges
                   React.createElement('div', { key: 'info', className: 'flex items-center gap-2 min-w-0 flex-wrap' }, [
                     React.createElement('span', { className: 'font-medium text-sm truncate' }, v.name),
                     v.id === activeVoiceId && React.createElement('span', {
@@ -354,7 +329,6 @@ function VoiceboxView() {
                       className: 'text-xs text-muted-foreground/50 shrink-0'
                     }, v.voice_type === 'preset' ? '⭐ Preset' : '🎙️ Cloned')
                   ]),
-                  // Right: delete
                   React.createElement('div', { key: 'actions', className: 'flex items-center gap-2 shrink-0 ml-3' },
                     deleteConfirmId === v.id
                       ? [
@@ -419,7 +393,7 @@ function VoiceboxView() {
 
         // Reference text
         React.createElement('div', { className: 'flex flex-col gap-2 bg-muted/30 border border-border/50 rounded p-4' }, [
-          React.createElement('span', { className: 'text-xs font-bold text-muted-foreground uppercase tracking-wider' }, 'Read this aloud:'),
+          React.createElement('span', { className: 'text-xs font-bold text-muted-foreground uppercase tracking-wider' }, 'Read this aloud in your recording:'),
           React.createElement('p', { className: 'text-lg italic font-medium leading-relaxed text-foreground' }, referenceText),
           React.createElement(Input, {
             className: 'text-xs mt-2 text-muted-foreground bg-transparent border-none p-0 h-auto focus-visible:ring-0',
@@ -433,33 +407,17 @@ function VoiceboxView() {
           React.createElement('span', { className: 'font-semibold text-foreground text-sm' }, '🎙️ Voice Cloning Guidelines'),
           React.createElement('ul', { className: 'list-disc pl-4 flex flex-col gap-1' }, [
             React.createElement('li', {}, 'Formats: .wav, .mp3, .m4a, .ogg, .flac, .aac, .webm, .opus — max 50 MB.'),
-            React.createElement('li', {}, 'Best results: 10–30s of clean audio with little background noise.'),
-            React.createElement('li', {}, 'IMPORTANT: The reference text above must exactly match what was spoken in the audio.')
+            React.createElement('li', {}, 'Record a clean 10–30s audio sample using your OS recorder.'),
+            React.createElement('li', {}, 'Ensure the reference text above matches the spoken audio exactly.')
           ])
         ]),
 
-        // Hidden file input
-        React.createElement('input', {
-          type: 'file', accept: 'audio/*', id: 'voice-file-upload',
-          style: { display: 'none' }, onChange: handleFileUpload
-        }),
-
-        // Recording controls
+        // Upload controls
         React.createElement('div', { className: 'flex items-center gap-3 mt-1' }, [
-          recordingState === 'idle' && React.createElement(React.Fragment, { key: 'idle' }, [
-            React.createElement(Button, { key: 'rec', variant: 'destructive', onClick: startRecording }, '🔴 Start Recording'),
-            React.createElement(Button, { key: 'upl', variant: 'outline',
-              onClick: () => document.getElementById('voice-file-upload').click() }, '📁 Upload Audio File')
-          ]),
-          recordingState === 'recording' && React.createElement(Button, {
-            key: 'stop', variant: 'destructive', onClick: stopRecording }, '⏹️ Stop Recording'),
-          recordingState === 'recorded' && React.createElement(React.Fragment, { key: 'recorded' }, [
-            React.createElement(Button, { key: 'rerec', variant: 'outline', onClick: startRecording }, '🔄 Record Again'),
-            React.createElement(Button, { key: 'reupl', variant: 'outline',
-              onClick: () => document.getElementById('voice-file-upload').click() }, '📁 Upload New File'),
-            React.createElement(Button, { key: 'play', variant: 'secondary', onClick: playPlayback },
-              isPlaying ? '⏸️ Pause' : '▶️ Play Sample')
-          ])
+          React.createElement(Button, { key: 'upl', variant: 'outline', onClick: handleNativeUpload }, '📁 Select Audio Sample File'),
+          fileName && React.createElement('span', { key: 'fn', className: 'text-xs text-muted-foreground truncate max-w-xs' }, `Selected: ${fileName}`),
+          audioUrl && React.createElement(Button, { key: 'play', variant: 'secondary', size: 'sm', onClick: playPlayback },
+            isPlaying ? '⏸️ Pause' : '▶️ Play Sample')
         ]),
 
         // Clone button
