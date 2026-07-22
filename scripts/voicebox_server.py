@@ -2,7 +2,7 @@
 """
 Voicebox API Backend Server for Hermes Desktop Integration
 Provides REST endpoints on port 17493 for voice profile management,
-active voice settings, and audio streaming generation.
+active voice settings, and Chatterbox TTS GPU voice cloning.
 """
 
 import os
@@ -12,6 +12,8 @@ import uuid
 import struct
 import io
 import shutil
+import asyncio
+import tempfile
 import subprocess
 from pathlib import Path
 
@@ -30,7 +32,7 @@ PROFILES_DIR = HERMES_DIR / "voicebox_profiles"
 UPLOADS_DIR = PROFILES_DIR / "uploads"
 PROFILES_JSON = PROFILES_DIR / "profiles.json"
 SETTINGS_JSON = PROFILES_DIR / "settings.json"
-SAMPLES_DIR = HERMES_DIR / "voice_samples"
+SAMPLES_DIR = Path(r"H:\Documents\AI Folder\Projects\Voice clone install scripts from Hermes\voice-samples")
 
 PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,7 +48,7 @@ DEFAULT_PROFILES = [
     },
     {
         "id": "chuck_voice",
-        "name": "Chuck's Voice",
+        "name": "Chuck's Voice (Cloned)",
         "voice_type": "custom",
         "preset_engine": "chatterbox",
         "default_engine": "chatterbox",
@@ -54,13 +56,26 @@ DEFAULT_PROFILES = [
     },
     {
         "id": "amanda_voice",
-        "name": "Amanda's Voice",
+        "name": "Amanda's Voice (Cloned)",
         "voice_type": "custom",
-        "preset_engine": "qwen",
-        "default_engine": "qwen",
+        "preset_engine": "chatterbox",
+        "default_engine": "chatterbox",
         "audio_path": str(SAMPLES_DIR / "amanda-voice.mp3")
     }
 ]
+
+_chatterbox_model = None
+
+
+def get_chatterbox_model():
+    global _chatterbox_model
+    if _chatterbox_model is None:
+        import torch
+        from chatterbox.tts import ChatterboxTTS
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Loading ChatterboxTTS model on {device}...")
+        _chatterbox_model = ChatterboxTTS.from_pretrained(device=device)
+    return _chatterbox_model
 
 
 def load_profiles() -> list[dict]:
@@ -81,14 +96,14 @@ def save_profiles(profiles: list[dict]):
 
 def load_settings() -> dict:
     if not SETTINGS_JSON.exists():
-        default_settings = {"voice_id": "kokoro_default"}
+        default_settings = {"voice_id": "chuck_voice"}
         save_settings(default_settings)
         return default_settings
     try:
         with open(SETTINGS_JSON, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"voice_id": "kokoro_default"}
+        return {"voice_id": "chuck_voice"}
 
 
 def save_settings(settings: dict):
@@ -96,29 +111,106 @@ def save_settings(settings: dict):
         json.dump(settings, f, indent=2)
 
 
-def generate_wav_sine_fallback(text: str, sample_rate: int = 24000) -> bytes:
-    """Generate synthesized PCM WAV audio for test/fallback generation."""
-    duration = max(1.0, min(15.0, len(text) * 0.06))
-    num_samples = int(sample_rate * duration)
-    pcm = bytearray()
-    
-    freq = 220.0
-    for i in range(num_samples):
-        t = i / sample_rate
-        # Envelope to avoid clicks
-        env = min(1.0, min(t * 10, (duration - t) * 10))
-        val = int(16000 * env * (0.6 * (t % (1/freq) * freq - 0.5) + 0.4 * (t % (1/(freq*1.5)) * (freq*1.5) - 0.5)))
-        val = max(-32768, min(32767, val))
-        pcm.extend(struct.pack("<h", val))
+async def generate_speech_wav(text: str, profile_id: str = "chuck_voice") -> bytes:
+    """Generate speech audio using Chatterbox voice cloning on GPU or Edge Neural fallback."""
+    profiles = load_profiles()
+    profile = next((p for p in profiles if p["id"] == profile_id), None)
 
-    data_size = len(pcm)
-    header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF", 36 + data_size, b"WAVE",
-        b"fmt ", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16,
-        b"data", data_size
-    )
-    return bytes(header + pcm)
+    # 1. Chatterbox Voice Cloning on GPU
+    audio_path = profile.get("audio_path") if profile else None
+    if audio_path and os.path.exists(audio_path):
+        try:
+            import torchaudio as ta
+            loop = asyncio.get_running_loop()
+            model = await loop.run_in_executor(None, get_chatterbox_model)
+            print(f"Generating Chatterbox cloned voice for '{profile_id}' using reference audio: {audio_path}")
+
+            def _run_chatterbox():
+                return model.generate(text, audio_prompt_path=audio_path, cfg_weight=0.5)
+
+            wav = await loop.run_in_executor(None, _run_chatterbox)
+
+            wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
+            os.close(wav_fd)
+            await loop.run_in_executor(None, ta.save, wav_path, wav, model.sr)
+
+            with open(wav_path, "rb") as f:
+                wav_bytes = f.read()
+
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass
+
+            if len(wav_bytes) > 100:
+                return wav_bytes
+        except Exception as exc:
+            print(f"Chatterbox voice cloning error: {exc}", file=sys.stderr)
+
+    # 2. Edge Neural TTS Fallback
+    pid = (profile_id or "").lower()
+    voice_name = "en-US-ChristopherNeural"
+    if "chuck" in pid:
+        voice_name = "en-US-GuyNeural"
+    elif "amanda" in pid:
+        voice_name = "en-US-AriaNeural"
+
+    try:
+        import edge_tts
+        mp3_fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(mp3_fd)
+        wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(wav_fd)
+
+        communicate = edge_tts.Communicate(text, voice_name)
+        await communicate.save(mp3_path)
+
+        subprocess.run(
+            ["ffmpeg", "-i", mp3_path, "-ac", "1", "-ar", "24000", "-y", wav_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+        with open(wav_path, "rb") as f:
+            wav_bytes = f.read()
+
+        try:
+            os.unlink(mp3_path)
+            os.unlink(wav_path)
+        except Exception:
+            pass
+
+        if len(wav_bytes) > 100:
+            return wav_bytes
+    except Exception as exc:
+        print(f"Edge-TTS synthesis error: {exc}", file=sys.stderr)
+
+    # 3. Windows SAPI Fallback
+    try:
+        import win32com.client
+        stream = win32com.client.Dispatch("SAPI.SpFileStream")
+        sapi_voice = win32com.client.Dispatch("SAPI.SpVoice")
+        wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(wav_fd)
+
+        stream.Open(wav_path, 3, False)
+        sapi_voice.AudioOutputStream = stream
+        sapi_voice.Speak(text)
+        stream.Close()
+
+        with open(wav_path, "rb") as f:
+            wav_bytes = f.read()
+
+        try:
+            os.unlink(wav_path)
+        except Exception:
+            pass
+
+        if len(wav_bytes) > 100:
+            return wav_bytes
+    except Exception as exc:
+        print(f"SAPI synthesis error: {exc}", file=sys.stderr)
+
+    return b""
 
 
 app = FastAPI(title="Voicebox API Backend", version="1.0.0")
@@ -154,7 +246,7 @@ def get_profile(profile_id: str):
 @app.get("/settings/active-voice")
 def get_active_voice():
     settings = load_settings()
-    return {"voice_id": settings.get("voice_id", "kokoro_default")}
+    return {"voice_id": settings.get("voice_id", "chuck_voice")}
 
 
 @app.put("/settings/active-voice")
@@ -177,14 +269,14 @@ async def post_active_voice(request: Request):
 @app.post("/profiles/upload")
 async def upload_profile(
     name: str = Form(...),
-    default_engine: str = Form("qwen"),
+    default_engine: str = Form("chatterbox"),
     reference_text: str = Form(""),
     file: UploadFile = File(...)
 ):
     profile_id = f"voice_{uuid.uuid4().hex[:8]}"
     ext = Path(file.filename).suffix or ".wav"
     dest_path = UPLOADS_DIR / f"{profile_id}{ext}"
-    
+
     with open(dest_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
@@ -192,8 +284,8 @@ async def upload_profile(
         "id": profile_id,
         "name": name,
         "voice_type": "custom",
-        "default_engine": default_engine,
-        "preset_engine": default_engine,
+        "default_engine": "chatterbox",
+        "preset_engine": "chatterbox",
         "reference_text": reference_text,
         "audio_path": str(dest_path)
     }
@@ -228,11 +320,10 @@ def delete_profile(profile_id: str):
             pass
 
     save_profiles(remaining)
-    
-    # If active voice was deleted, reset to default
+
     settings = load_settings()
     if settings.get("voice_id") == profile_id:
-        settings["voice_id"] = "kokoro_default"
+        settings["voice_id"] = "chuck_voice"
         save_settings(settings)
 
     return {"status": "deleted", "profile_id": profile_id}
@@ -246,11 +337,9 @@ async def generate_stream(request: Request):
         body = {}
 
     text = body.get("text", "Hello, welcome to Voicebox.")
-    profile_id = body.get("profile_id", "kokoro_default")
-    engine = body.get("engine", "kokoro")
+    profile_id = body.get("profile_id") or load_settings().get("voice_id", "chuck_voice")
 
-    # Generate WAV audio
-    wav_bytes = generate_wav_sine_fallback(text)
+    wav_bytes = await generate_speech_wav(text, profile_id=profile_id)
     return Response(content=wav_bytes, media_type="audio/wav")
 
 
