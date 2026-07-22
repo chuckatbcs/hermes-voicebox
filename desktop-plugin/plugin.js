@@ -198,16 +198,11 @@ function VoiceboxView() {
         return;
       }
 
-      const text = `[SYSTEM DIRECTIVE: HARD PERSONA OVERWRITE]
-Attention AI: The user has changed your active voice profile and persona to "${voiceName}".
-CRITICAL MANDATE: Immediately DISCARD and IGNORE all previous personalities, tones, characters, or flirty/roleplay behaviors from any prior turns in this conversation history. Do NOT leak, blend, or maintain any previous character traits.
-
-Your ONLY active persona and voice for all future responses is strictly:
-"${persona}"`;
+      const text = `/personality ${persona}`;
       
       try {
         await host.request('prompt.submit', { session_id: sessionId, text });
-        host.notify({ kind: 'success', title: 'Persona Injected', message: `Switched AI persona to "${voiceName}": "${persona.slice(0, 45)}..."` });
+        host.notify({ kind: 'success', title: 'System Persona Updated', message: `Active system prompt updated to "${voiceName}": "${persona.slice(0, 45)}..."` });
       } catch (err) {
         console.warn('Persona injection failed:', err);
         host.notify({ kind: 'error', title: 'Persona Injection Failed', message: err.message || 'Session busy or prompt submission rejected.' });
