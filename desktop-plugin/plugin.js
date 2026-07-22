@@ -532,6 +532,12 @@ function VoiceboxView() {
                             body: JSON.stringify({ name: v.name, language: v.language || 'en', personality: val })
                           });
                           setVoices(prev => prev.map(p => p.id === v.id ? { ...p, personality: val } : p));
+
+                          // If this is the currently active voice, update active session system prompt immediately
+                          if (v.id === activeVoiceId) {
+                            const sessionId = host.state?.activeSessionId?.get();
+                            await host.request('config.set', { key: 'personality', value: val, session_id: sessionId || undefined });
+                          }
                         } catch (_) {}
                       },
                       className: 'h-8 text-xs bg-background/50'
