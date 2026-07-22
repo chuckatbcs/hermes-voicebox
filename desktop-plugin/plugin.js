@@ -185,18 +185,27 @@ function VoiceboxView() {
         message: `Active voice: ${voice?.name || voiceId}  •  ${meta.label || engine}  •  VRAM ${meta.vram || '?'}` });
 
       const voiceName = voice?.name || voiceId;
-      const persona = personaMapping[voiceId] || personaMapping[voiceName] || personaMapping['Default'];
-      const sessionId = host.state.activeSessionId.get();
-      if (sessionId && persona) {
-        const text = `[SYSTEM NOTIFICATION] The user has changed your active voice profile to "${voiceName}". Effective immediately, you must adopt the following personality and tone for all future responses: "${persona}"`;
-        await host.request('prompt.submit', {
-          session_id: sessionId,
-          text
-        }).then(() => {
-          host.notify({ kind: 'success', title: 'Persona Injected', message: `Notified AI to switch persona to "${voiceName}".` });
-        }).catch(err => {
-          console.warn('Persona injection failed or timed out:', err);
-        });
+      const persona = personaMapping[voiceId] || personaMapping[voiceName];
+      
+      if (!persona) {
+        host.notify({ kind: 'info', title: 'Voice Changed', message: `Active voice set to "${voiceName}". (No custom AI persona prompt set in Manage Voices)` });
+        return;
+      }
+
+      const sessionId = host.state?.activeSessionId?.get();
+      if (!sessionId) {
+        host.notify({ kind: 'warning', title: 'No Active Chat Session', message: `Changed voice to "${voiceName}", but open a chat room to inject the persona into your session.` });
+        return;
+      }
+
+      const text = `[SYSTEM NOTIFICATION] The user has changed your active voice profile to "${voiceName}". Effective immediately, you must adopt the following personality and tone for all future responses: "${persona}"`;
+      
+      try {
+        await host.request('prompt.submit', { session_id: sessionId, text });
+        host.notify({ kind: 'success', title: 'Persona Injected', message: `Switched AI persona to "${voiceName}": "${persona.slice(0, 45)}..."` });
+      } catch (err) {
+        console.warn('Persona injection failed:', err);
+        host.notify({ kind: 'error', title: 'Persona Injection Failed', message: err.message || 'Session busy or prompt submission rejected.' });
       }
     } catch (err) {
       host.notify({ kind: 'error', title: 'Voice Update Failed', message: err.message });
