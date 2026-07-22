@@ -184,16 +184,16 @@ def main():
     import subprocess
     
     def _ensure_service_running():
-        try:
-            _get_json(f"{base_url}/health")
-            return
-        except Exception:
-            # Try to start systemd service if available
+        for _ in range(15):
             try:
-                subprocess.run(["systemctl", "--user", "start", "voicebox"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                time.sleep(3)
+                _get_json(f"{base_url}/health")
+                return
             except Exception:
-                pass
+                try:
+                    subprocess.run(["systemctl", "--user", "start", "voicebox"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+                time.sleep(1)
 
     _ensure_service_running()
 
