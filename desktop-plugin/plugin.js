@@ -198,7 +198,12 @@ function VoiceboxView() {
         return;
       }
 
-      const text = `[SYSTEM NOTIFICATION] The user has changed your active voice profile to "${voiceName}". Effective immediately, you must adopt the following personality and tone for all future responses: "${persona}"`;
+      const text = `[SYSTEM DIRECTIVE: HARD PERSONA OVERWRITE]
+Attention AI: The user has changed your active voice profile and persona to "${voiceName}".
+CRITICAL MANDATE: Immediately DISCARD and IGNORE all previous personalities, tones, characters, or flirty/roleplay behaviors from any prior turns in this conversation history. Do NOT leak, blend, or maintain any previous character traits.
+
+Your ONLY active persona and voice for all future responses is strictly:
+"${persona}"`;
       
       try {
         await host.request('prompt.submit', { session_id: sessionId, text });
