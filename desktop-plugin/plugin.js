@@ -185,7 +185,7 @@ function VoiceboxView() {
         message: `Active voice: ${voice?.name || voiceId}  •  ${meta.label || engine}  •  VRAM ${meta.vram || '?'}` });
 
       const voiceName = voice?.name || voiceId;
-      const persona = personaMapping[voiceId] || personaMapping[voiceName];
+      const persona = voice?.personality || personaMapping[voiceId] || personaMapping[voiceName];
       
       if (!persona) {
         host.notify({ kind: 'info', title: 'Voice Changed', message: `Active voice set to "${voiceName}". (No custom AI persona prompt set in Manage Voices)` });
@@ -523,12 +523,23 @@ function VoiceboxView() {
                   React.createElement('div', { key: 'persona-row', className: 'flex flex-col gap-1 mt-1 pt-2 border-t border-border/50' }, [
                     React.createElement('label', { className: 'text-xs font-semibold text-muted-foreground' }, '🎭 AI Persona Prompt'),
                     React.createElement(Input, {
-                      value: personaMapping[v.id] || personaMapping[v.name] || '',
-                      placeholder: 'e.g. You are a helpful assistant...',
-                      onChange: (e) => {
-                        const next = { ...personaMapping, [v.id]: e.target.value };
+                      value: v.personality || personaMapping[v.id] || personaMapping[v.name] || '',
+                      placeholder: 'e.g. You are Vincent Price. Speak with an eerie horror host voice...',
+                      onChange: async (e) => {
+                        const val = e.target.value;
+                        const next = { ...personaMapping, [v.id]: val, [v.name]: val };
                         setPersonaMapping(next);
                         localStorage.setItem('hermes_personas', JSON.stringify(next));
+                        
+                        // Sync to Voicebox DB
+                        try {
+                          await fetch(`${BACKEND_URL}/profiles/${v.id}`, {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name: v.name, language: v.language || 'en', personality: val })
+                          });
+                          setVoices(prev => prev.map(p => p.id === v.id ? { ...p, personality: val } : p));
+                        } catch (_) {}
                       },
                       className: 'h-8 text-xs bg-background/50'
                     })
