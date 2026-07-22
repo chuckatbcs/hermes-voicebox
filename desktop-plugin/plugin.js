@@ -193,19 +193,12 @@ function VoiceboxView() {
       }
 
       const sessionId = host.state?.activeSessionId?.get();
-      if (!sessionId) {
-        host.notify({ kind: 'warning', title: 'No Active Chat Session', message: `Changed voice to "${voiceName}", but open a chat room to inject the persona into your session.` });
-        return;
-      }
-
-      const text = `/personality ${persona}`;
-      
       try {
-        await host.request('prompt.submit', { session_id: sessionId, text });
+        await host.request('config.set', { key: 'personality', value: persona, session_id: sessionId || undefined });
         host.notify({ kind: 'success', title: 'System Persona Updated', message: `Active system prompt updated to "${voiceName}": "${persona.slice(0, 45)}..."` });
       } catch (err) {
-        console.warn('Persona injection failed:', err);
-        host.notify({ kind: 'error', title: 'Persona Injection Failed', message: err.message || 'Session busy or prompt submission rejected.' });
+        console.warn('Persona update failed:', err);
+        host.notify({ kind: 'error', title: 'Persona Update Failed', message: err.message || 'Failed to update system persona.' });
       }
     } catch (err) {
       host.notify({ kind: 'error', title: 'Voice Update Failed', message: err.message });
