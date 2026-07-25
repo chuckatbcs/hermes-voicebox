@@ -1,10 +1,12 @@
-# Windows launcher for the cross-platform Hermes Voicebox installer.
+﻿# Windows launcher for the cross-platform Hermes Voicebox installer.
 # Bootstraps Python if missing, then runs install.py (prereqs + plugin).
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Yes
 #   .\install.ps1 -Yes
 #   .\install.ps1 -SkipPrereqs
+#
+# Encoding: ASCII / UTF-8 with BOM for Windows PowerShell 5.1 compatibility.
 [CmdletBinding()]
 param(
     [string]$HermesDir = $env:HERMES_DIR,
@@ -55,10 +57,10 @@ function Find-Python {
 }
 
 function Install-PythonBootstrap {
-    Write-Host "Python 3.10+ not found — attempting install via winget..." -ForegroundColor Yellow
+    Write-Host "Python 3.10+ not found - attempting install via winget..." -ForegroundColor Yellow
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if (-not $winget) {
-        Write-Error "winget not found. Install Python from https://www.python.org/downloads/ (check 'Add python.exe to PATH'), then re-run."
+        Write-Error "winget not found. Install Python from https://www.python.org/downloads/ (check Add python.exe to PATH), then re-run."
         exit 1
     }
     & winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements

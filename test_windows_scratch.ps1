@@ -1,4 +1,4 @@
-# Simulates a typical new Windows Hermes user installing this repo from scratch.
+﻿# Simulates a typical new Windows Hermes user installing this repo from scratch.
 # Runs under Windows PowerShell or PowerShell 7 (pwsh) on Linux CI.
 #
 # Typical user command this approximates:
@@ -39,7 +39,7 @@ Assert-True ($LASTEXITCODE -eq 0) "install.ps1 -PrintSnippet exit 0"
 Write-Host ""
 Write-Host "Step 2: From-scratch plugin install (skip live upstream downloads)" -ForegroundColor Cyan
 Write-Host "        (Approximates a user who will start Hermes/Voicebox separately,"
-Write-Host "         or already has them — validates the Windows entrypoint path.)"
+Write-Host "         or already has them - validates the Windows entrypoint path.)"
 & "$RepoRoot\install.ps1" -HermesDir $HermesDir -Yes -SkipPrereqs
 Assert-True ($LASTEXITCODE -eq 0) "install.ps1 -Yes -SkipPrereqs exit 0"
 
