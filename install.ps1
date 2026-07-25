@@ -1,32 +1,59 @@
-# Windows installer for Hermes Voicebox integration
+# Windows launcher for the cross-platform Hermes Voicebox installer.
+# Usage:
+#   powershell -ExecutionPolicy Bypass -File .\install.ps1
+#   .\install.ps1
+#   .\install.ps1 -NoConfig
+[CmdletBinding()]
+param(
+    [string]$HermesDir = $env:HERMES_DIR,
+    [switch]$NoConfig,
+    [switch]$PrintSnippet
+)
+
 $ErrorActionPreference = "Stop"
 
-$HERMES_DIR = "$HOME\.hermes"
-Write-Host "=== Installing Hermes Voicebox Integration (Windows) ===" -ForegroundColor Cyan
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ScriptDir
 
-# 1. Ensure target directories exist
-New-Item -ItemType Directory -Force -Path "$HERMES_DIR\desktop-plugins\voice-switcher" | Out-Null
-New-Item -ItemType Directory -Force -Path "$HERMES_DIR\scripts" | Out-Null
+function Find-Python {
+    $commands = @(
+        @{ File = "py"; Args = @("-3") },
+        @{ File = "python"; Args = @() },
+        @{ File = "python3"; Args = @() }
+    )
+    foreach ($cand in $commands) {
+        $cmd = Get-Command $cand.File -ErrorAction SilentlyContinue
+        if (-not $cmd) { continue }
+        try {
+            $allArgs = $cand.Args + @("-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)")
+            & $cand.File @allArgs | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                return @{ File = $cand.File; Args = $cand.Args }
+            }
+        } catch {
+            continue
+        }
+    }
+    return $null
+}
 
-# 2. Copy plugin files
-Write-Host "Copying plugin UI..."
-Copy-Item -Path "desktop-plugin\plugin.js" -Destination "$HERMES_DIR\desktop-plugins\voice-switcher\plugin.js" -Force
+$py = Find-Python
+if (-not $py) {
+    Write-Error "Python 3.10+ is required but was not found on PATH. Install Python from https://www.python.org/downloads/ and ensure 'Add python.exe to PATH' is checked."
+    exit 1
+}
 
-# 3. Copy python bridge script
-Write-Host "Copying python bridge..."
-Copy-Item -Path "scripts\voicebox_tts.py" -Destination "$HERMES_DIR\scripts\voicebox_tts.py" -Force
+$installArgs = @("$ScriptDir\install.py")
+if ($HermesDir) {
+    $installArgs += @("--hermes-dir", $HermesDir)
+}
+if ($NoConfig) {
+    $installArgs += "--no-config"
+}
+if ($PrintSnippet) {
+    $installArgs += "--print-snippet"
+}
 
-Write-Host ""
-Write-Host "=== Setup Complete ===" -ForegroundColor Green
-Write-Host "Please add/replace the following section in your $HERMES_DIR\config.yaml:"
-Write-Host ""
-Write-Host "tts:"
-Write-Host "  provider: voicebox"
-Write-Host "  providers:"
-Write-Host "    voicebox:"
-Write-Host "      type: command"
-Write-Host '      command: python $env:USERPROFILE\.hermes\scripts\voicebox_tts.py --text-file {input_path} --out {output_path} --voice {voice}'
-Write-Host "      voice: default"
-Write-Host "      output_format: wav"
-Write-Host ""
-Write-Host "Make sure your Voicebox API is running locally on port 17493!" -ForegroundColor Yellow
+Write-Host "Using: $($py.File) $($py.Args -join ' ')" -ForegroundColor Cyan
+& $py.File @($py.Args + $installArgs)
+exit $LASTEXITCODE

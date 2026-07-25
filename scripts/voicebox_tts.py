@@ -198,15 +198,17 @@ def main():
                 return
             except Exception as e:
                 last_err = e
-                try:
-                    subprocess.run(
-                        ["systemctl", "--user", "start", "voicebox"],
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception:
-                    pass
+                # Auto-start via systemd is Linux-only; Windows users start Voicebox manually.
+                if sys.platform.startswith("linux"):
+                    try:
+                        subprocess.run(
+                            ["systemctl", "--user", "start", "voicebox"],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception:
+                        pass
                 time.sleep(1)
         print(
             f"Error: Voicebox API unreachable at {base_url}/health ({last_err}). "

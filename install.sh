@@ -1,35 +1,17 @@
-#!/bin/bash
-# Linux installer for Hermes Voicebox integration
-set -e
+#!/usr/bin/env bash
+# Linux/macOS launcher for the cross-platform Hermes Voicebox installer.
+set -euo pipefail
 
-HERMES_DIR="$HOME/.hermes"
-echo "=== Installing Hermes Voicebox Integration (Linux) ==="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-# 1. Ensure target directories exist
-mkdir -p "$HERMES_DIR/desktop-plugins/voice-switcher"
-mkdir -p "$HERMES_DIR/scripts"
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON=python
+else
+  echo "ERROR: Python 3.10+ is required but was not found on PATH." >&2
+  exit 1
+fi
 
-# 2. Copy plugin files
-echo "Copying plugin UI..."
-cp desktop-plugin/plugin.js "$HERMES_DIR/desktop-plugins/voice-switcher/plugin.js"
-
-# 3. Copy python bridge script
-echo "Copying python bridge..."
-cp scripts/voicebox_tts.py "$HERMES_DIR/scripts/voicebox_tts.py"
-chmod +x "$HERMES_DIR/scripts/voicebox_tts.py"
-
-# 4. Prompt user to configure hermes config.yaml
-echo ""
-echo "=== Setup Complete ==="
-echo "Please add/replace the following section in your $HERMES_DIR/config.yaml:"
-echo ""
-echo "tts:"
-echo "  provider: voicebox"
-echo "  providers:"
-echo "    voicebox:"
-echo "      type: command"
-echo "      command: python3 \$HOME/.hermes/scripts/voicebox_tts.py --text-file {input_path} --out {output_path} --voice {voice}"
-echo "      voice: default"
-echo "      output_format: wav"
-echo ""
-echo "Make sure your Voicebox API is running locally on port 17493!"
+exec "$PYTHON" "$SCRIPT_DIR/install.py" "$@"

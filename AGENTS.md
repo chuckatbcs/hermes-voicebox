@@ -16,7 +16,8 @@ Bounded local execution engineer for this repository unless explicitly assigned 
 |------|---------|
 | `desktop-plugin/plugin.js` | Hermes desktop plugin UI (voice select / clone / delete / personas) |
 | `scripts/voicebox_tts.py` | Hermes TTS command bridge (chunked generate + WAV merge) |
-| `install.sh` / `install.ps1` | Copy plugin + bridge into `$HOME/.hermes` |
+| `install.py` | Cross-platform installer (canonical) |
+| `install.sh` / `install.ps1` | Thin OS launchers that call `install.py` |
 | `README.md` | User-facing docs |
 
 ## Authorized scope
@@ -51,8 +52,9 @@ None currently designated. Do not invent protected paths.
 
 Before claiming complete, run applicable checks:
 
-- Python syntax: `python3 -m py_compile scripts/voicebox_tts.py`
-- Any added unit tests for bridge helpers
+- Python syntax: `python3 -m py_compile scripts/voicebox_tts.py install.py`
+- Unit tests: `python3 -m unittest discover -s scripts -v` and `python3 -m unittest discover -s . -p 'test_install.py' -v` when present
+- Installer smoke test to a temp `HERMES_DIR` on Linux
 - Manual sanity review of plugin fetch/error paths when UI tests are unavailable
 
 ## Stop conditions
