@@ -60,10 +60,51 @@ function samplePersonalityForHermes(sample) {
   ].join('\n');
 }
 
+function packSamplePersonality(sample, userFacingPrompt) {
+  const body = String(userFacingPrompt || sample.personality || '').trim();
+  return `${SAMPLE_SEED_MARKER}:${sample.key}\n${body}`;
+}
+
+/** Strip internal seed markers / legacy wrappers for UI display. */
+function displayPersonaPrompt(text) {
+  let t = String(text || '');
+  // Older seeds concatenated marker + wrapper without newlines.
+  t = t.replace(new RegExp(`^\\s*${SAMPLE_SEED_MARKER}:[a-z0-9_]+\\s*`, 'i'), '');
+  t = t.replace(/^\s*\[Voicebox sample persona:[^\]]+\]\s*/i, '');
+  t = t.replace(/^\s*CRITICAL:\s*Adopt this persona completely for this session\.\s*/i, '');
+  t = t.replace(/^\s*Discard prior roleplay tones from earlier turns unless the user asks to drop character\.\s*/i, '');
+  // Safety pass if leftovers remain mid-string from legacy packs.
+  t = t.replace(new RegExp(`${SAMPLE_SEED_MARKER}:[a-z0-9_]+\\s*`, 'i'), '');
+  t = t.replace(/\[Voicebox sample persona:[^\]]+\]\s*/i, '');
+  return t.trim();
+}
+
+function sameVoiceId(a, b) {
+  return String(a ?? '') !== '' && String(a) === String(b);
+}
+
+const ACTIVE_VOICE_LS_KEY = 'voicebox_active_voice_id';
+
+function readLocalActiveVoice() {
+  try {
+    return String(localStorage.getItem(ACTIVE_VOICE_LS_KEY) || '');
+  } catch (_) {
+    return '';
+  }
+}
+
+function writeLocalActiveVoice(voiceId) {
+  try {
+    const id = voiceId == null ? '' : String(voiceId);
+    if (id) localStorage.setItem(ACTIVE_VOICE_LS_KEY, id);
+    else localStorage.removeItem(ACTIVE_VOICE_LS_KEY);
+  } catch (_) {}
+}
+
 function findSampleByVoice(voice) {
   if (!voice) return null;
   const personality = String(voice.personality || '');
-  const marker = personality.match(new RegExp(`${SAMPLE_SEED_MARKER}:([a-z0-9_]+)`));
+  const marker = personality.match(new RegExp(`${SAMPLE_SEED_MARKER}:([a-z0-9_]+)`, 'i'));
   if (marker) {
     return SAMPLE_VOICES.find((s) => s.key === marker[1]) || null;
   }
@@ -72,10 +113,8 @@ function findSampleByVoice(voice) {
 }
 
 function buildSampleProfilePayload(sample) {
-  const personality = [
-    `${SAMPLE_SEED_MARKER}:${sample.key}`,
-    samplePersonalityForHermes(sample),
-  ].join('\n');
+  // Store a clean user-facing persona plus a one-line machine marker.
+  const personality = packSamplePersonality(sample, sample.personality);
   const payload = {
     name: sample.name,
     language: 'en',
@@ -216,21 +255,81 @@ async function apiFetch(path, options = {}) {
 // Voice selection persistence via Voicebox API
 // instead of Hermes config store (which crashes)
 // ─────────────────────────────────────────────
+async function persistHermesTtsVoice(voiceId) {
+  // Hermes command TTS substitutes {voice} from provider config — this is the
+  // reliable path because many Voicebox builds have no /settings/active-voice.
+  const value = voiceId ? String(voiceId) : 'default';
+  const keys = [
+    'tts.providers.voicebox.voice',
+    'tts.voice',
+  ];
+  let lastErr = null;
+  for (const key of keys) {
+    try {
+      await host.request('config.set', { key, value });
+      return key;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('Could not update Hermes TTS voice');
+}
+
 async function saveActiveVoice(voiceId) {
-  await apiFetch('/settings/active-voice', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ voice_id: voiceId })
-  });
+  const id = voiceId == null ? '' : String(voiceId);
+  writeLocalActiveVoice(id);
+
+  let hermesKey = null;
+  try {
+    hermesKey = await persistHermesTtsVoice(id);
+  } catch (err) {
+    console.warn('Hermes TTS voice persist skipped:', err);
+  }
+
+  // Optional: some forks expose an active-voice settings route; most do not.
+  const payloads = [
+    { voice_id: id },
+    { profile_id: id },
+    { active_voice_id: id },
+    { id },
+  ];
+  for (const body of payloads) {
+    try {
+      await apiFetch('/settings/active-voice', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      return { hermesKey, voicebox: true };
+    } catch (_) {
+      // keep trying
+    }
+  }
+  try {
+    await apiFetch('/settings/active-voice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ voice_id: id, profile_id: id }),
+    });
+    return { hermesKey, voicebox: true };
+  } catch (_) {}
+
+  if (hermesKey || id === '' || readLocalActiveVoice() === id) {
+    // Local + Hermes persistence is enough for plugin UI and TTS bridge.
+    return { hermesKey, voicebox: false };
+  }
+  throw new Error('Could not persist active voice');
 }
 
 async function loadActiveVoice(signal) {
   try {
     const data = await apiFetch('/settings/active-voice', signal ? { signal } : {});
-    return data?.voice_id || '';
+    const fromApi = data?.voice_id || data?.profile_id || data?.active_voice_id || data?.id || '';
+    if (fromApi) return String(fromApi);
   } catch {
-    return '';
+    // Voicebox may not expose this route.
   }
+  return readLocalActiveVoice();
 }
 
 /**
@@ -242,7 +341,16 @@ async function loadActiveVoice(signal) {
 async function applyHermesPersona({ key, prompt, voiceName }) {
   const sessionId = host.state?.activeSessionId?.get();
   const modes = [];
+  const cleanPrompt = displayPersonaPrompt(prompt) || prompt;
+  const sample = key ? SAMPLE_VOICES.find((s) => s.key === key) : null;
+  const systemPrompt = sample
+    ? samplePersonalityForHermes({ ...sample, personality: cleanPrompt })
+    : cleanPrompt;
 
+  // Named keys match /personality — but many Desktop sessions 404 until restart
+  // after installer merge. Prefer named, then fall back to full prompt text.
+  // Never set named *after* prompt-text (that overwrites a working prompt).
+  let personalitySet = false;
   if (key) {
     try {
       await host.request('config.set', {
@@ -251,24 +359,34 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
         session_id: sessionId || undefined,
       });
       modes.push(`named:${key}`);
+      personalitySet = true;
     } catch (err) {
-      console.warn('Named personality set failed, falling back to prompt text:', err);
+      console.warn('Named personality set skipped:', err);
     }
   }
 
-  if (!modes.length) {
-    await host.request('config.set', {
-      key: 'personality',
-      value: prompt,
-      session_id: sessionId || undefined,
-    });
-    modes.push('prompt-text');
+  if (!personalitySet) {
+    try {
+      await host.request('config.set', {
+        key: 'personality',
+        value: systemPrompt,
+        session_id: sessionId || undefined,
+      });
+      modes.push('prompt-text');
+      personalitySet = true;
+    } catch (err) {
+      console.warn('Prompt-text personality set failed:', err);
+    }
+  }
+
+  if (!personalitySet) {
+    throw new Error('Hermes rejected persona update (config.set personality)');
   }
 
   try {
     await host.request('config.set', {
       key: 'agent.system_prompt',
-      value: prompt,
+      value: systemPrompt,
       session_id: sessionId || undefined,
     });
     modes.push('agent.system_prompt');
@@ -290,8 +408,11 @@ async function seedSampleVoices(existingProfiles) {
     const payload = buildSampleProfilePayload(sample);
 
     if (existing?.id) {
-      const hasMarker = String(existing.personality || '').includes(`${SAMPLE_SEED_MARKER}:${sample.key}`);
-      if (!hasMarker || !existing.personality) {
+      const stored = String(existing.personality || '');
+      const hasMarker = stored.includes(`${SAMPLE_SEED_MARKER}:${sample.key}`);
+      const looksConcatenated = hasMarker && !stored.includes('\n') && stored.length > 80;
+      const hasLegacyWrapper = /\[Voicebox sample persona:/i.test(stored);
+      if (!hasMarker || !stored || looksConcatenated || hasLegacyWrapper) {
         try {
           await apiFetch(`/profiles/${existing.id}`, {
             method: 'PUT',
@@ -636,10 +757,14 @@ function VoiceboxView() {
       }
 
       if (controller.signal.aborted) return;
-      setVoices(Array.isArray(data) ? data : []);
+      const profiles = Array.isArray(data) ? data.map((v) => ({ ...v, id: String(v.id) })) : [];
+      setVoices(profiles);
 
       const savedVoice = await loadActiveVoice(controller.signal);
-      if (!controller.signal.aborted && savedVoice) setActiveVoiceId(savedVoice);
+      if (!controller.signal.aborted && savedVoice) {
+        const match = profiles.find((v) => sameVoiceId(v.id, savedVoice));
+        setActiveVoiceId(match ? match.id : String(savedVoice));
+      }
     } catch (err) {
       if (err?.name === 'AbortError') return;
       console.error(err);
@@ -683,6 +808,9 @@ function VoiceboxView() {
   }, [deleteConfirmId]);
 
   const persistPersona = useCallback(async (voice, val) => {
+    const sample = findSampleByVoice(voice) || SAMPLE_VOICES.find(s => s.name === voice.name);
+    const storedVal = sample ? packSamplePersonality(sample, val) : val;
+
     setPersonaMapping(prev => {
       const next = { ...prev, [voice.id]: val, [voice.name]: val };
       try {
@@ -695,12 +823,11 @@ function VoiceboxView() {
       await apiFetch(`/profiles/${voice.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: voice.name, language: voice.language || 'en', personality: val })
+        body: JSON.stringify({ name: voice.name, language: voice.language || 'en', personality: storedVal })
       });
-      setVoices(prev => prev.map(p => p.id === voice.id ? { ...p, personality: val } : p));
+      setVoices(prev => prev.map(p => p.id === voice.id ? { ...p, personality: storedVal } : p));
 
-      if (voice.id === activeVoiceId) {
-        const sample = findSampleByVoice({ ...voice, personality: val });
+      if (sameVoiceId(voice.id, activeVoiceId)) {
         await applyHermesPersona({
           key: sample?.key,
           prompt: val,
@@ -729,49 +856,81 @@ function VoiceboxView() {
   // ── Active Voice Selection ───────────────────
   const handleVoiceChange = async (voiceId) => {
     if (!voiceId) return;
+    const id = String(voiceId);
     const previousId = activeVoiceId;
-    const voice = voices.find(v => v.id === voiceId);
-    const { engine, meta } = getEngineMeta(voice);
-    try {
-      setActiveVoiceId(voiceId);
-      await saveActiveVoice(voiceId);
-      host.notify({ kind: 'success', title: 'Voice Updated',
-        message: `Active voice: ${voice?.name || voiceId}  •  ${meta.label || engine}  •  VRAM ${meta.vram || '?'}` });
-
-      const voiceName = voice?.name || voiceId;
-      const sample = findSampleByVoice(voice);
-      const persona = voice?.personality
-        || (sample ? samplePersonalityForHermes(sample) : null)
-        || personaMapping[voiceId]
-        || personaMapping[voiceName];
-
-      if (!persona) {
-        host.notify({ kind: 'info', title: 'Voice Changed', message: `Active voice set to "${voiceName}". (No custom AI persona prompt set in Manage Voices)` });
-        return;
-      }
-
-      try {
-        const result = await applyHermesPersona({
-          key: sample?.key,
-          prompt: persona,
-          voiceName,
-        });
-        const mode = result.modes.join(' + ');
-        host.notify({
-          kind: 'success',
-          title: 'Persona Applied',
-          message: result.sessionId
-            ? `"${voiceName}" persona active for this chat (${mode}).`
-            : `"${voiceName}" persona saved. Open/focus a chat for full session overlay (${mode}).`,
-        });
-      } catch (err) {
-        console.warn('Persona update failed:', err);
-        host.notify({ kind: 'error', title: 'Persona Update Failed', message: err.message || 'Failed to update system persona.' });
-      }
-    } catch (err) {
-      setActiveVoiceId(previousId);
-      host.notify({ kind: 'error', title: 'Voice Update Failed', message: err.message });
+    const voice = voices.find((v) => sameVoiceId(v.id, id));
+    if (!voice) {
+      host.notify({ kind: 'error', title: 'Voice Update Failed', message: `Profile not found in list (${id}).` });
+      return;
     }
+    const { engine, meta } = getEngineMeta(voice);
+    setActiveVoiceId(id);
+
+    let persistInfo = null;
+    try {
+      persistInfo = await saveActiveVoice(id);
+    } catch (err) {
+      // Do not roll back UI selection — local active + persona can still work.
+      console.warn('Active-voice persistence failed:', err);
+      host.notify({
+        kind: 'warning',
+        title: 'Active Voice Saved Locally Only',
+        message: `${err.message || 'Not Found'} — selection kept for this Hermes session.`,
+      });
+    }
+
+    if (persistInfo) {
+      host.notify({
+        kind: 'success',
+        title: 'Voice Updated',
+        message: persistInfo.voicebox
+          ? `Active voice: ${voice.name}  •  ${meta.label || engine}  •  VRAM ${meta.vram || '?'}`
+          : `Active voice: ${voice.name} (Hermes TTS + local). Voicebox has no active-voice API on this build.`,
+      });
+    }
+
+    const voiceName = voice.name || voiceId;
+    const sample = findSampleByVoice(voice);
+    const persona = displayPersonaPrompt(voice.personality)
+      || (sample ? sample.personality : null)
+      || personaMapping[voiceId]
+      || personaMapping[voiceName];
+
+    if (!persona) {
+      host.notify({
+        kind: 'info',
+        title: 'Voice Changed',
+        message: `Active voice set to "${voiceName}". (No custom AI persona prompt set in Manage Voices)`,
+      });
+      return;
+    }
+
+    try {
+      const result = await applyHermesPersona({
+        key: sample?.key,
+        prompt: persona,
+        voiceName,
+      });
+      const mode = result.modes.join(' + ');
+      host.notify({
+        kind: 'success',
+        title: 'Persona Applied',
+        message: result.sessionId
+          ? `"${voiceName}" persona active for this chat (${mode}).`
+          : `"${voiceName}" persona saved. Open/focus a chat for full session overlay (${mode}).`,
+      });
+    } catch (err) {
+      console.warn('Persona update failed:', err);
+      // Keep the selected voice even if persona RPC fails.
+      host.notify({
+        kind: 'error',
+        title: 'Persona Update Failed',
+        message: err.message || 'Failed to update system persona.',
+      });
+    }
+
+    // previousId kept for possible future undo; selection intentionally not rolled back
+    void previousId;
   };
 
   // ── Delete voice ─────────────────────────────
@@ -779,7 +938,7 @@ function VoiceboxView() {
     setIsDeleting(true);
     try {
       await apiFetch(`/profiles/${voiceId}`, { method: 'DELETE' });
-      if (voiceId === activeVoiceId) {
+      if (sameVoiceId(voiceId, activeVoiceId)) {
         setActiveVoiceId('');
         try { await saveActiveVoice(''); } catch (_) {}
       }
@@ -1001,23 +1160,31 @@ function VoiceboxView() {
         React.createElement('h2', { key: 'h', className: 'text-xl font-semibold' }, 'Active Voice'),
         React.createElement('div', { key: 'body', className: 'flex flex-col gap-2' }, [
           React.createElement('label', { key: 'lbl', className: 'text-sm font-medium text-muted-foreground' }, 'Select Voice Profile'),
-          React.createElement(Select, { key: 'sel', value: activeVoiceId, onValueChange: handleVoiceChange },
+          React.createElement(Select, {
+            key: 'sel',
+            value: activeVoiceId ? String(activeVoiceId) : undefined,
+            onValueChange: handleVoiceChange,
+          },
             React.createElement(SelectTrigger, { className: 'w-full h-10' },
               React.createElement(SelectValue, { placeholder: 'Select a voice...' })
             ),
             React.createElement(SelectContent, {},
               voices.map(v =>
-                React.createElement(SelectItem, { key: v.id, value: v.id },
+                React.createElement(SelectItem, { key: String(v.id), value: String(v.id) },
                   `${engineBadge(v)}  —  ${v.name}`
                 )
               )
             )
           ),
           activeVoiceId && (() => {
-            const v = voices.find(x => x.id === activeVoiceId);
+            const v = voices.find((x) => sameVoiceId(x.id, activeVoiceId));
             if (!v) return null;
             const { engine, meta } = getEngineMeta(v);
-            const personaText = v.personality || personaMapping[v.id] || personaMapping[v.name] || personaMapping['Default'] || 'You are a helpful AI assistant.';
+            const personaText = displayPersonaPrompt(v.personality)
+              || personaMapping[v.id]
+              || personaMapping[v.name]
+              || personaMapping['Default']
+              || 'You are a helpful AI assistant.';
             return React.createElement('div', { key: 'active-info', className: 'flex flex-col gap-1 mt-1 bg-muted/30 p-3 rounded-md border border-border/50' }, [
               React.createElement('p', { key: 'v-info', className: 'text-xs text-muted-foreground' },
                 `${meta.badge || '⚪'} Using ${meta.label || engine}  •  ${meta.vram || '?'} VRAM  •  ${meta.description || ''}`
@@ -1044,15 +1211,15 @@ function VoiceboxView() {
                 const draft = personaDrafts[v.id];
                 const personaValue = draft != null
                   ? draft
-                  : (v.personality || personaMapping[v.id] || personaMapping[v.name] || '');
+                  : (displayPersonaPrompt(v.personality) || personaMapping[v.id] || personaMapping[v.name] || '');
                 return React.createElement('div', {
                   key: v.id,
-                  className: `flex flex-col gap-2 rounded-md px-4 py-3 border transition-colors ${v.id === activeVoiceId ? 'border-primary bg-primary/5' : 'border-border bg-muted/20 hover:bg-muted/30'}`
+                  className: `flex flex-col gap-2 rounded-md px-4 py-3 border transition-colors ${sameVoiceId(v.id, activeVoiceId) ? 'border-primary bg-primary/5' : 'border-border bg-muted/20 hover:bg-muted/30'}`
                 }, [
                   React.createElement('div', { key: 'top-row', className: 'flex items-center justify-between' }, [
                     React.createElement('div', { key: 'info', className: 'flex items-center gap-2 min-w-0 flex-wrap' }, [
                       React.createElement('span', { key: 'name', className: 'font-medium text-sm truncate' }, v.name),
-                      v.id === activeVoiceId && React.createElement('span', {
+                      sameVoiceId(v.id, activeVoiceId) && React.createElement('span', {
                         key: 'active',
                         className: 'text-xs bg-primary text-primary-foreground rounded-full px-2 py-0.5 shrink-0'
                       }, 'Active'),

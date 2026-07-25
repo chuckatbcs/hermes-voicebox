@@ -96,6 +96,7 @@ python install.py -y
 - **`VOICEBOX_PORT`** / **`--base-url`**: TTS bridge backend URL (default `http://127.0.0.1:17493`)
 - **`HERMES_DIR`**: Hermes data directory override (default `~/.hermes`)
 - **`localStorage.voicebox_backend_url`**: optional plugin UI override
+- **Active voice**: the plugin stores selection in `localStorage` and updates Hermes `tts.providers.voicebox.voice` (so the bridge’s `{voice}` is correct). Upstream Voicebox often has **no** `/settings/active-voice` route — a 404 there is expected and non-fatal.
 
 Bridge URL precedence: `--base-url` → `VOICEBOX_PORT` → default `17493`.
 

@@ -7,6 +7,7 @@ from voicebox_tts import (
     _parse_wav_header,
     _split_sentences,
     get_base_url,
+    resolve_profile_id,
 )
 
 
@@ -59,6 +60,37 @@ class TestGetBaseUrl(unittest.TestCase):
                 del os.environ["VOICEBOX_PORT"]
             else:
                 os.environ["VOICEBOX_PORT"] = old
+
+
+class TestResolveProfileId(unittest.TestCase):
+    def test_cli_voice_wins(self):
+        calls = []
+
+        def get_json(url):
+            calls.append(url)
+            raise AssertionError("should not fetch when CLI voice is set")
+
+        self.assertEqual(
+            resolve_profile_id("profile-123", "http://127.0.0.1:17493", get_json=get_json),
+            "profile-123",
+        )
+        self.assertEqual(calls, [])
+
+    def test_falls_back_when_active_voice_missing(self):
+        class MissingActiveVoice(Exception):
+            pass
+
+        def get_json(url):
+            if url.endswith("/settings/active-voice"):
+                raise MissingActiveVoice("Not Found")
+            if url.endswith("/profiles"):
+                return [{"id": "first-profile"}]
+            raise AssertionError(url)
+
+        self.assertEqual(
+            resolve_profile_id("default", "http://127.0.0.1:17493", get_json=get_json),
+            "first-profile",
+        )
 
 
 if __name__ == "__main__":

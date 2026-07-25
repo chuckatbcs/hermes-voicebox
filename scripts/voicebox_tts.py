@@ -147,6 +147,78 @@ def _get_json(url: str) -> dict:
         return json.loads(r.read().decode())
 
 
+_INVALID_VOICE_IDS = {
+    "",
+    "default",
+    "undefined",
+    "null",
+    "none",
+    "00000000-0000-0000-0000-000000000000",
+}
+
+
+def _hermes_dir() -> str:
+    return os.environ.get("HERMES_DIR") or os.path.expanduser("~/.hermes")
+
+
+def _read_local_active_voice() -> str:
+    """Optional sidecar; many Voicebox builds lack /settings/active-voice."""
+    candidates = [
+        os.path.join(_hermes_dir(), "voicebox_active_voice.json"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "voicebox_active_voice.json"),
+    ]
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            vid = data.get("voice_id") or data.get("profile_id") or data.get("id") or ""
+            vid = str(vid).strip()
+            if vid and vid.lower() not in _INVALID_VOICE_IDS:
+                return vid
+        except Exception:
+            continue
+    return ""
+
+
+def resolve_profile_id(cli_voice: str, base_url: str, get_json=None) -> str:
+    """
+    Resolve which Voicebox profile to use.
+    Precedence: CLI --voice > local sidecar > /settings/active-voice > first profile.
+    """
+    fetcher = get_json or _get_json
+    voice = (cli_voice or "").strip()
+    if voice and voice.lower() not in _INVALID_VOICE_IDS:
+        return voice
+
+    local = _read_local_active_voice()
+    if local:
+        return local
+
+    try:
+        active_data = fetcher(f"{base_url}/settings/active-voice")
+        if isinstance(active_data, dict):
+            active_id = (
+                active_data.get("voice_id")
+                or active_data.get("profile_id")
+                or active_data.get("active_voice_id")
+                or active_data.get("id")
+                or ""
+            )
+            active_id = str(active_id).strip()
+            if active_id and active_id.lower() not in _INVALID_VOICE_IDS:
+                return active_id
+    except Exception as e:
+        print(
+            f"Note: active-voice settings unavailable ({e}); using profiles list.",
+            file=sys.stderr,
+        )
+
+    profiles = fetcher(f"{base_url}/profiles")
+    if profiles:
+        return str(profiles[0]["id"])
+    raise RuntimeError("No voice profiles available.")
+
+
 def _post_stream(url: str, payload: dict, timeout: int) -> bytes:
     data = json.dumps(payload).encode("utf-8")
     req  = urllib.request.Request(url, data=data,
@@ -219,27 +291,12 @@ def main():
 
     _ensure_service_running()
 
-    # 2b. Resolve profile ID
-    profile_id = args.voice
-    if not profile_id or profile_id in ("default", "undefined", "", "00000000-0000-0000-0000-000000000000"):
-        try:
-            # Try to get the active voice from the backend
-            active_data = _get_json(f"{base_url}/settings/active-voice")
-            active_id = active_data.get("voice_id")
-            
-            if active_id:
-                profile_id = active_id
-            else:
-                # Fallback to the first available profile
-                profiles = _get_json(f"{base_url}/profiles")
-                if profiles:
-                    profile_id = profiles[0]["id"]
-                else:
-                    print("Error: No voice profiles available.", file=sys.stderr)
-                    sys.exit(1)
-        except Exception as e:
-            print(f"Error resolving fallback profile: {e}", file=sys.stderr)
-            sys.exit(1)
+    # 2b. Resolve profile ID (CLI / local sidecar / optional API / first profile)
+    try:
+        profile_id = resolve_profile_id(args.voice, base_url)
+    except Exception as e:
+        print(f"Error resolving fallback profile: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # 3. Resolve engine + language from profile metadata
     engine = None
