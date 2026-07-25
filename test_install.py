@@ -86,6 +86,44 @@ class ModelResolveTests(unittest.TestCase):
         needed = prereqs.resolve_models_to_download(status, None)
         self.assertEqual(needed, ["kokoro"])
 
+    def test_does_not_invent_unknown_engine_ids(self):
+        # Real Voicebox rejects POST /models/download {"model_name":"qwen"}
+        status = {
+            "models": [
+                {"model_name": "kokoro", "engine": "kokoro", "downloaded": False},
+                {"model_name": "qwen-tts-1.7B", "engine": "qwen", "downloaded": False},
+                {"model_name": "chatterbox-tts", "engine": "chatterbox", "downloaded": False},
+                {"model_name": "chatterbox-turbo", "engine": "chatterbox_turbo", "downloaded": False},
+            ]
+        }
+        needed = prereqs.resolve_models_to_download(
+            status, ("kokoro", "qwen", "chatterbox", "chatterbox_turbo")
+        )
+        self.assertEqual(
+            needed,
+            ["kokoro", "qwen-tts-1.7B", "chatterbox-tts", "chatterbox-turbo"],
+        )
+        self.assertNotIn("qwen", needed)
+        self.assertNotIn("chatterbox", needed)
+
+    def test_matches_name_when_engine_field_missing(self):
+        status = {
+            "models": [
+                {"model_name": "qwen-tts-1.7B", "downloaded": False, "size_mb": 3500},
+                {"model_name": "chatterbox-turbo", "downloaded": False, "size_mb": 1500},
+            ]
+        }
+        needed = prereqs.resolve_models_to_download(status, ("qwen", "chatterbox_turbo"))
+        self.assertEqual(needed, ["qwen-tts-1.7B", "chatterbox-turbo"])
+
+    def test_dict_keyed_status_shape(self):
+        status = {
+            "kokoro": {"downloaded": False, "engine": "kokoro"},
+            "qwen-tts-1.7B": {"downloaded": False, "engine": "qwen", "size_mb": 3500},
+        }
+        needed = prereqs.resolve_models_to_download(status, ("kokoro", "qwen"))
+        self.assertEqual(needed, ["kokoro", "qwen-tts-1.7B"])
+
 
 class SkipPrereqInstallTests(unittest.TestCase):
     def test_skip_prereqs_smoke(self):

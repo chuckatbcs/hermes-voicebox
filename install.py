@@ -98,7 +98,7 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     return plugin_dst, bridge_dst
 
 
-def merge_config(config_path: Path, snippet: str) -> str:
+def merge_config(config_path: Path, snippet: str, *, force: bool = False) -> str:
     """
     Merge voicebox TTS block into config.yaml.
     Returns one of: created | replaced | appended | skipped_manual
@@ -118,6 +118,11 @@ def merge_config(config_path: Path, snippet: str) -> str:
         merged = (pre + "\n\n" if pre else "") + snippet + (("\n" + post) if post else "")
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
         return "replaced"
+
+    if force:
+        appended = original.rstrip() + "\n\n" + snippet
+        config_path.write_text(appended if appended.endswith("\n") else appended + "\n", encoding="utf-8")
+        return "appended"
 
     if "voicebox_tts.py" in original or "provider: voicebox" in original:
         return "skipped_manual"
@@ -155,6 +160,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-config",
         action="store_true",
         help="Only copy files; do not modify config.yaml",
+    )
+    parser.add_argument(
+        "--force-config",
+        action="store_true",
+        help="Replace/insert the marked hermes-voicebox TTS block even if config already has tts/voicebox",
     )
     parser.add_argument(
         "--print-snippet",
@@ -261,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_config:
         print("Skipped config.yaml (--no-config).")
     else:
-        result = merge_config(config_path, snippet)
+        result = merge_config(config_path, snippet, force=args.force_config)
         if result == "created":
             print(f"Created {config_path} with Voicebox TTS provider.")
         elif result == "replaced":
@@ -270,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Appended Voicebox TTS provider to {config_path} (backup: config.yaml.bak).")
         else:
             print(f"Left existing {config_path} unchanged (already has TTS/voicebox settings).")
-            print("Merge the snippet below manually if needed:")
+            print("Re-run with --force-config to append the marked block, or merge the snippet below manually:")
 
     print()
     print("=== Setup Complete ===")

@@ -13,6 +13,7 @@ param(
     [string]$BaseUrl = $(if ($env:VOICEBOX_BASE_URL) { $env:VOICEBOX_BASE_URL } else { "http://127.0.0.1:17493" }),
     [string]$ModelProfile = "plugin",
     [switch]$NoConfig,
+    [switch]$ForceConfig,
     [switch]$PrintSnippet,
     [switch]$Yes,
     [switch]$SkipPrereqs,
@@ -85,6 +86,7 @@ $InstallPy = Join-Path $ScriptDir "install.py"
 $installArgs = @($InstallPy, "--base-url", $BaseUrl, "--model-profile", $ModelProfile)
 if ($HermesDir) { $installArgs += @("--hermes-dir", $HermesDir) }
 if ($NoConfig) { $installArgs += "--no-config" }
+if ($ForceConfig) { $installArgs += "--force-config" }
 if ($PrintSnippet) { $installArgs += "--print-snippet" }
 if ($Yes) { $installArgs += "--yes" }
 if ($SkipPrereqs) { $installArgs += "--skip-prereqs" }

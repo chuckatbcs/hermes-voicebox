@@ -571,43 +571,85 @@ def _models_from_status(payload) -> list[dict]:
     if payload is None:
         return []
     if isinstance(payload, list):
-        return payload
+        return [m for m in payload if isinstance(m, dict)]
     if isinstance(payload, dict):
-        models = payload.get("models")
-        if isinstance(models, list):
-            return models
+        for key in ("models", "items", "data", "status"):
+            models = payload.get(key)
+            if isinstance(models, list):
+                return [m for m in models if isinstance(m, dict)]
+        # Some builds return { "kokoro": {...}, "qwen-tts-1.7B": {...} }
+        values = []
+        for k, v in payload.items():
+            if isinstance(v, dict) and (
+                "downloaded" in v or "engine" in v or "model_name" in v or "display_name" in v
+            ):
+                row = dict(v)
+                row.setdefault("model_name", k)
+                values.append(row)
+        if values:
+            return values
     return []
 
 
+def _model_name(m: dict) -> str:
+    return str(m.get("model_name") or m.get("name") or m.get("id") or "").strip()
+
+
+def _model_engine(m: dict) -> str:
+    return str(m.get("engine") or m.get("backend") or "").strip().lower().replace("-", "_")
+
+
+def _is_whisper(m: dict) -> bool:
+    blob = f"{_model_engine(m)} {_model_name(m)} {m.get('display_name', '')}".lower()
+    return "whisper" in blob or "asr" == _model_engine(m)
+
+
+def _engine_matches(wanted: str, m: dict) -> bool:
+    """Match a plugin engine key to a Voicebox /models/status row."""
+    wanted = wanted.lower().replace("-", "_")
+    eng = _model_engine(m)
+    name = _model_name(m).lower().replace("-", "_")
+    display = str(m.get("display_name", "")).lower().replace("-", "_")
+    blob = f"{eng} {name} {display}"
+
+    if wanted == "kokoro":
+        return eng == "kokoro" or "kokoro" in name
+    if wanted == "qwen":
+        # Prefer base Qwen TTS, not CustomVoice presets.
+        if "custom_voice" in blob or "customvoice" in blob:
+            return False
+        return eng in ("qwen", "qwen3", "qwen_tts") or name.startswith("qwen_tts") or "qwen_tts" in name
+    if wanted == "chatterbox_turbo":
+        return (
+            eng in ("chatterbox_turbo",)
+            or ("chatterbox" in blob and "turbo" in blob)
+        )
+    if wanted == "chatterbox":
+        if "turbo" in blob:
+            return False
+        return eng == "chatterbox" or name.startswith("chatterbox")
+    # Generic: exact engine, or model_name equals/starts with wanted
+    return eng == wanted or name == wanted or name.startswith(wanted + "_")
+
+
 def resolve_models_to_download(status_payload, engines: Iterable[str] | None) -> list[str]:
+    """
+    Return Voicebox *model_name* values to download.
+
+    Never invents names: only returns IDs present in /models/status (or exact
+    model_name equals an engine key when Voicebox registers it that way, e.g. kokoro).
+    """
     models = _models_from_status(status_payload)
-    tts_models = [
-        m for m in models
-        if isinstance(m, dict) and not str(m.get("engine", "")).startswith("whisper")
-        and "whisper" not in str(m.get("model_name", "")).lower()
-    ]
+    tts_models = [m for m in models if not _is_whisper(m) and _model_name(m)]
 
     if engines is None:
-        # all TTS
-        return [
-            m["model_name"]
-            for m in tts_models
-            if m.get("model_name") and not m.get("downloaded")
-        ]
+        return [_model_name(m) for m in tts_models if not m.get("downloaded")]
 
-    wanted = set(engines)
-    chosen: list[str] = []
-    # Prefer one model per engine. Favor larger/"1.7B"/non-0.6 variants when multiple.
-    by_engine: dict[str, list[dict]] = {}
-    for m in tts_models:
-        eng = m.get("engine")
-        if eng in wanted:
-            by_engine.setdefault(eng, []).append(m)
+    known_names = {_model_name(m) for m in tts_models}
 
     def rank(m: dict) -> tuple:
-        name = str(m.get("model_name", "")).lower()
+        name = _model_name(m).lower()
         display = str(m.get("display_name", "")).lower()
-        # higher is better
         score = 0
         if "1.7" in name or "1.7" in display:
             score += 30
@@ -616,17 +658,36 @@ def resolve_models_to_download(status_payload, engines: Iterable[str] | None) ->
         if m.get("downloaded"):
             score += 5
         size = m.get("size_mb") or 0
+        try:
+            size = int(size)
+        except Exception:
+            size = 0
         return (score, size)
 
+    chosen: list[str] = []
+    missing_engines: list[str] = []
     for eng in engines:
-        options = by_engine.get(eng) or []
+        options = [m for m in tts_models if _engine_matches(eng, m)]
         if not options:
-            # Fall back to using engine name itself as download key (docs example uses "kokoro")
-            chosen.append(eng)
+            # Only use bare engine key if Voicebox literally registers that model_name.
+            if eng in known_names:
+                row = next(m for m in tts_models if _model_name(m) == eng)
+                if not row.get("downloaded"):
+                    chosen.append(eng)
+            else:
+                missing_engines.append(eng)
             continue
         best = sorted(options, key=rank, reverse=True)[0]
         if not best.get("downloaded"):
-            chosen.append(best["model_name"])
+            chosen.append(_model_name(best))
+
+    if missing_engines:
+        available = sorted(known_names)
+        log(
+            "WARNING: No /models/status match for engine(s): "
+            + ", ".join(missing_engines)
+            + (f". Available: {', '.join(available)}" if available else ". (status list empty/unrecognized)")
+        )
     return chosen
 
 
@@ -679,14 +740,45 @@ def ensure_models(
         report.errors.append(f"Failed to query /models/status: {exc}")
         return False
 
-    report.add_check("models/status", True, f"profile={profile}")
+    available = [_model_name(m) for m in _models_from_status(status) if _model_name(m)]
+    report.add_check(
+        "models/status",
+        True,
+        f"profile={profile}; {len(available)} model(s) reported",
+    )
+    if available:
+        log("Voicebox reports models: " + ", ".join(available))
+
     needed = resolve_models_to_download(status, engines)
     if extra_models:
+        known = set(available)
         for name in extra_models:
-            if name not in needed:
-                needed.append(name)
+            if name in needed:
+                continue
+            if known and name not in known:
+                report.errors.append(
+                    f"Requested --model {name} not in /models/status. Available: {', '.join(sorted(known))}"
+                )
+                continue
+            needed.append(name)
 
     if not needed:
+        # Distinguish "all present" vs "could not map engines to model IDs"
+        still_missing = []
+        if engines is not None:
+            for eng in engines:
+                options = [m for m in _models_from_status(status) if _engine_matches(eng, m)]
+                if not options:
+                    still_missing.append(eng)
+                elif not any(m.get("downloaded") for m in options):
+                    # resolver should have added these; treat as mapping bug
+                    still_missing.append(eng)
+        if still_missing:
+            report.errors.append(
+                "Could not map engines to Voicebox model IDs: " + ", ".join(still_missing)
+            )
+            report.add_check("models", False, "engine→model_name mapping failed")
+            return False
         report.actions.append("All requested models already downloaded")
         report.add_check("models", True, "requested models present")
         return True
