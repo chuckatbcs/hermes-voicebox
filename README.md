@@ -6,7 +6,7 @@ Cross-platform integration between the **Hermes Desktop Client** and **Voicebox 
 
 - **Smart Engine Routing** for Kokoro / Chatterbox / Qwen profiles
 - **Sentence chunking & WAV merging** for long AI responses
-- **Native OS audio upload** for voice cloning
+- **In-plugin microphone recording** (plus native OS file picker) for voice cloning samples
 - **Safe two-step voice deletion**
 - **Installer that checks prerequisites and provisions what’s missing** (Hermes, Voicebox, TTS models)
 
