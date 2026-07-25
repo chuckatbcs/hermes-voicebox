@@ -133,8 +133,10 @@ class SkipPrereqInstallTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             plugin_dir = hermes / "desktop-plugins" / "voice-switcher"
             self.assertTrue((plugin_dir / "plugin.js").is_file())
-            self.assertTrue((plugin_dir / "sample-voices.js").is_file())
             self.assertTrue((plugin_dir / "sample-voices.json").is_file())
+            plugin_src = (plugin_dir / "plugin.js").read_text(encoding="utf-8")
+            self.assertNotIn("from './sample-voices.js'", plugin_src)
+            self.assertIn("SAMPLE_VOICES", plugin_src)
             self.assertTrue((hermes / "scripts" / "voicebox_tts.py").is_file())
 
 
