@@ -133,3 +133,21 @@ python3 -m unittest test_install.py -v
 (cd scripts && python3 -m unittest test_voicebox_tts.py -v)
 ./install.sh --hermes-dir /tmp/hermes-test --skip-prereqs
 ```
+
+### Windows from-scratch smoke test
+
+Simulates a new user’s Windows launcher against a clean Hermes directory (skips live Hermes/Voicebox/model downloads in CI):
+
+```powershell
+pwsh -NoProfile -File .\test_windows_scratch.ps1
+# or on Windows:
+powershell -NoProfile -ExecutionPolicy Bypass -File .\test_windows_scratch.ps1
+```
+
+On a real Windows PC, a brand-new user typically runs:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Yes
+```
+
+Then restart Hermes Desktop.

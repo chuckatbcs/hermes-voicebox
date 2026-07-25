@@ -78,7 +78,9 @@ if (-not $py) {
     exit 1
 }
 
-$installArgs = @("$ScriptDir\install.py", "--base-url", $BaseUrl, "--model-profile", $ModelProfile)
+# Join-Path so this launcher works on Windows PowerShell and pwsh-on-Linux CI.
+$InstallPy = Join-Path $ScriptDir "install.py"
+$installArgs = @($InstallPy, "--base-url", $BaseUrl, "--model-profile", $ModelProfile)
 if ($HermesDir) { $installArgs += @("--hermes-dir", $HermesDir) }
 if ($NoConfig) { $installArgs += "--no-config" }
 if ($PrintSnippet) { $installArgs += "--print-snippet" }
