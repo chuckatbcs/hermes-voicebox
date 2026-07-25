@@ -87,6 +87,29 @@ function extensionOf(filePath) {
   return idx > 0 ? base.slice(idx + 1).toLowerCase() : 'wav';
 }
 
+function pickRecorderMime() {
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) {
+    return '';
+  }
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/ogg;codecs=opus',
+    'audio/ogg',
+  ];
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+}
+
+function extensionForMime(mimeType) {
+  const m = (mimeType || '').toLowerCase();
+  if (m.includes('webm')) return 'webm';
+  if (m.includes('ogg')) return 'ogg';
+  if (m.includes('mp4') || m.includes('m4a') || m.includes('aac')) return 'm4a';
+  if (m.includes('wav')) return 'wav';
+  return 'webm';
+}
+
 async function apiFetch(path, options = {}) {
   const res = await fetch(`${BACKEND_URL}${path}`, options);
   if (!res.ok) {
@@ -151,7 +174,7 @@ function VoiceboxView() {
   });
   const [personaDrafts, setPersonaDrafts] = useState({});
 
-  // File state
+  // File / recording state
   const [fileName, setFileName]           = useState('');
   const [uploadFileName, setUploadFileName] = useState('sample.wav');
   const [audioUrl, setAudioUrl]           = useState(null);
@@ -159,6 +182,8 @@ function VoiceboxView() {
   const [audioDuration, setAudioDuration] = useState(null);
   const [isSaving, setIsSaving]           = useState(false);
   const [isPlaying, setIsPlaying]         = useState(false);
+  const [recordingState, setRecordingState] = useState('idle'); // idle | recording | recorded
+  const [recordElapsed, setRecordElapsed] = useState(0);
 
   // Connection & loading state
   const [isLoading, setIsLoading]         = useState(true);
@@ -169,6 +194,13 @@ function VoiceboxView() {
   const personaTimersRef = useRef({});
   const audioObjectUrlRef = useRef(null);
   const fetchAbortRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const recordMimeRef = useRef('');
+  const recordStartedAtRef = useRef(0);
+  const recordTickRef = useRef(null);
+  const recordMaxTimerRef = useRef(null);
 
   const revokeAudioUrl = useCallback(() => {
     if (audioObjectUrlRef.current) {
@@ -185,6 +217,203 @@ function VoiceboxView() {
     }
     setIsPlaying(false);
   }, []);
+
+  const clearRecordTimers = useCallback(() => {
+    if (recordTickRef.current) {
+      clearInterval(recordTickRef.current);
+      recordTickRef.current = null;
+    }
+    if (recordMaxTimerRef.current) {
+      clearTimeout(recordMaxTimerRef.current);
+      recordMaxTimerRef.current = null;
+    }
+  }, []);
+
+  const releaseMediaStream = useCallback(() => {
+    if (mediaStreamRef.current) {
+      try {
+        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+      } catch (_) {}
+      mediaStreamRef.current = null;
+    }
+  }, []);
+
+  const applyCapturedSample = useCallback(async (blob, nameForUi, uploadName) => {
+    stopPlayback();
+    revokeAudioUrl();
+    const objectUrl = URL.createObjectURL(blob);
+    audioObjectUrlRef.current = objectUrl;
+    setAudioBlob(blob);
+    setAudioUrl(objectUrl);
+    setFileName(nameForUi);
+    setUploadFileName(uploadName);
+    setAudioDuration(null);
+    setRecordingState('recorded');
+
+    try {
+      const tempAudio = new Audio(objectUrl);
+      await new Promise((resolve, reject) => {
+        tempAudio.onloadedmetadata = resolve;
+        tempAudio.onerror = reject;
+        setTimeout(() => reject(new Error('metadata timeout')), 5000);
+      });
+      if (isFinite(tempAudio.duration) && tempAudio.duration > 0) {
+        setAudioDuration(tempAudio.duration);
+      } else if (recordStartedAtRef.current) {
+        setAudioDuration(Math.max(0, (Date.now() - recordStartedAtRef.current) / 1000));
+      }
+      tempAudio.src = '';
+    } catch (durErr) {
+      console.warn('Could not read audio duration:', durErr);
+      if (recordStartedAtRef.current) {
+        setAudioDuration(Math.max(0, (Date.now() - recordStartedAtRef.current) / 1000));
+      }
+    }
+  }, [revokeAudioUrl, stopPlayback]);
+
+  const finalizeRecording = useCallback(() => {
+    clearRecordTimers();
+    // Stop tracks before creating any blob/object URL (avoids prior Electron segfault path).
+    releaseMediaStream();
+    mediaRecorderRef.current = null;
+
+    const mime = recordMimeRef.current || 'audio/webm';
+    const chunks = audioChunksRef.current;
+    audioChunksRef.current = [];
+    if (!chunks.length) {
+      setRecordingState('idle');
+      host.notify({ kind: 'warning', title: 'Empty Recording', message: 'No audio was captured. Try again or select a file.' });
+      return;
+    }
+    const blob = new Blob(chunks, { type: mime });
+    const ext = extensionForMime(mime);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const uiName = `mic-recording-${stamp}.${ext}`;
+    applyCapturedSample(blob, uiName, `sample.${ext}`);
+    if (!cloneName.trim()) {
+      setCloneName('Mic Recording');
+    }
+  }, [applyCapturedSample, clearRecordTimers, cloneName, releaseMediaStream]);
+
+  const stopRecording = useCallback(() => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state === 'inactive') {
+      clearRecordTimers();
+      releaseMediaStream();
+      setRecordingState((s) => (s === 'recording' ? 'idle' : s));
+      return;
+    }
+    try {
+      recorder.stop();
+    } catch (err) {
+      console.warn('MediaRecorder.stop failed:', err);
+      clearRecordTimers();
+      releaseMediaStream();
+      setRecordingState('idle');
+    }
+  }, [clearRecordTimers, releaseMediaStream]);
+
+  const startRecording = useCallback(async () => {
+    if (recordingState === 'recording') return;
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      host.notify({
+        kind: 'error',
+        title: 'Recording Unsupported',
+        message: 'Microphone capture is unavailable here. Use Select Audio Sample File instead.',
+      });
+      return;
+    }
+    if (typeof MediaRecorder === 'undefined') {
+      host.notify({
+        kind: 'error',
+        title: 'Recording Unsupported',
+        message: 'MediaRecorder is unavailable. Use Select Audio Sample File instead.',
+      });
+      return;
+    }
+
+    try {
+      if (window.hermesDesktop?.requestMicrophoneAccess) {
+        const permitted = await window.hermesDesktop.requestMicrophoneAccess();
+        if (permitted === false) {
+          host.notify({ kind: 'error', title: 'Mic Access Denied', message: 'Microphone access was denied.' });
+          return;
+        }
+      }
+
+      stopPlayback();
+      clearRecordTimers();
+      releaseMediaStream();
+      audioChunksRef.current = [];
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          channelCount: 1,
+        },
+      });
+      mediaStreamRef.current = stream;
+
+      const mimeType = pickRecorderMime();
+      recordMimeRef.current = mimeType || 'audio/webm';
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      recorder.onerror = (ev) => {
+        console.error('MediaRecorder error', ev);
+        clearRecordTimers();
+        releaseMediaStream();
+        mediaRecorderRef.current = null;
+        setRecordingState('idle');
+        host.notify({ kind: 'error', title: 'Recording Failed', message: 'Microphone recorder error. Try a file upload instead.' });
+      };
+      recorder.onstop = () => {
+        finalizeRecording();
+      };
+
+      // timeslice keeps chunks flowing; stop tracks only in finalizeRecording
+      recorder.start(250);
+      recordStartedAtRef.current = Date.now();
+      setRecordElapsed(0);
+      setRecordingState('recording');
+      setAudioDuration(null);
+
+      recordTickRef.current = setInterval(() => {
+        setRecordElapsed(Math.floor((Date.now() - recordStartedAtRef.current) / 1000));
+      }, 250);
+
+      recordMaxTimerRef.current = setTimeout(() => {
+        host.notify({
+          kind: 'info',
+          title: 'Recording Limit',
+          message: `Stopped at ${MAX_SAMPLE_SECONDS}s (Voicebox max sample length).`,
+        });
+        stopRecording();
+      }, MAX_SAMPLE_SECONDS * 1000);
+    } catch (err) {
+      console.error(err);
+      clearRecordTimers();
+      releaseMediaStream();
+      mediaRecorderRef.current = null;
+      setRecordingState('idle');
+      host.notify({
+        kind: 'error',
+        title: 'Mic Access Failed',
+        message: (err && err.message) || 'Could not access microphone. Use Select Audio Sample File instead.',
+      });
+    }
+  }, [
+    clearRecordTimers,
+    finalizeRecording,
+    recordingState,
+    releaseMediaStream,
+    stopPlayback,
+    stopRecording,
+  ]);
 
   // ── Fetch profiles + active voice ──────────
   const fetchProfilesAndConfig = useCallback(async () => {
@@ -219,10 +448,19 @@ function VoiceboxView() {
       if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
       Object.values(personaTimersRef.current).forEach(clearTimeout);
       personaTimersRef.current = {};
+      clearRecordTimers();
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.onstop = null;
+          mediaRecorderRef.current.stop();
+        }
+      } catch (_) {}
+      mediaRecorderRef.current = null;
+      releaseMediaStream();
       stopPlayback();
       revokeAudioUrl();
     };
-  }, [fetchProfilesAndConfig, stopPlayback, revokeAudioUrl]);
+  }, [fetchProfilesAndConfig, stopPlayback, revokeAudioUrl, clearRecordTimers, releaseMediaStream]);
 
   // ── Auto-cancel delete confirmation after 5 seconds ──
   useEffect(() => {
@@ -347,9 +585,6 @@ function VoiceboxView() {
       const baseName = nameWithExt.substring(0, nameWithExt.lastIndexOf('.')) || nameWithExt;
       const ext = extensionOf(filePath);
 
-      setFileName(nameWithExt);
-      setUploadFileName(`sample.${ext}`);
-      setAudioDuration(null);
       if (!cloneName.trim()) {
         setCloneName(baseName.replace(/[_-]/g, ' '));
       }
@@ -357,30 +592,8 @@ function VoiceboxView() {
       const dataUrl = await window.hermesDesktop.readFileDataUrl(filePath);
       const fetchRes = await fetch(dataUrl);
       const blob = await fetchRes.blob();
-
-      stopPlayback();
-      revokeAudioUrl();
-      const objectUrl = URL.createObjectURL(blob);
-      audioObjectUrlRef.current = objectUrl;
-
-      setAudioBlob(blob);
-      setAudioUrl(objectUrl);
-
-      // Get duration via an Audio element (safer than AudioContext in Electron)
-      try {
-        const tempAudio = new Audio(objectUrl);
-        await new Promise((resolve, reject) => {
-          tempAudio.onloadedmetadata = resolve;
-          tempAudio.onerror = reject;
-          setTimeout(() => reject(new Error('metadata timeout')), 5000);
-        });
-        if (isFinite(tempAudio.duration)) {
-          setAudioDuration(tempAudio.duration);
-        }
-        tempAudio.src = '';
-      } catch (durErr) {
-        console.warn('Could not read audio duration:', durErr);
-      }
+      recordStartedAtRef.current = 0;
+      await applyCapturedSample(blob, nameWithExt, `sample.${ext}`);
     } catch (err) {
       console.error(err);
       host.notify({ kind: 'error', title: 'File Read Failed', message: err.message });
@@ -417,8 +630,11 @@ function VoiceboxView() {
     if (!cloneName.trim()) {
       host.notify({ kind: 'warning', title: 'Name Required', message: 'Enter a name for the voice.' }); return;
     }
+    if (recordingState === 'recording') {
+      host.notify({ kind: 'warning', title: 'Still Recording', message: 'Stop the microphone recording before cloning.' }); return;
+    }
     if (!audioBlob) {
-      host.notify({ kind: 'warning', title: 'Audio Required', message: 'Upload a sample first.' }); return;
+      host.notify({ kind: 'warning', title: 'Audio Required', message: 'Record or upload a sample first.' }); return;
     }
     if (audioDuration != null && !sampleDurationOk) {
       host.notify({
@@ -463,6 +679,7 @@ function VoiceboxView() {
       revokeAudioUrl();
       setCloneName(''); setFileName(''); setUploadFileName('sample.wav');
       setAudioBlob(null); setAudioUrl(null); setAudioDuration(null);
+      setRecordingState('idle'); setRecordElapsed(0);
       host.notify({ kind: 'success', title: 'Voice Cloned!',
         message: `"${savedName}" created using ${engineMeta.label || cloneEngine} (${engineMeta.vram || '?'} VRAM).` });
 
@@ -716,24 +933,63 @@ function VoiceboxView() {
         React.createElement('div', { key: 'guide', className: 'flex flex-col gap-2 bg-muted/20 border border-border/50 rounded-md p-4 text-xs text-muted-foreground' }, [
           React.createElement('span', { key: 'title', className: 'font-semibold text-foreground text-sm' }, '🎙️ Voice Cloning Guidelines'),
           React.createElement('ul', { key: 'list', className: 'list-disc pl-4 flex flex-col gap-1' }, [
-            React.createElement('li', { key: '1' }, 'Formats: .wav, .mp3, .m4a, .ogg, .flac, .aac, .webm, .opus — max 50 MB.'),
-            React.createElement('li', { key: '2' }, 'Record a clean 10–120s audio sample using your OS recorder.'),
+            React.createElement('li', { key: '1' }, 'Record in-plugin (mic) or select a file: .wav, .mp3, .m4a, .ogg, .flac, .aac, .webm, .opus — max 50 MB.'),
+            React.createElement('li', { key: '2' }, `Aim for a clean ${MIN_SAMPLE_SECONDS}–${MAX_SAMPLE_SECONDS}s sample (auto-stops at ${MAX_SAMPLE_SECONDS}s).`),
             React.createElement('li', { key: '3' }, 'Ensure the reference text above matches the spoken audio exactly.')
           ])
         ]),
 
-        React.createElement('div', { key: 'upload', className: 'flex items-center gap-3 mt-1 flex-wrap' }, [
-          React.createElement(Button, { key: 'upl', variant: 'outline', onClick: handleNativeUpload }, '📁 Select Audio Sample File'),
-          fileName && React.createElement('span', { key: 'fn', className: 'text-xs text-muted-foreground truncate max-w-xs' }, `Selected: ${fileName}`),
-          durationBadge,
-          audioUrl && React.createElement(Button, { key: 'play', variant: 'secondary', size: 'sm', onClick: playPlayback },
-            isPlaying ? '⏸️ Pause' : '▶️ Play Sample')
+        React.createElement('div', { key: 'capture', className: 'flex flex-col gap-3 mt-1' }, [
+          React.createElement('div', { key: 'rec-row', className: 'flex items-center gap-3 flex-wrap' }, [
+            recordingState !== 'recording' && React.createElement(Button, {
+              key: 'rec',
+              variant: 'destructive',
+              disabled: isSaving,
+              onClick: startRecording
+            }, recordingState === 'recorded' ? '🔄 Record Again' : '🎙️ Record Sample'),
+            recordingState === 'recording' && React.createElement(Button, {
+              key: 'stop',
+              variant: 'destructive',
+              onClick: stopRecording
+            }, `⏹️ Stop (${formatDuration(recordElapsed)})`),
+            React.createElement(Button, {
+              key: 'upl',
+              variant: 'outline',
+              disabled: isSaving || recordingState === 'recording',
+              onClick: handleNativeUpload
+            }, '📁 Select Audio File'),
+            recordingState === 'recording' && React.createElement('span', {
+              key: 'live',
+              className: 'text-xs text-red-400 font-mono animate-pulse'
+            }, `Recording… ${formatDuration(recordElapsed)} / ${formatDuration(MAX_SAMPLE_SECONDS)}`),
+          ]),
+          React.createElement('div', { key: 'sample-row', className: 'flex items-center gap-3 flex-wrap' }, [
+            fileName && React.createElement('span', { key: 'fn', className: 'text-xs text-muted-foreground truncate max-w-xs' }, `Sample: ${fileName}`),
+            durationBadge,
+            audioUrl && recordingState !== 'recording' && React.createElement(Button, {
+              key: 'play', variant: 'secondary', size: 'sm', onClick: playPlayback
+            }, isPlaying ? '⏸️ Pause' : '▶️ Play Sample'),
+            audioUrl && recordingState === 'recorded' && React.createElement(Button, {
+              key: 'clear', variant: 'ghost', size: 'sm',
+              onClick: () => {
+                stopPlayback();
+                revokeAudioUrl();
+                setAudioBlob(null);
+                setAudioUrl(null);
+                setAudioDuration(null);
+                setFileName('');
+                setUploadFileName('sample.wav');
+                setRecordingState('idle');
+                setRecordElapsed(0);
+              }
+            }, 'Clear')
+          ])
         ]),
 
         React.createElement(Button, {
           key: 'clone-btn',
           className: 'w-full mt-4 h-11 text-base font-semibold', variant: 'default',
-          disabled: isSaving || !cloneName.trim() || !audioBlob || !sampleDurationOk,
+          disabled: isSaving || recordingState === 'recording' || !cloneName.trim() || !audioBlob || !sampleDurationOk,
           onClick: handleCloneSubmit
         }, isSaving ? 'Cloning Voice...' : `✨ Clone Voice  •  ${selectedEngineMeta.badge || ''} ${selectedEngineMeta.label || cloneEngine}`)
       ])
