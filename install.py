@@ -2,8 +2,9 @@
 """
 Cross-platform installer for Hermes Voicebox integration.
 
-Installs the desktop plugin + TTS bridge into the local Hermes directory
-and (optionally) merges the voicebox TTS provider into config.yaml.
+1) Checks/installs prerequisites (Python, Hermes, Voicebox, TTS models)
+2) Installs the desktop plugin + TTS bridge into the local Hermes directory
+3) Merges the voicebox TTS provider into config.yaml
 
 Works on Windows and Linux. Override target with HERMES_DIR.
 """
@@ -15,6 +16,14 @@ import platform
 import shutil
 import sys
 from pathlib import Path
+
+from installer.prereqs import (
+    DEFAULT_BASE_URL,
+    MODEL_PROFILES,
+    find_python_command,
+    run_prerequisite_flow,
+    voicebox_healthy,
+)
 
 
 MARKER_BEGIN = "# BEGIN hermes-voicebox"
@@ -30,42 +39,7 @@ def default_hermes_dir() -> Path:
     override = os.environ.get("HERMES_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    home = Path.home()
-    return (home / ".hermes").resolve()
-
-
-def find_python_command() -> str:
-    """Return a command Hermes can use to run the bridge on this OS."""
-    is_windows = platform.system() == "Windows"
-    candidates = []
-    if is_windows:
-        candidates.extend(["py -3", "python", "python3"])
-    else:
-        candidates.extend(["python3", "python"])
-
-    for candidate in candidates:
-        parts = candidate.split()
-        exe = shutil.which(parts[0])
-        if not exe:
-            continue
-        # Prefer real interpreters; skip Windows Store alias stubs when possible.
-        try:
-            import subprocess
-
-            probe = subprocess.run(
-                parts + ["-c", "import sys; print(sys.version_info[:2] >= (3, 10))"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if probe.returncode == 0 and probe.stdout.strip().endswith("True"):
-                return candidate
-        except Exception:
-            continue
-
-    # Fallback: whatever we were launched with
-    return "python" if is_windows else "python3"
+    return (Path.home() / ".hermes").resolve()
 
 
 def quote_for_command(path: Path) -> str:
@@ -145,7 +119,6 @@ def merge_config(config_path: Path, snippet: str) -> str:
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
         return "replaced"
 
-    # Already configured without markers — do not clobber unknown YAML structure.
     if "voicebox_tts.py" in original or "provider: voicebox" in original:
         return "skipped_manual"
 
@@ -165,11 +138,18 @@ def verify_install(plugin_dst: Path, bridge_dst: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Install Hermes Voicebox integration")
+    parser = argparse.ArgumentParser(
+        description="Install Hermes Voicebox integration (with prerequisite provisioning)"
+    )
     parser.add_argument(
         "--hermes-dir",
         default=None,
         help="Target Hermes directory (default: ~/.hermes or $HERMES_DIR)",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("VOICEBOX_BASE_URL", DEFAULT_BASE_URL),
+        help=f"Voicebox API base URL (default: {DEFAULT_BASE_URL})",
     )
     parser.add_argument(
         "--no-config",
@@ -181,11 +161,47 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print the config snippet and exit without installing",
     )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Non-interactive: auto-approve prerequisite installs/downloads",
+    )
+    parser.add_argument(
+        "--skip-prereqs",
+        action="store_true",
+        help="Skip prerequisite detection/provisioning (plugin files only)",
+    )
+    parser.add_argument("--skip-hermes", action="store_true", help="Do not install Hermes")
+    parser.add_argument("--skip-voicebox", action="store_true", help="Do not provision Voicebox")
+    parser.add_argument("--skip-models", action="store_true", help="Do not download TTS models")
+    parser.add_argument(
+        "--model-profile",
+        choices=sorted(MODEL_PROFILES.keys()),
+        default="plugin",
+        help="Which TTS models to ensure (default: plugin = kokoro/qwen/chatterbox/turbo)",
+    )
+    parser.add_argument(
+        "--model",
+        action="append",
+        default=[],
+        help="Extra model_name to download (repeatable)",
+    )
+    parser.add_argument(
+        "--prefer-docker",
+        action="store_true",
+        help="Prefer Docker for Voicebox even on Windows",
+    )
+    parser.add_argument(
+        "--prefer-desktop",
+        action="store_true",
+        help="Prefer Voicebox desktop installer on Windows",
+    )
     args = parser.parse_args(argv)
 
     src_root = repo_root()
     hermes_dir = Path(args.hermes_dir).expanduser().resolve() if args.hermes_dir else default_hermes_dir()
-    python_cmd = find_python_command()
+    python_cmd = find_python_command() or ("python" if platform.system() == "Windows" else "python3")
     bridge_path = hermes_dir / "scripts" / "voicebox_tts.py"
     snippet = build_snippet(python_cmd, bridge_path)
 
@@ -193,17 +209,50 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Repo:        {src_root}")
     print(f"Hermes dir:  {hermes_dir}")
     print(f"Python cmd:  {python_cmd}")
+    print(f"Voicebox:    {args.base_url}")
 
     if args.print_snippet:
         print()
         print(snippet)
         return 0
 
+    if not args.skip_prereqs:
+        prefer_docker = True
+        if platform.system() == "Windows":
+            prefer_docker = bool(args.prefer_docker) and not args.prefer_desktop
+            if args.prefer_desktop:
+                prefer_docker = False
+            elif not args.prefer_docker:
+                prefer_docker = False  # Windows default: desktop installer first
+
+        report = run_prerequisite_flow(
+            hermes_dir=hermes_dir,
+            base_url=args.base_url,
+            assume_yes=args.yes,
+            skip_hermes=args.skip_hermes,
+            skip_voicebox=args.skip_voicebox,
+            skip_models=args.skip_models,
+            model_profile=args.model_profile,
+            extra_models=args.model,
+            prefer_docker=prefer_docker,
+        )
+        if report.errors and not args.yes:
+            # In interactive mode, continue if plugin can still be installed, but warn.
+            print("WARNING: Some prerequisites reported errors. Continuing with plugin install...")
+        elif report.errors and args.yes and not args.skip_voicebox:
+            # Hard-fail in automation if Voicebox never became healthy.
+            if not voicebox_healthy(args.base_url) and not args.skip_models:
+                print("ERROR: Prerequisites failed; aborting.", file=sys.stderr)
+                return 1
+
     plugin_dst, bridge_dst = install_files(src_root, hermes_dir)
     verify_install(plugin_dst, bridge_dst)
     print(f"Installed plugin: {plugin_dst}")
     print(f"Installed bridge: {bridge_dst}")
 
+    # Refresh snippet with possibly updated python after prereq install
+    python_cmd = find_python_command() or python_cmd
+    snippet = build_snippet(python_cmd, bridge_dst)
     snippet_path = hermes_dir / "voicebox-provider.snippet.yaml"
     snippet_path.write_text(snippet, encoding="utf-8")
     print(f"Wrote snippet:    {snippet_path}")
@@ -228,14 +277,19 @@ def main(argv: list[str] | None = None) -> int:
     print("Config snippet (absolute paths for this machine):")
     print()
     print(snippet)
+    healthy = voicebox_healthy(args.base_url)
+    print("Status:")
+    print(f"  Voicebox API: {'healthy' if healthy else 'NOT REACHABLE'} ({args.base_url})")
     print("Next steps:")
-    print("  1. Ensure Voicebox API is running at http://127.0.0.1:17493")
-    print("  2. Restart Hermes Desktop so it reloads plugins + config")
-    print("  3. Open the Voicebox sidebar entry")
+    if not healthy:
+        print("  1. Start Voicebox (desktop app or `docker compose up -d` in ~/.hermes/vendor/voicebox)")
+        print("  2. Re-run with: python install.py -y --skip-hermes")
+    print("  • Restart Hermes Desktop so it reloads plugins + config")
+    print("  • Open the Voicebox sidebar entry")
     if platform.system() == "Windows":
         print()
         print("Windows tip: if script execution is blocked, run:")
-        print('  powershell -ExecutionPolicy Bypass -File .\\install.ps1')
+        print('  powershell -ExecutionPolicy Bypass -File .\\install.ps1 -Yes')
     return 0
 
 

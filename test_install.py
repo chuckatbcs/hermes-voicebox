@@ -5,8 +5,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import install
+from installer import prereqs
 
 
 class InstallerTests(unittest.TestCase):
@@ -58,6 +60,41 @@ class InstallerTests(unittest.TestCase):
             result = install.merge_config(cfg, snippet)
             self.assertEqual(result, "skipped_manual")
             self.assertEqual(cfg.read_text(encoding="utf-8"), "tts:\n  provider: something_else\n")
+
+
+class ModelResolveTests(unittest.TestCase):
+    def test_prefers_17b_qwen_and_skips_downloaded(self):
+        status = {
+            "models": [
+                {"model_name": "qwen-tts-0.6B", "engine": "qwen", "downloaded": False, "size_mb": 1200},
+                {"model_name": "qwen-tts-1.7B", "engine": "qwen", "downloaded": False, "size_mb": 3500},
+                {"model_name": "kokoro", "engine": "kokoro", "downloaded": True, "size_mb": 350},
+                {"model_name": "chatterbox-tts", "engine": "chatterbox", "downloaded": False, "size_mb": 3200},
+                {"model_name": "whisper-base", "engine": "whisper", "downloaded": False, "size_mb": 300},
+            ]
+        }
+        needed = prereqs.resolve_models_to_download(status, ("kokoro", "qwen", "chatterbox"))
+        self.assertEqual(needed, ["qwen-tts-1.7B", "chatterbox-tts"])
+
+    def test_all_profile_skips_whisper(self):
+        status = {
+            "models": [
+                {"model_name": "kokoro", "engine": "kokoro", "downloaded": False},
+                {"model_name": "whisper-small", "engine": "whisper", "downloaded": False},
+            ]
+        }
+        needed = prereqs.resolve_models_to_download(status, None)
+        self.assertEqual(needed, ["kokoro"])
+
+
+class SkipPrereqInstallTests(unittest.TestCase):
+    def test_skip_prereqs_smoke(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes = Path(tmp) / ".hermes"
+            rc = install.main(["--hermes-dir", str(hermes), "--skip-prereqs", "--no-config"])
+            self.assertEqual(rc, 0)
+            self.assertTrue((hermes / "desktop-plugins" / "voice-switcher" / "plugin.js").is_file())
+            self.assertTrue((hermes / "scripts" / "voicebox_tts.py").is_file())
 
 
 if __name__ == "__main__":

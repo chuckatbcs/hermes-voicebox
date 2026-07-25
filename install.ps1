@@ -1,19 +1,42 @@
 # Windows launcher for the cross-platform Hermes Voicebox installer.
+# Bootstraps Python if missing, then runs install.py (prereqs + plugin).
+#
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File .\install.ps1
-#   .\install.ps1
-#   .\install.ps1 -NoConfig
+#   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Yes
+#   .\install.ps1 -Yes
+#   .\install.ps1 -SkipPrereqs
 [CmdletBinding()]
 param(
     [string]$HermesDir = $env:HERMES_DIR,
+    [string]$BaseUrl = $(if ($env:VOICEBOX_BASE_URL) { $env:VOICEBOX_BASE_URL } else { "http://127.0.0.1:17493" }),
+    [string]$ModelProfile = "plugin",
     [switch]$NoConfig,
-    [switch]$PrintSnippet
+    [switch]$PrintSnippet,
+    [switch]$Yes,
+    [switch]$SkipPrereqs,
+    [switch]$SkipHermes,
+    [switch]$SkipVoicebox,
+    [switch]$SkipModels,
+    [switch]$PreferDocker,
+    [switch]$PreferDesktop
 )
 
 $ErrorActionPreference = "Stop"
-
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
+
+function Test-Python {
+    param([string]$File, [string[]]$PrefixArgs)
+    try {
+        $allArgs = @()
+        if ($PrefixArgs) { $allArgs += $PrefixArgs }
+        $allArgs += @("-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)")
+        & $File @allArgs | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
 
 function Find-Python {
     $commands = @(
@@ -24,35 +47,48 @@ function Find-Python {
     foreach ($cand in $commands) {
         $cmd = Get-Command $cand.File -ErrorAction SilentlyContinue
         if (-not $cmd) { continue }
-        try {
-            $allArgs = $cand.Args + @("-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)")
-            & $cand.File @allArgs | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                return @{ File = $cand.File; Args = $cand.Args }
-            }
-        } catch {
-            continue
+        if (Test-Python -File $cand.File -PrefixArgs $cand.Args) {
+            return @{ File = $cand.File; Args = $cand.Args }
         }
     }
     return $null
 }
 
+function Install-PythonBootstrap {
+    Write-Host "Python 3.10+ not found — attempting install via winget..." -ForegroundColor Yellow
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        Write-Error "winget not found. Install Python from https://www.python.org/downloads/ (check 'Add python.exe to PATH'), then re-run."
+        exit 1
+    }
+    & winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements
+    # Refresh PATH in this session from machine + user env
+    $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = "$machinePath;$userPath"
+}
+
 $py = Find-Python
 if (-not $py) {
-    Write-Error "Python 3.10+ is required but was not found on PATH. Install Python from https://www.python.org/downloads/ and ensure 'Add python.exe to PATH' is checked."
+    Install-PythonBootstrap
+    $py = Find-Python
+}
+if (-not $py) {
+    Write-Error "Python 3.10+ is still not on PATH. Close this window, open a new PowerShell, and re-run install.ps1."
     exit 1
 }
 
-$installArgs = @("$ScriptDir\install.py")
-if ($HermesDir) {
-    $installArgs += @("--hermes-dir", $HermesDir)
-}
-if ($NoConfig) {
-    $installArgs += "--no-config"
-}
-if ($PrintSnippet) {
-    $installArgs += "--print-snippet"
-}
+$installArgs = @("$ScriptDir\install.py", "--base-url", $BaseUrl, "--model-profile", $ModelProfile)
+if ($HermesDir) { $installArgs += @("--hermes-dir", $HermesDir) }
+if ($NoConfig) { $installArgs += "--no-config" }
+if ($PrintSnippet) { $installArgs += "--print-snippet" }
+if ($Yes) { $installArgs += "--yes" }
+if ($SkipPrereqs) { $installArgs += "--skip-prereqs" }
+if ($SkipHermes) { $installArgs += "--skip-hermes" }
+if ($SkipVoicebox) { $installArgs += "--skip-voicebox" }
+if ($SkipModels) { $installArgs += "--skip-models" }
+if ($PreferDocker) { $installArgs += "--prefer-docker" }
+if ($PreferDesktop) { $installArgs += "--prefer-desktop" }
 
 Write-Host "Using: $($py.File) $($py.Args -join ' ')" -ForegroundColor Cyan
 & $py.File @($py.Args + $installArgs)
