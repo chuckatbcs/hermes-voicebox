@@ -10,6 +10,8 @@ import re
 import argparse
 import json
 import struct
+import subprocess
+import time
 import urllib.request
 import urllib.error
 
@@ -176,24 +178,42 @@ def main():
         sys.exit(1)
 
     if not text:
-        print("Warning: Empty text, skipping generation.", file=sys.stderr)
+        # Hermes expects an output file; write a minimal valid silent WAV.
+        print("Warning: Empty text, writing silent WAV.", file=sys.stderr)
+        silent = _build_wav([b"\x00\x00" * 240], 24000, 1, 16)
+        try:
+            with open(args.out, "wb") as f:
+                f.write(silent)
+        except Exception as e:
+            print(f"Error writing silent output file: {e}", file=sys.stderr)
+            sys.exit(1)
         sys.exit(0)
 
-    # 2. Ensure Voicebox service is running
-    import time
-    import subprocess
-    
+    # 2. Ensure Voicebox service is running (fail closed if still unreachable)
     def _ensure_service_running():
+        last_err = None
         for _ in range(15):
             try:
                 _get_json(f"{base_url}/health")
                 return
-            except Exception:
+            except Exception as e:
+                last_err = e
                 try:
-                    subprocess.run(["systemctl", "--user", "start", "voicebox"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(
+                        ["systemctl", "--user", "start", "voicebox"],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
                 except Exception:
                     pass
                 time.sleep(1)
+        print(
+            f"Error: Voicebox API unreachable at {base_url}/health ({last_err}). "
+            "Start the backend and retry.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     _ensure_service_running()
 
@@ -219,11 +239,13 @@ def main():
             print(f"Error resolving fallback profile: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # 3. Resolve engine from profile metadata
+    # 3. Resolve engine + language from profile metadata
     engine = None
+    language = "en"
     try:
         profile = _get_json(f"{base_url}/profiles/{profile_id}")
         engine  = profile.get("default_engine") or profile.get("preset_engine")
+        language = profile.get("language") or language
     except Exception as e:
         print(f"Warning: could not fetch profile details ({e}), engine left unset.", file=sys.stderr)
 
@@ -238,28 +260,49 @@ def main():
 
     for i, chunk_text in enumerate(chunks, 1):
         print(f"  Chunk {i}/{n} ({len(chunk_text)} chars)...", file=sys.stderr)
-        payload = {"profile_id": profile_id, "text": chunk_text, "language": "en"}
+        payload = {"profile_id": profile_id, "text": chunk_text, "language": language}
         if engine:
             payload["engine"] = engine
 
-        try:
-            raw = _post_stream(f"{base_url}/generate/stream", payload, CHUNK_TIMEOUT)
-        except urllib.error.HTTPError as e:
-            msg = e.read().decode("utf-8", errors="ignore")
-            print(f"HTTP {e.code} on chunk {i}: {msg}", file=sys.stderr)
-            sys.exit(1)
-        except urllib.error.URLError as e:
-            print(f"Connection error on chunk {i}: {e.reason}", file=sys.stderr)
-            sys.exit(1)
-        except Exception as e:
-            print(f"Unexpected error on chunk {i}: {e}", file=sys.stderr)
+        raw = None
+        last_err = None
+        for attempt in range(2):
+            try:
+                raw = _post_stream(f"{base_url}/generate/stream", payload, CHUNK_TIMEOUT)
+                break
+            except urllib.error.HTTPError as e:
+                msg = e.read().decode("utf-8", errors="ignore")
+                print(f"HTTP {e.code} on chunk {i}: {msg}", file=sys.stderr)
+                sys.exit(1)
+            except urllib.error.URLError as e:
+                last_err = e.reason
+                if attempt == 0:
+                    print(f"Connection error on chunk {i} (retrying): {e.reason}", file=sys.stderr)
+                    time.sleep(1)
+                    continue
+                print(f"Connection error on chunk {i}: {e.reason}", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                print(f"Unexpected error on chunk {i}: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        if raw is None:
+            print(f"Connection error on chunk {i}: {last_err}", file=sys.stderr)
             sys.exit(1)
 
         # Parse WAV header to extract PCM
         try:
             sr, nc, bps, data_offset, data_len = _parse_wav_header(raw)
+            chunk_fmt = (sr, nc, bps)
             if wav_format is None:
-                wav_format = (sr, nc, bps)
+                wav_format = chunk_fmt
+            elif chunk_fmt != wav_format:
+                print(
+                    f"Error: chunk {i} WAV format {chunk_fmt} does not match "
+                    f"first chunk format {wav_format}.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             pcm_segments.append(raw[data_offset: data_offset + data_len])
         except ValueError:
             # Backend returned an error JSON instead of WAV — surface it

@@ -29,6 +29,7 @@ A powerful cross-platform integration between the **Hermes Desktop Client** and 
 
 - **`VOICEBOX_PORT`**: Environment variable to set the port for the Voicebox API backend (default: `17493`).
 - **`--base-url`**: CLI argument for `voicebox_tts.py` to set the backend base URL directly (e.g. `--base-url http://127.0.0.1:17493`).
+- **`localStorage.voicebox_backend_url`**: Optional desktop-plugin override for the Voicebox API base URL (default: `http://127.0.0.1:17493`).
 
 The TTS bridge resolves the backend base URL using the following precedence order:
 1. `--base-url` CLI flag (highest precedence)

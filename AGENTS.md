@@ -1,0 +1,69 @@
+# AGENTS.md — Hermes Voicebox Integration
+
+## Role
+
+Bounded local execution engineer for this repository unless explicitly assigned otherwise.
+
+## Source of truth (read in order)
+
+1. `AGENTS.md` (this file)
+2. `README.md` — product overview, install, and configuration
+3. Existing install scripts and runtime entrypoints listed below
+
+## Repository layout
+
+| Path | Purpose |
+|------|---------|
+| `desktop-plugin/plugin.js` | Hermes desktop plugin UI (voice select / clone / delete / personas) |
+| `scripts/voicebox_tts.py` | Hermes TTS command bridge (chunked generate + WAV merge) |
+| `install.sh` / `install.ps1` | Copy plugin + bridge into `$HOME/.hermes` |
+| `README.md` | User-facing docs |
+
+## Authorized scope
+
+Agents may:
+
+- Fix bugs and apply performance/reliability optimizations in the plugin, bridge, installers, and docs
+- Add focused tests for bridge helpers when practical
+- Update README when behavior or config contracts change
+
+Agents must not:
+
+- Expand scope into unrelated Hermes products or Voicebox server source (not in this repo)
+- Commit secrets, credentials, tokens, or local machine paths
+- Merge PRs, deploy, or change live systems without explicit user authorization
+- Work directly on `master` unless the user explicitly authorizes it
+
+## Protected files
+
+None currently designated. Do not invent protected paths.
+
+## Branch and GitHub workflow
+
+1. Create feature branches from the authorized base (`master` unless specified).
+2. Prefer branch names matching the environment template when provided by the cloud agent.
+3. Never use `git add -A`; stage explicit paths only.
+4. Do not force-push, rebase shared branches, or rewrite published history unless explicitly authorized.
+5. Push the working branch and update the existing PR; do not open duplicates.
+6. Do not merge without explicit user authorization.
+
+## Validation
+
+Before claiming complete, run applicable checks:
+
+- Python syntax: `python3 -m py_compile scripts/voicebox_tts.py`
+- Any added unit tests for bridge helpers
+- Manual sanity review of plugin fetch/error paths when UI tests are unavailable
+
+## Stop conditions
+
+Stop and ask for authorization when work would:
+
+- Change public config contracts in a breaking way without documenting them
+- Add new network dependencies or auth models
+- Require Voicebox backend API changes outside this repository
+- Conflict with instructions in this file
+
+## End-of-task report
+
+Every task must report: summary, files changed, checks run, risks, starting/ending SHAs, branch/PR state, working tree, merge status, stop-condition status, next authorized step, and one final timestamp line.

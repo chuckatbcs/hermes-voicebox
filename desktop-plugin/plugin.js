@@ -1,7 +1,20 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, host } from '@hermes/plugin-sdk';
 
-const BACKEND_URL = 'http://localhost:17493';
+const DEFAULT_BACKEND_URL = 'http://127.0.0.1:17493';
+const PERSONA_DEBOUNCE_MS = 400;
+const MIN_SAMPLE_SECONDS = 2;
+const MAX_SAMPLE_SECONDS = 120;
+
+function resolveBackendUrl() {
+  try {
+    const stored = localStorage.getItem('voicebox_backend_url');
+    if (stored && /^https?:\/\//i.test(stored)) return stored.replace(/\/$/, '');
+  } catch (_) {}
+  return DEFAULT_BACKEND_URL;
+}
+
+const BACKEND_URL = resolveBackendUrl();
 
 // ─────────────────────────────────────────────
 // Engine metadata
@@ -68,25 +81,46 @@ function formatDuration(seconds) {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
+function extensionOf(filePath) {
+  const base = filePath.split(/[/\\]/).pop() || '';
+  const idx = base.lastIndexOf('.');
+  return idx > 0 ? base.slice(idx + 1).toLowerCase() : 'wav';
+}
+
+async function apiFetch(path, options = {}) {
+  const res = await fetch(`${BACKEND_URL}${path}`, options);
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const data = await res.json();
+      detail = data.detail || data.message || '';
+    } catch (_) {
+      try { detail = await res.text(); } catch (_) {}
+    }
+    throw new Error(detail || `Request failed (${res.status})`);
+  }
+  if (res.status === 204) return null;
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) return res.json();
+  return res;
+}
+
 // ─────────────────────────────────────────────
 // Voice selection persistence via Voicebox API
 // instead of Hermes config store (which crashes)
 // ─────────────────────────────────────────────
 async function saveActiveVoice(voiceId) {
-  // Write to Voicebox backend's own config endpoint
-  await fetch(`${BACKEND_URL}/settings/active-voice`, {
+  await apiFetch('/settings/active-voice', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ voice_id: voiceId })
   });
 }
 
-async function loadActiveVoice() {
+async function loadActiveVoice(signal) {
   try {
-    const res = await fetch(`${BACKEND_URL}/settings/active-voice`);
-    if (!res.ok) return '';
-    const data = await res.json();
-    return data.voice_id || '';
+    const data = await apiFetch('/settings/active-voice', signal ? { signal } : {});
+    return data?.voice_id || '';
   } catch {
     return '';
   }
@@ -104,7 +138,7 @@ function VoiceboxView() {
   const [deleteConfirmId, setDeleteConfirmId] = useState(null);
   const [isDeleting, setIsDeleting]       = useState(false);
 
-  // Persona state
+  // Persona state (cache; server personality is preferred when present)
   const [personaMapping, setPersonaMapping] = useState(() => {
     try {
       const stored = localStorage.getItem('hermes_personas');
@@ -113,12 +147,13 @@ function VoiceboxView() {
     return {
       'Default': 'You are a helpful AI assistant.',
       'Jarvis': 'You are Jarvis. Be highly formal, polite, and efficient.',
-      'Sexy Girl': 'You are a playful, flirty, and provocative companion.'
     };
   });
+  const [personaDrafts, setPersonaDrafts] = useState({});
 
   // File state
   const [fileName, setFileName]           = useState('');
+  const [uploadFileName, setUploadFileName] = useState('sample.wav');
   const [audioUrl, setAudioUrl]           = useState(null);
   const [audioBlob, setAudioBlob]         = useState(null);
   const [audioDuration, setAudioDuration] = useState(null);
@@ -131,38 +166,63 @@ function VoiceboxView() {
 
   const playbackAudioRef = useRef(null);
   const deleteTimerRef   = useRef(null);
+  const personaTimersRef = useRef({});
+  const audioObjectUrlRef = useRef(null);
+  const fetchAbortRef = useRef(null);
+
+  const revokeAudioUrl = useCallback(() => {
+    if (audioObjectUrlRef.current) {
+      URL.revokeObjectURL(audioObjectUrlRef.current);
+      audioObjectUrlRef.current = null;
+    }
+  }, []);
+
+  const stopPlayback = useCallback(() => {
+    if (playbackAudioRef.current) {
+      playbackAudioRef.current.pause();
+      playbackAudioRef.current.onended = null;
+      playbackAudioRef.current = null;
+    }
+    setIsPlaying(false);
+  }, []);
 
   // ── Fetch profiles + active voice ──────────
   const fetchProfilesAndConfig = useCallback(async () => {
+    if (fetchAbortRef.current) fetchAbortRef.current.abort();
+    const controller = new AbortController();
+    fetchAbortRef.current = controller;
+
     try {
-      const res = await fetch(`${BACKEND_URL}/profiles`);
-      if (!res.ok) throw new Error('Failed to fetch profiles');
-      setVoices(await res.json());
+      const data = await apiFetch('/profiles', { signal: controller.signal });
+      if (controller.signal.aborted) return;
+      setVoices(Array.isArray(data) ? data : []);
       setIsConnected(true);
 
-      const savedVoice = await loadActiveVoice();
-      if (savedVoice) setActiveVoiceId(savedVoice);
+      const savedVoice = await loadActiveVoice(controller.signal);
+      if (!controller.signal.aborted && savedVoice) setActiveVoiceId(savedVoice);
     } catch (err) {
+      if (err?.name === 'AbortError') return;
       console.error(err);
       setIsConnected(false);
       host.notify({ kind: 'error', title: 'Voicebox Connection Failed',
         message: 'Could not connect to Voicebox backend. Is it running?' });
     } finally {
-      setIsLoading(false);
+      if (!controller.signal.aborted) setIsLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      fetchProfilesAndConfig();
-    }, 2000);
+    fetchProfilesAndConfig();
 
     return () => {
-      clearTimeout(timer);
+      if (fetchAbortRef.current) fetchAbortRef.current.abort();
       if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
-      if (playbackAudioRef.current) playbackAudioRef.current.pause();
+      Object.values(personaTimersRef.current).forEach(clearTimeout);
+      personaTimersRef.current = {};
+      stopPlayback();
+      revokeAudioUrl();
     };
-  }, [fetchProfilesAndConfig]);
+  }, [fetchProfilesAndConfig, stopPlayback, revokeAudioUrl]);
 
   // ── Auto-cancel delete confirmation after 5 seconds ──
   useEffect(() => {
@@ -173,9 +233,50 @@ function VoiceboxView() {
     return () => { if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current); };
   }, [deleteConfirmId]);
 
+  const persistPersona = useCallback(async (voice, val) => {
+    setPersonaMapping(prev => {
+      const next = { ...prev, [voice.id]: val, [voice.name]: val };
+      try {
+        localStorage.setItem('hermes_personas', JSON.stringify(next));
+      } catch (_) {}
+      return next;
+    });
+
+    try {
+      await apiFetch(`/profiles/${voice.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: voice.name, language: voice.language || 'en', personality: val })
+      });
+      setVoices(prev => prev.map(p => p.id === voice.id ? { ...p, personality: val } : p));
+
+      if (voice.id === activeVoiceId) {
+        const sessionId = host.state?.activeSessionId?.get();
+        await host.request('config.set', { key: 'personality', value: val, session_id: sessionId || undefined });
+      }
+    } catch (err) {
+      console.warn('Persona sync failed:', err);
+      host.notify({
+        kind: 'error',
+        title: 'Persona Sync Failed',
+        message: err.message || 'Could not save persona prompt.'
+      });
+    }
+  }, [activeVoiceId]);
+
+  const schedulePersonaPersist = useCallback((voice, val) => {
+    setPersonaDrafts(prev => ({ ...prev, [voice.id]: val }));
+    if (personaTimersRef.current[voice.id]) clearTimeout(personaTimersRef.current[voice.id]);
+    personaTimersRef.current[voice.id] = setTimeout(() => {
+      delete personaTimersRef.current[voice.id];
+      persistPersona(voice, val);
+    }, PERSONA_DEBOUNCE_MS);
+  }, [persistPersona]);
+
   // ── Active Voice Selection ───────────────────
   const handleVoiceChange = async (voiceId) => {
     if (!voiceId) return;
+    const previousId = activeVoiceId;
     const voice = voices.find(v => v.id === voiceId);
     const { engine, meta } = getEngineMeta(voice);
     try {
@@ -186,7 +287,7 @@ function VoiceboxView() {
 
       const voiceName = voice?.name || voiceId;
       const persona = voice?.personality || personaMapping[voiceId] || personaMapping[voiceName];
-      
+
       if (!persona) {
         host.notify({ kind: 'info', title: 'Voice Changed', message: `Active voice set to "${voiceName}". (No custom AI persona prompt set in Manage Voices)` });
         return;
@@ -201,6 +302,7 @@ function VoiceboxView() {
         host.notify({ kind: 'error', title: 'Persona Update Failed', message: err.message || 'Failed to update system persona.' });
       }
     } catch (err) {
+      setActiveVoiceId(previousId);
       host.notify({ kind: 'error', title: 'Voice Update Failed', message: err.message });
     }
   };
@@ -209,8 +311,7 @@ function VoiceboxView() {
   const handleDeleteVoice = async (voiceId) => {
     setIsDeleting(true);
     try {
-      const res = await fetch(`${BACKEND_URL}/profiles/${voiceId}`, { method: 'DELETE' });
-      if (!res.ok) throw new Error(`Delete failed: ${res.status}`);
+      await apiFetch(`/profiles/${voiceId}`, { method: 'DELETE' });
       if (voiceId === activeVoiceId) {
         setActiveVoiceId('');
         try { await saveActiveVoice(''); } catch (_) {}
@@ -244,8 +345,10 @@ function VoiceboxView() {
       const nameParts = filePath.split(/[/\\]/);
       const nameWithExt = nameParts[nameParts.length - 1];
       const baseName = nameWithExt.substring(0, nameWithExt.lastIndexOf('.')) || nameWithExt;
+      const ext = extensionOf(filePath);
 
       setFileName(nameWithExt);
+      setUploadFileName(`sample.${ext}`);
       setAudioDuration(null);
       if (!cloneName.trim()) {
         setCloneName(baseName.replace(/[_-]/g, ' '));
@@ -255,16 +358,21 @@ function VoiceboxView() {
       const fetchRes = await fetch(dataUrl);
       const blob = await fetchRes.blob();
 
+      stopPlayback();
+      revokeAudioUrl();
+      const objectUrl = URL.createObjectURL(blob);
+      audioObjectUrlRef.current = objectUrl;
+
       setAudioBlob(blob);
-      setAudioUrl(dataUrl);
+      setAudioUrl(objectUrl);
 
       // Get duration via an Audio element (safer than AudioContext in Electron)
       try {
-        const tempAudio = new Audio(dataUrl);
+        const tempAudio = new Audio(objectUrl);
         await new Promise((resolve, reject) => {
           tempAudio.onloadedmetadata = resolve;
           tempAudio.onerror = reject;
-          setTimeout(reject, 5000);
+          setTimeout(() => reject(new Error('metadata timeout')), 5000);
         });
         if (isFinite(tempAudio.duration)) {
           setAudioDuration(tempAudio.duration);
@@ -282,16 +390,27 @@ function VoiceboxView() {
   const playPlayback = () => {
     if (!audioUrl) return;
     if (isPlaying) {
-      if (playbackAudioRef.current) playbackAudioRef.current.pause();
-      setIsPlaying(false);
-    } else {
-      const audio = new Audio(audioUrl);
-      playbackAudioRef.current = audio;
-      audio.onended = () => setIsPlaying(false);
-      audio.play();
-      setIsPlaying(true);
+      stopPlayback();
+      return;
     }
+    stopPlayback();
+    const audio = new Audio(audioUrl);
+    playbackAudioRef.current = audio;
+    audio.onended = () => {
+      setIsPlaying(false);
+      playbackAudioRef.current = null;
+    };
+    audio.play().catch(err => {
+      console.warn('Playback failed:', err);
+      setIsPlaying(false);
+      playbackAudioRef.current = null;
+    });
+    setIsPlaying(true);
   };
+
+  const sampleDurationOk =
+    audioDuration == null ||
+    (audioDuration >= MIN_SAMPLE_SECONDS && audioDuration <= MAX_SAMPLE_SECONDS);
 
   // ── Clone submit ─────────────────────────────
   const handleCloneSubmit = async () => {
@@ -301,6 +420,14 @@ function VoiceboxView() {
     if (!audioBlob) {
       host.notify({ kind: 'warning', title: 'Audio Required', message: 'Upload a sample first.' }); return;
     }
+    if (audioDuration != null && !sampleDurationOk) {
+      host.notify({
+        kind: 'warning',
+        title: 'Invalid Sample Length',
+        message: `Sample must be ${MIN_SAMPLE_SECONDS}–${MAX_SAMPLE_SECONDS} seconds.`
+      });
+      return;
+    }
     const engineMeta = ENGINE_META[cloneEngine] || {};
     const savedName = cloneName.trim();
     setIsSaving(true);
@@ -308,20 +435,16 @@ function VoiceboxView() {
     let createdProfileId = null;
     try {
       // 1. Create profile
-      const createRes = await fetch(`${BACKEND_URL}/profiles`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      const profile = await apiFetch('/profiles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: savedName, default_engine: cloneEngine })
       });
-      if (!createRes.ok) {
-        const errData = await createRes.json().catch(() => ({}));
-        throw new Error(errData.detail || `Server returned ${createRes.status}`);
-      }
-      const profile = await createRes.json();
       createdProfileId = profile.id;
 
-      // 2. Upload sample
+      // 2. Upload sample (keep real extension)
       const form = new FormData();
-      form.append('file', audioBlob, 'sample.wav');
+      form.append('file', audioBlob, uploadFileName || fileName || 'sample.wav');
       form.append('reference_text', referenceText.trim() || 'The quick brown fox jumps over the lazy dog.');
       const uploadRes = await fetch(`${BACKEND_URL}/profiles/${profile.id}/samples`, { method: 'POST', body: form });
       if (!uploadRes.ok) {
@@ -336,7 +459,10 @@ function VoiceboxView() {
       await handleVoiceChange(profile.id);
 
       // 4. Reset
-      setCloneName(''); setFileName(''); setAudioBlob(null); setAudioUrl(null); setAudioDuration(null);
+      stopPlayback();
+      revokeAudioUrl();
+      setCloneName(''); setFileName(''); setUploadFileName('sample.wav');
+      setAudioBlob(null); setAudioUrl(null); setAudioDuration(null);
       host.notify({ kind: 'success', title: 'Voice Cloned!',
         message: `"${savedName}" created using ${engineMeta.label || cloneEngine} (${engineMeta.vram || '?'} VRAM).` });
 
@@ -344,7 +470,7 @@ function VoiceboxView() {
     } catch (err) {
       if (createdProfileId) {
         try {
-          await fetch(`${BACKEND_URL}/profiles/${createdProfileId}`, { method: 'DELETE' });
+          await apiFetch(`/profiles/${createdProfileId}`, { method: 'DELETE' });
         } catch (_) {}
       }
       host.notify({ kind: 'error', title: 'Cloning Failed', message: err.message });
@@ -381,11 +507,11 @@ function VoiceboxView() {
     ? React.createElement('span', {
         key: 'dur',
         className: `text-xs px-2 py-0.5 rounded-full font-mono ${
-          audioDuration >= 2 && audioDuration <= 120
+          sampleDurationOk
             ? 'bg-green-500/10 text-green-400 border border-green-500/30'
             : 'bg-red-500/10 text-red-400 border border-red-500/30'
         }`
-      }, `${formatDuration(audioDuration)}${audioDuration < 2 ? ' (too short)' : audioDuration > 120 ? ' (too long)' : ''}`)
+      }, `${formatDuration(audioDuration)}${audioDuration < MIN_SAMPLE_SECONDS ? ' (too short)' : audioDuration > MAX_SAMPLE_SECONDS ? ' (too long)' : ''}`)
     : null;
 
   return React.createElement('div',
@@ -445,7 +571,7 @@ function VoiceboxView() {
             const v = voices.find(x => x.id === activeVoiceId);
             if (!v) return null;
             const { engine, meta } = getEngineMeta(v);
-            const personaText = personaMapping[v.id] || personaMapping[v.name] || personaMapping['Default'] || 'You are a helpful AI assistant.';
+            const personaText = v.personality || personaMapping[v.id] || personaMapping[v.name] || personaMapping['Default'] || 'You are a helpful AI assistant.';
             return React.createElement('div', { key: 'active-info', className: 'flex flex-col gap-1 mt-1 bg-muted/30 p-3 rounded-md border border-border/50' }, [
               React.createElement('p', { key: 'v-info', className: 'text-xs text-muted-foreground' },
                 `${meta.badge || '⚪'} Using ${meta.label || engine}  •  ${meta.vram || '?'} VRAM  •  ${meta.description || ''}`
@@ -469,6 +595,10 @@ function VoiceboxView() {
           : React.createElement('div', { key: 'list', className: 'flex flex-col gap-2' },
               voices.map(v => {
                 const { meta } = getEngineMeta(v);
+                const draft = personaDrafts[v.id];
+                const personaValue = draft != null
+                  ? draft
+                  : (v.personality || personaMapping[v.id] || personaMapping[v.name] || '');
                 return React.createElement('div', {
                   key: v.id,
                   className: `flex flex-col gap-2 rounded-md px-4 py-3 border transition-colors ${v.id === activeVoiceId ? 'border-primary bg-primary/5' : 'border-border bg-muted/20 hover:bg-muted/30'}`
@@ -516,29 +646,15 @@ function VoiceboxView() {
                   React.createElement('div', { key: 'persona-row', className: 'flex flex-col gap-1 mt-1 pt-2 border-t border-border/50' }, [
                     React.createElement('label', { className: 'text-xs font-semibold text-muted-foreground' }, '🎭 AI Persona Prompt'),
                     React.createElement(Input, {
-                      value: v.personality || personaMapping[v.id] || personaMapping[v.name] || '',
+                      value: personaValue,
                       placeholder: 'e.g. You are Vincent Price. Speak with an eerie horror host voice...',
-                      onChange: async (e) => {
-                        const val = e.target.value;
-                        const next = { ...personaMapping, [v.id]: val, [v.name]: val };
-                        setPersonaMapping(next);
-                        localStorage.setItem('hermes_personas', JSON.stringify(next));
-                        
-                        // Sync to Voicebox DB
-                        try {
-                          await fetch(`${BACKEND_URL}/profiles/${v.id}`, {
-                            method: 'PUT',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ name: v.name, language: v.language || 'en', personality: val })
-                          });
-                          setVoices(prev => prev.map(p => p.id === v.id ? { ...p, personality: val } : p));
-
-                          // If this is the currently active voice, update active session system prompt immediately
-                          if (v.id === activeVoiceId) {
-                            const sessionId = host.state?.activeSessionId?.get();
-                            await host.request('config.set', { key: 'personality', value: val, session_id: sessionId || undefined });
-                          }
-                        } catch (_) {}
+                      onChange: (e) => schedulePersonaPersist(v, e.target.value),
+                      onBlur: (e) => {
+                        if (personaTimersRef.current[v.id]) {
+                          clearTimeout(personaTimersRef.current[v.id]);
+                          delete personaTimersRef.current[v.id];
+                          persistPersona(v, e.target.value);
+                        }
                       },
                       className: 'h-8 text-xs bg-background/50'
                     })
@@ -617,7 +733,7 @@ function VoiceboxView() {
         React.createElement(Button, {
           key: 'clone-btn',
           className: 'w-full mt-4 h-11 text-base font-semibold', variant: 'default',
-          disabled: isSaving || !cloneName.trim() || !audioBlob,
+          disabled: isSaving || !cloneName.trim() || !audioBlob || !sampleDurationOk,
           onClick: handleCloneSubmit
         }, isSaving ? 'Cloning Voice...' : `✨ Clone Voice  •  ${selectedEngineMeta.badge || ''} ${selectedEngineMeta.label || cloneEngine}`)
       ])
