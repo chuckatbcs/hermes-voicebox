@@ -1,5 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, host } from '@hermes/plugin-sdk';
+import {
+  SAMPLE_VOICES,
+  SAMPLE_SEED_MARKER,
+  buildSampleProfilePayload,
+  findSampleByVoice,
+  samplePersonalityForHermes,
+} from './sample-voices.js';
 
 const DEFAULT_BACKEND_URL = 'http://127.0.0.1:17493';
 const PERSONA_DEBOUNCE_MS = 400;
@@ -149,6 +156,114 @@ async function loadActiveVoice(signal) {
   }
 }
 
+/**
+ * Apply a voice persona the Hermes-native way:
+ * 1) config.set personality=<named key>  (same as /personality <key>)
+ * 2) fallback to full prompt text if the named key is not registered yet
+ * 3) also set agent.system_prompt (Desktop has historically ignored display-only personality)
+ */
+async function applyHermesPersona({ key, prompt, voiceName }) {
+  const sessionId = host.state?.activeSessionId?.get();
+  const modes = [];
+
+  if (key) {
+    try {
+      await host.request('config.set', {
+        key: 'personality',
+        value: key,
+        session_id: sessionId || undefined,
+      });
+      modes.push(`named:${key}`);
+    } catch (err) {
+      console.warn('Named personality set failed, falling back to prompt text:', err);
+    }
+  }
+
+  if (!modes.length) {
+    await host.request('config.set', {
+      key: 'personality',
+      value: prompt,
+      session_id: sessionId || undefined,
+    });
+    modes.push('prompt-text');
+  }
+
+  try {
+    await host.request('config.set', {
+      key: 'agent.system_prompt',
+      value: prompt,
+      session_id: sessionId || undefined,
+    });
+    modes.push('agent.system_prompt');
+  } catch (err) {
+    console.warn('agent.system_prompt update skipped:', err);
+  }
+
+  return { sessionId, modes, voiceName };
+}
+
+async function seedSampleVoices(existingProfiles) {
+  const list = Array.isArray(existingProfiles) ? existingProfiles : [];
+  const byName = new Map(list.map((v) => [String(v.name || '').trim().toLowerCase(), v]));
+  let created = 0;
+  let updated = 0;
+
+  for (const sample of SAMPLE_VOICES) {
+    const existing = byName.get(sample.name.toLowerCase());
+    const payload = buildSampleProfilePayload(sample);
+
+    if (existing?.id) {
+      const hasMarker = String(existing.personality || '').includes(`${SAMPLE_SEED_MARKER}:${sample.key}`);
+      if (!hasMarker || !existing.personality) {
+        try {
+          await apiFetch(`/profiles/${existing.id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: sample.name,
+              language: 'en',
+              personality: payload.personality,
+              default_engine: sample.engine,
+            }),
+          });
+          updated += 1;
+        } catch (err) {
+          console.warn('Sample persona update failed:', sample.key, err);
+        }
+      }
+      continue;
+    }
+
+    try {
+      await apiFetch('/profiles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      created += 1;
+    } catch (err) {
+      // Some Voicebox builds reject preset_* fields on create — retry minimal payload.
+      try {
+        await apiFetch('/profiles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: sample.name,
+            language: 'en',
+            default_engine: sample.engine,
+            personality: payload.personality,
+          }),
+        });
+        created += 1;
+      } catch (err2) {
+        console.warn('Sample voice seed failed:', sample.key, err2);
+      }
+    }
+  }
+
+  return { created, updated };
+}
+
 // ─────────────────────────────────────────────
 // Main view
 // ─────────────────────────────────────────────
@@ -167,10 +282,12 @@ function VoiceboxView() {
       const stored = localStorage.getItem('hermes_personas');
       if (stored) return JSON.parse(stored);
     } catch (e) {}
-    return {
-      'Default': 'You are a helpful AI assistant.',
-      'Jarvis': 'You are Jarvis. Be highly formal, polite, and efficient.',
-    };
+    const defaults = { Default: 'You are a helpful AI assistant.' };
+    for (const sample of SAMPLE_VOICES) {
+      defaults[sample.name] = samplePersonalityForHermes(sample);
+      defaults[sample.key] = defaults[sample.name];
+    }
+    return defaults;
   });
   const [personaDrafts, setPersonaDrafts] = useState({});
 
@@ -420,10 +537,29 @@ function VoiceboxView() {
     fetchAbortRef.current = controller;
 
     try {
-      const data = await apiFetch('/profiles', { signal: controller.signal });
+      let data = await apiFetch('/profiles', { signal: controller.signal });
+      if (controller.signal.aborted) return;
+      setIsConnected(true);
+
+      // Seed fun sample persona voices once Voicebox is reachable.
+      try {
+        const seed = await seedSampleVoices(data);
+        if ((seed.created || seed.updated) && !controller.signal.aborted) {
+          data = await apiFetch('/profiles', { signal: controller.signal });
+          if (seed.created > 0) {
+            host.notify({
+              kind: 'success',
+              title: 'Sample Voices Ready',
+              message: `Added ${seed.created} fun demo voice(s): Vincent Price, Porky Pig, Cartman, Jarvis, GLaDOS. Personas are parody templates — not official clones.`,
+            });
+          }
+        }
+      } catch (seedErr) {
+        console.warn('Sample voice seeding skipped:', seedErr);
+      }
+
       if (controller.signal.aborted) return;
       setVoices(Array.isArray(data) ? data : []);
-      setIsConnected(true);
 
       const savedVoice = await loadActiveVoice(controller.signal);
       if (!controller.signal.aborted && savedVoice) setActiveVoiceId(savedVoice);
@@ -487,8 +623,12 @@ function VoiceboxView() {
       setVoices(prev => prev.map(p => p.id === voice.id ? { ...p, personality: val } : p));
 
       if (voice.id === activeVoiceId) {
-        const sessionId = host.state?.activeSessionId?.get();
-        await host.request('config.set', { key: 'personality', value: val, session_id: sessionId || undefined });
+        const sample = findSampleByVoice({ ...voice, personality: val });
+        await applyHermesPersona({
+          key: sample?.key,
+          prompt: val,
+          voiceName: voice.name,
+        });
       }
     } catch (err) {
       console.warn('Persona sync failed:', err);
@@ -522,17 +662,31 @@ function VoiceboxView() {
         message: `Active voice: ${voice?.name || voiceId}  •  ${meta.label || engine}  •  VRAM ${meta.vram || '?'}` });
 
       const voiceName = voice?.name || voiceId;
-      const persona = voice?.personality || personaMapping[voiceId] || personaMapping[voiceName];
+      const sample = findSampleByVoice(voice);
+      const persona = voice?.personality
+        || (sample ? samplePersonalityForHermes(sample) : null)
+        || personaMapping[voiceId]
+        || personaMapping[voiceName];
 
       if (!persona) {
         host.notify({ kind: 'info', title: 'Voice Changed', message: `Active voice set to "${voiceName}". (No custom AI persona prompt set in Manage Voices)` });
         return;
       }
 
-      const sessionId = host.state?.activeSessionId?.get();
       try {
-        await host.request('config.set', { key: 'personality', value: persona, session_id: sessionId || undefined });
-        host.notify({ kind: 'success', title: 'System Persona Updated', message: `Active system prompt updated to "${voiceName}": "${persona.slice(0, 45)}..."` });
+        const result = await applyHermesPersona({
+          key: sample?.key,
+          prompt: persona,
+          voiceName,
+        });
+        const mode = result.modes.join(' + ');
+        host.notify({
+          kind: 'success',
+          title: 'Persona Applied',
+          message: result.sessionId
+            ? `"${voiceName}" persona active for this chat (${mode}).`
+            : `"${voiceName}" persona saved. Open/focus a chat for full session overlay (${mode}).`,
+        });
       } catch (err) {
         console.warn('Persona update failed:', err);
         host.notify({ kind: 'error', title: 'Persona Update Failed', message: err.message || 'Failed to update system persona.' });
@@ -739,7 +893,7 @@ function VoiceboxView() {
           React.createElement('h1', { key: 'title', className: 'text-3xl font-bold tracking-tight' }, 'Voicebox Control'),
         ]),
         React.createElement('p', { key: 'desc', className: 'text-muted-foreground text-sm' },
-          'Smart engine routing — each voice uses the right model automatically.'),
+          'Smart engine routing — each voice uses the right model automatically. Fun sample personas seed on first connect (parody templates, not official clones).'),
         isConnected === false && React.createElement('div', {
           key: 'reconnect',
           className: 'flex items-center gap-2 mt-2 text-xs text-red-400'

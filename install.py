@@ -11,6 +11,7 @@ Works on Windows and Linux. Override target with HERMES_DIR.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -28,6 +29,8 @@ from installer.prereqs import (
 
 MARKER_BEGIN = "# BEGIN hermes-voicebox"
 MARKER_END = "# END hermes-voicebox"
+PERSONA_MARKER_BEGIN = "# BEGIN hermes-voicebox-personalities"
+PERSONA_MARKER_END = "# END hermes-voicebox-personalities"
 PLUGIN_ID = "voice-switcher"
 
 
@@ -72,8 +75,110 @@ def build_snippet(python_cmd: str, bridge_path: Path) -> str:
     )
 
 
+def _yaml_literal_block(text: str, indent: int = 6) -> str:
+    pad = " " * indent
+    lines = text.replace("\r\n", "\n").split("\n")
+    return "\n".join(pad + line if line else pad for line in lines)
+
+
+def load_sample_voices(src_root: Path) -> list[dict]:
+    path = src_root / "desktop-plugin" / "sample-voices.json"
+    if not path.is_file():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def build_personalities_entries(samples: list[dict]) -> str:
+    """YAML entries only (under agent.personalities), wrapped in markers."""
+    chunks = [PERSONA_MARKER_BEGIN]
+    for sample in samples:
+        key = sample["key"]
+        prompt = (
+            f"[Voicebox sample persona: {key}]\n"
+            "CRITICAL: Adopt this persona completely for this session.\n"
+            "Discard prior roleplay tones from earlier turns unless the user asks to drop character.\n"
+            f"{sample['personality']}"
+        )
+        chunks.append(f"    {key}: |")
+        chunks.append(_yaml_literal_block(prompt, indent=6))
+    chunks.append(PERSONA_MARKER_END)
+    return "\n".join(chunks)
+
+
+def build_personalities_snippet(samples: list[dict]) -> str:
+    """Standalone snippet file for users / first-time configs."""
+    entries = build_personalities_entries(samples)
+    # Strip marker indent context into a full agent.personalities document for the .snippet file
+    body = "\n".join(
+        line for line in entries.splitlines()
+        if line not in (PERSONA_MARKER_BEGIN, PERSONA_MARKER_END)
+    )
+    return (
+        f"{PERSONA_MARKER_BEGIN}\n"
+        "# Named personalities for /personality and Voicebox sample voices\n"
+        "agent:\n"
+        "  personalities:\n"
+        f"{body}\n"
+        f"{PERSONA_MARKER_END}\n"
+    )
+
+
+def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
+    """
+    Upsert sample personalities under agent.personalities without clobbering
+    other agent: settings (avoid appending a second top-level agent key).
+    """
+    if not samples:
+        return "skipped_empty"
+
+    entries = build_personalities_entries(samples)
+    if not config_path.exists():
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(build_personalities_snippet(samples), encoding="utf-8")
+        return "created"
+
+    original = config_path.read_text(encoding="utf-8")
+    backup = config_path.with_suffix(config_path.suffix + ".bak")
+    backup.write_text(original, encoding="utf-8")
+
+    if PERSONA_MARKER_BEGIN in original and PERSONA_MARKER_END in original:
+        pre = original.split(PERSONA_MARKER_BEGIN, 1)[0].rstrip()
+        post = original.split(PERSONA_MARKER_END, 1)[1].lstrip("\n")
+        # Keep surrounding structure; replace only marked entries block.
+        merged = (pre + "\n" if pre else "") + entries + ("\n" + post if post else "\n")
+        config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
+        return "replaced"
+
+    # Insert under existing agent.personalities: if present.
+    import re
+
+    personalities_hdr = re.search(r"(?m)^([ \t]*)personalities:\s*$", original)
+    agent_hdr = re.search(r"(?m)^agent:\s*$", original)
+
+    if personalities_hdr:
+        # entries use 4-space keys, matching typical `agent: / personalities:` nesting
+        block = entries
+        insert_at = personalities_hdr.end()
+        merged = original[:insert_at] + "\n" + block + original[insert_at:]
+        config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
+        return "inserted_personalities"
+
+    if agent_hdr:
+        insert_at = agent_hdr.end()
+        block = "\n  personalities:\n" + entries + "\n"
+        merged = original[:insert_at] + block + original[insert_at:]
+        config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
+        return "inserted_under_agent"
+
+    # No agent section — append a complete one (safe: nothing to clobber).
+    appended = original.rstrip() + "\n\n" + build_personalities_snippet(samples)
+    config_path.write_text(appended if appended.endswith("\n") else appended + "\n", encoding="utf-8")
+    return "appended"
+
+
 def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
-    plugin_src = src_root / "desktop-plugin" / "plugin.js"
+    plugin_src_dir = src_root / "desktop-plugin"
+    plugin_src = plugin_src_dir / "plugin.js"
     bridge_src = src_root / "scripts" / "voicebox_tts.py"
 
     if not plugin_src.is_file():
@@ -89,7 +194,11 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     plugin_dst = plugin_dst_dir / "plugin.js"
     bridge_dst = scripts_dst_dir / "voicebox_tts.py"
 
-    shutil.copy2(plugin_src, plugin_dst)
+    # Copy plugin entry + companion modules/assets
+    for src in plugin_src_dir.iterdir():
+        if src.is_file() and src.suffix.lower() in {".js", ".json", ".css", ".md"}:
+            shutil.copy2(src, plugin_dst_dir / src.name)
+
     shutil.copy2(bridge_src, bridge_dst)
 
     if platform.system() != "Windows":
@@ -268,6 +377,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote snippet:    {snippet_path}")
 
     config_path = hermes_dir / "config.yaml"
+    samples = load_sample_voices(src_root)
+    persona_snippet = build_personalities_snippet(samples)
+    persona_snippet_path = hermes_dir / "voicebox-personalities.snippet.yaml"
+    if persona_snippet.strip():
+        persona_snippet_path.write_text(persona_snippet, encoding="utf-8")
+        print(f"Wrote personas:   {persona_snippet_path}")
+
     if args.no_config:
         print("Skipped config.yaml (--no-config).")
     else:
@@ -279,8 +395,13 @@ def main(argv: list[str] | None = None) -> int:
         elif result == "appended":
             print(f"Appended Voicebox TTS provider to {config_path} (backup: config.yaml.bak).")
         else:
-            print(f"Left existing {config_path} unchanged (already has TTS/voicebox settings).")
-            print("Re-run with --force-config to append the marked block, or merge the snippet below manually:")
+            print(f"Left existing TTS block in {config_path} unchanged.")
+            print("Re-run with --force-config to append the marked TTS block, or merge the snippet below manually:")
+
+        # Always upsert named sample personalities (Hermes /personality keys).
+        if samples:
+            presult = merge_personalities_config(config_path, samples)
+            print(f"Sample personalities in config.yaml: {presult}")
 
     print()
     print("=== Setup Complete ===")
@@ -295,7 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         print("  1. Start Voicebox (desktop app or `docker compose up -d` in ~/.hermes/vendor/voicebox)")
         print("  2. Re-run with: python install.py -y --skip-hermes")
     print("  • Restart Hermes Desktop so it reloads plugins + config")
-    print("  • Open the Voicebox sidebar entry")
+    print("  • Open the Voicebox sidebar — fun sample voices seed on first connect")
+    print("  • Selecting a sample voice applies its Hermes persona (agent.personalities / /personality)")
     if platform.system() == "Windows":
         print()
         print("Windows tip: if script execution is blocked, run:")

@@ -7,6 +7,7 @@ Cross-platform integration between the **Hermes Desktop Client** and **Voicebox 
 - **Smart Engine Routing** for Kokoro / Chatterbox / Qwen profiles
 - **Sentence chunking & WAV merging** for long AI responses
 - **In-plugin microphone recording** (plus native OS file picker) for voice cloning samples
+- **Fun sample persona voices** (Vincent Price, Porky Pig, Cartman, Jarvis, GLaDOS) seeded as parody templates with Hermes `/personality` keys — not official voice clones / no copyrighted audio bundled
 - **Safe two-step voice deletion**
 - **Installer that checks prerequisites and provisions what’s missing** (Hermes, Voicebox, TTS models)
 

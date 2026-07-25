@@ -131,8 +131,34 @@ class SkipPrereqInstallTests(unittest.TestCase):
             hermes = Path(tmp) / ".hermes"
             rc = install.main(["--hermes-dir", str(hermes), "--skip-prereqs", "--no-config"])
             self.assertEqual(rc, 0)
-            self.assertTrue((hermes / "desktop-plugins" / "voice-switcher" / "plugin.js").is_file())
+            plugin_dir = hermes / "desktop-plugins" / "voice-switcher"
+            self.assertTrue((plugin_dir / "plugin.js").is_file())
+            self.assertTrue((plugin_dir / "sample-voices.js").is_file())
+            self.assertTrue((plugin_dir / "sample-voices.json").is_file())
             self.assertTrue((hermes / "scripts" / "voicebox_tts.py").is_file())
+
+
+class PersonalitiesMergeTests(unittest.TestCase):
+    def test_does_not_clobber_existing_agent_block(self):
+        samples = install.load_sample_voices(Path(__file__).resolve().parent)
+        self.assertGreaterEqual(len(samples), 5)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.yaml"
+            cfg.write_text(
+                "agent:\n"
+                "  model: gpt-test\n"
+                "  max_tokens: 123\n",
+                encoding="utf-8",
+            )
+            result = install.merge_personalities_config(cfg, samples)
+            self.assertEqual(result, "inserted_under_agent")
+            text = cfg.read_text(encoding="utf-8")
+            self.assertIn("model: gpt-test", text)
+            self.assertIn("max_tokens: 123", text)
+            self.assertIn("personalities:", text)
+            self.assertIn("vincent_price:", text)
+            self.assertIn("glados:", text)
+            self.assertEqual(len([ln for ln in text.splitlines() if ln.strip() == "agent:"]), 1)
 
 
 if __name__ == "__main__":
