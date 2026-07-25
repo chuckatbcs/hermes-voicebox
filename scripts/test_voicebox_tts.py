@@ -5,6 +5,7 @@ import unittest
 from voicebox_tts import (
     _build_wav,
     _parse_wav_header,
+    _profile_tts_preflight,
     _split_sentences,
     get_base_url,
     resolve_profile_id,
@@ -91,6 +92,34 @@ class TestResolveProfileId(unittest.TestCase):
             resolve_profile_id("default", "http://127.0.0.1:17493", get_json=get_json),
             "first-profile",
         )
+
+
+class TestProfilePreflight(unittest.TestCase):
+    def test_preset_missing_voice_id(self):
+        err = _profile_tts_preflight({
+            "name": "Jarvis",
+            "voice_type": "preset",
+            "preset_voice_id": None,
+        })
+        self.assertIsNotNone(err)
+        self.assertIn("preset_voice_id", err)
+
+    def test_cloned_without_samples(self):
+        err = _profile_tts_preflight({
+            "name": "Mine",
+            "voice_type": "cloned",
+            "sample_count": 0,
+        })
+        self.assertIsNotNone(err)
+        self.assertIn("reference samples", err)
+
+    def test_ok_preset(self):
+        self.assertIsNone(_profile_tts_preflight({
+            "name": "Jarvis",
+            "voice_type": "preset",
+            "preset_voice_id": "bm_george",
+            "default_engine": "kokoro",
+        }))
 
 
 if __name__ == "__main__":

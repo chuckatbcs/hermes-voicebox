@@ -397,6 +397,17 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
   return { sessionId, modes, voiceName };
 }
 
+function sampleNeedsPresetRepair(existing, sample) {
+  if (!existing) return false;
+  const voiceType = String(existing.voice_type || '').toLowerCase();
+  const presetId = existing.preset_voice_id || existing.presetVoiceId;
+  const engine = existing.preset_engine || existing.default_engine;
+  // Minimal create fallback used to leave "cloned" rows with no samples — those 500 on TTS.
+  if (sample.presetVoiceId && (!presetId || voiceType !== 'preset')) return true;
+  if (sample.engine && engine && String(engine).toLowerCase() !== sample.engine) return true;
+  return false;
+}
+
 async function seedSampleVoices(existingProfiles) {
   const list = Array.isArray(existingProfiles) ? existingProfiles : [];
   const byName = new Map(list.map((v) => [String(v.name || '').trim().toLowerCase(), v]));
@@ -412,21 +423,35 @@ async function seedSampleVoices(existingProfiles) {
       const hasMarker = stored.includes(`${SAMPLE_SEED_MARKER}:${sample.key}`);
       const looksConcatenated = hasMarker && !stored.includes('\n') && stored.length > 80;
       const hasLegacyWrapper = /\[Voicebox sample persona:/i.test(stored);
-      if (!hasMarker || !stored || looksConcatenated || hasLegacyWrapper) {
+      const needsPreset = sampleNeedsPresetRepair(existing, sample);
+      if (!hasMarker || !stored || looksConcatenated || hasLegacyWrapper || needsPreset) {
         try {
           await apiFetch(`/profiles/${existing.id}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: sample.name,
-              language: 'en',
-              personality: payload.personality,
-              default_engine: sample.engine,
-            }),
+            body: JSON.stringify(payload),
           });
           updated += 1;
         } catch (err) {
-          console.warn('Sample persona update failed:', sample.key, err);
+          // Fallback: persona/engine only (some builds reject voice_type changes).
+          try {
+            await apiFetch(`/profiles/${existing.id}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                name: sample.name,
+                language: 'en',
+                personality: payload.personality,
+                default_engine: sample.engine,
+                preset_engine: sample.engine,
+                preset_voice_id: sample.presetVoiceId,
+                voice_type: 'preset',
+              }),
+            });
+            updated += 1;
+          } catch (err2) {
+            console.warn('Sample persona update failed:', sample.key, err2);
+          }
         }
       }
       continue;
@@ -440,9 +465,10 @@ async function seedSampleVoices(existingProfiles) {
       });
       created += 1;
     } catch (err) {
-      // Some Voicebox builds reject preset_* fields on create — retry minimal payload.
+      // Some Voicebox builds reject preset_* fields on create — retry minimal payload,
+      // then immediately PUT the preset fields so TTS does not 500 (no samples).
       try {
-        await apiFetch('/profiles', {
+        const createdProfile = await apiFetch('/profiles', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -453,6 +479,18 @@ async function seedSampleVoices(existingProfiles) {
           }),
         });
         created += 1;
+        const newId = createdProfile?.id;
+        if (newId && sample.presetVoiceId) {
+          try {
+            await apiFetch(`/profiles/${newId}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+          } catch (putErr) {
+            console.warn('Sample preset repair after create failed:', sample.key, putErr);
+          }
+        }
       } catch (err2) {
         console.warn('Sample voice seed failed:', sample.key, err2);
       }

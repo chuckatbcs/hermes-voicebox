@@ -227,6 +227,133 @@ def _post_stream(url: str, payload: dict, timeout: int) -> bytes:
         return r.read()
 
 
+def _post_json(url: str, payload: dict, timeout: int = 60) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read().decode("utf-8", errors="ignore")
+        return json.loads(body) if body else {}
+
+
+def _get_bytes(url: str, timeout: int = 60) -> bytes:
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _profile_tts_preflight(profile: dict) -> str | None:
+    """Return a human error if the profile cannot generate, else None."""
+    if not profile:
+        return "Profile not found."
+    voice_type = str(profile.get("voice_type") or "").lower()
+    sample_count = profile.get("sample_count")
+    preset_voice = profile.get("preset_voice_id") or profile.get("presetVoiceId")
+    name = profile.get("name") or profile.get("id") or "profile"
+
+    if voice_type == "preset" and not preset_voice:
+        return (
+            f"Preset profile '{name}' has no preset_voice_id. "
+            "Open Voicebox → Profiles and set a Kokoro/Qwen preset voice, "
+            "or re-open the Hermes Voicebox sidebar to repair sample presets."
+        )
+    if voice_type in ("cloned", "") and sample_count == 0 and not preset_voice:
+        return (
+            f"Profile '{name}' has no reference samples (and is not a preset). "
+            "Add a WAV/MP3 sample in Voicebox, or pick a Kokoro preset voice."
+        )
+    return None
+
+
+def _model_status_hint(base_url: str, engine: str | None) -> str:
+    try:
+        status = _get_json(f"{base_url}/models/status")
+    except Exception as e:
+        return f"(could not query /models/status: {e})"
+
+    rows = status if isinstance(status, list) else status.get("models") or status.get("items") or []
+    if isinstance(status, dict) and not rows:
+        # dict keyed by model name
+        rows = [
+            {"model_name": k, **(v if isinstance(v, dict) else {"downloaded": bool(v)})}
+            for k, v in status.items()
+            if isinstance(v, (dict, bool))
+        ]
+
+    eng = (engine or "").lower()
+    relevant = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_eng = str(row.get("engine") or row.get("model_name") or "").lower()
+        name = str(row.get("model_name") or row.get("name") or row_eng)
+        if eng and eng not in row_eng and eng not in name.lower():
+            continue
+        downloaded = row.get("downloaded")
+        if downloaded is None:
+            downloaded = row.get("ready") or row.get("cached")
+        relevant.append(f"{name}: downloaded={downloaded}")
+
+    if not relevant:
+        return f"(no /models/status rows matched engine={engine!r})"
+    return "Model status: " + "; ".join(relevant[:6])
+
+
+def _generate_via_async_job(base_url: str, payload: dict, timeout: int) -> bytes:
+    """Fallback when /generate/stream 500s: queue /generate then fetch /audio/{id}."""
+    job = _post_json(f"{base_url}/generate", payload, timeout=min(60, timeout))
+    gen_id = job.get("id")
+    if not gen_id:
+        raise RuntimeError(f"/generate returned no id: {job}")
+
+    deadline = time.time() + timeout
+    last_status = job.get("status") or "generating"
+    last_error = job.get("error")
+    while time.time() < deadline:
+        try:
+            st = _get_json(f"{base_url}/history/{gen_id}")
+            last_status = st.get("status") or last_status
+            last_error = st.get("error") or last_error
+            if last_status == "completed":
+                return _get_bytes(f"{base_url}/audio/{gen_id}", timeout=min(60, timeout))
+            if last_status == "failed":
+                raise RuntimeError(last_error or "generation failed")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+    raise TimeoutError(
+        f"Timed out waiting for generation {gen_id} (last status={last_status}, error={last_error})"
+    )
+
+
+def generate_wav(base_url: str, payload: dict, timeout: int) -> bytes:
+    """Prefer streaming WAV; fall back to async job API on server 500."""
+    try:
+        return _post_stream(f"{base_url}/generate/stream", payload, timeout)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        if e.code != 500:
+            raise RuntimeError(f"HTTP {e.code}: {body or e.reason}") from e
+        print(
+            f"Stream generate HTTP 500 ({body or 'Internal Server Error'}); "
+            "retrying via /generate job API...",
+            file=sys.stderr,
+        )
+        try:
+            return _generate_via_async_job(base_url, payload, timeout)
+        except Exception as fallback_err:
+            raise RuntimeError(
+                f"HTTP 500 on /generate/stream: {body or 'Internal Server Error'}; "
+                f"job fallback also failed: {fallback_err}"
+            ) from fallback_err
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -301,20 +428,32 @@ def main():
     # 3. Resolve engine + language from profile metadata
     engine = None
     language = "en"
+    profile = {}
     try:
         profile = _get_json(f"{base_url}/profiles/{profile_id}")
-        engine  = profile.get("default_engine") or profile.get("preset_engine")
+        engine = profile.get("default_engine") or profile.get("preset_engine")
         language = profile.get("language") or language
+        print(
+            f"Profile '{profile.get('name') or profile_id}' "
+            f"type={profile.get('voice_type')!r} engine={engine!r} "
+            f"preset_voice_id={profile.get('preset_voice_id')!r} "
+            f"samples={profile.get('sample_count')!r}",
+            file=sys.stderr,
+        )
+        preflight = _profile_tts_preflight(profile)
+        if preflight:
+            print(f"Error: {preflight}", file=sys.stderr)
+            sys.exit(1)
     except Exception as e:
         print(f"Warning: could not fetch profile details ({e}), engine left unset.", file=sys.stderr)
 
     # 4. Split text into chunks
     chunks = _split_sentences(text, MAX_CHARS)
-    n      = len(chunks)
+    n = len(chunks)
     print(f"Generating TTS for profile '{profile_id}' in {n} chunk(s)...", file=sys.stderr)
 
     # 5. Generate each chunk
-    wav_format   = None   # (sample_rate, num_channels, bits_per_sample)
+    wav_format = None   # (sample_rate, num_channels, bits_per_sample)
     pcm_segments = []
 
     for i, chunk_text in enumerate(chunks, 1):
@@ -327,12 +466,8 @@ def main():
         last_err = None
         for attempt in range(2):
             try:
-                raw = _post_stream(f"{base_url}/generate/stream", payload, CHUNK_TIMEOUT)
+                raw = generate_wav(base_url, payload, CHUNK_TIMEOUT)
                 break
-            except urllib.error.HTTPError as e:
-                msg = e.read().decode("utf-8", errors="ignore")
-                print(f"HTTP {e.code} on chunk {i}: {msg}", file=sys.stderr)
-                sys.exit(1)
             except urllib.error.URLError as e:
                 last_err = e.reason
                 if attempt == 0:
@@ -342,7 +477,14 @@ def main():
                 print(f"Connection error on chunk {i}: {e.reason}", file=sys.stderr)
                 sys.exit(1)
             except Exception as e:
-                print(f"Unexpected error on chunk {i}: {e}", file=sys.stderr)
+                print(f"TTS failed on chunk {i}: {e}", file=sys.stderr)
+                print(_model_status_hint(base_url, engine), file=sys.stderr)
+                print(
+                    "Hint: confirm Voicebox can speak this profile in its own UI, "
+                    "and that the engine model is downloaded "
+                    f"(curl -s {base_url}/models/status).",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
 
         if raw is None:
