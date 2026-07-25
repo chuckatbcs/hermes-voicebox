@@ -290,10 +290,8 @@ function VoiceboxView() {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const uiName = `mic-recording-${stamp}.${ext}`;
     applyCapturedSample(blob, uiName, `sample.${ext}`);
-    if (!cloneName.trim()) {
-      setCloneName('Mic Recording');
-    }
-  }, [applyCapturedSample, clearRecordTimers, cloneName, releaseMediaStream]);
+    setCloneName((prev) => (prev && prev.trim() ? prev : 'Mic Recording'));
+  }, [applyCapturedSample, clearRecordTimers, releaseMediaStream]);
 
   const stopRecording = useCallback(() => {
     const recorder = mediaRecorderRef.current;
