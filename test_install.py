@@ -61,6 +61,30 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(result, "skipped_manual")
             self.assertEqual(cfg.read_text(encoding="utf-8"), "tts:\n  provider: something_else\n")
 
+    def test_relocates_tts_block_parked_under_personalities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.yaml"
+            cfg.write_text(
+                "agent:\n"
+                "  personalities:\n"
+                f"{install.MARKER_BEGIN}\n"
+                "tts:\n  provider: old\n"
+                f"{install.MARKER_END}\n"
+                "    helpful: You are helpful.\n"
+                "terminal:\n  backend: local\n",
+                encoding="utf-8",
+            )
+            snippet = install.build_snippet("python3", Path(tmp) / "scripts" / "voicebox_tts.py")
+            result = install.merge_config(cfg, snippet)
+            self.assertEqual(result, "relocated")
+            text = cfg.read_text(encoding="utf-8")
+            self.assertIn("provider: voicebox", text)
+            self.assertNotIn("provider: old", text)
+            # personalities entries must still be under personalities, not after a TTS hole
+            self.assertIn("    helpful: You are helpful.", text)
+            self.assertLess(text.index("personalities:"), text.index("helpful:"))
+            self.assertLess(text.index("helpful:"), text.index(install.MARKER_BEGIN))
+
 
 class ModelResolveTests(unittest.TestCase):
     def test_prefers_17b_qwen_and_skips_downloaded(self):

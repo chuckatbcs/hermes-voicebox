@@ -84,6 +84,7 @@ function sameVoiceId(a, b) {
 }
 
 const ACTIVE_VOICE_LS_KEY = 'voicebox_active_voice_id';
+const DISMISSED_SAMPLES_KEY = 'voicebox_dismissed_sample_keys';
 
 function readLocalActiveVoice() {
   try {
@@ -98,6 +99,25 @@ function writeLocalActiveVoice(voiceId) {
     const id = voiceId == null ? '' : String(voiceId);
     if (id) localStorage.setItem(ACTIVE_VOICE_LS_KEY, id);
     else localStorage.removeItem(ACTIVE_VOICE_LS_KEY);
+  } catch (_) {}
+}
+
+function readDismissedSampleKeys() {
+  try {
+    const raw = localStorage.getItem(DISMISSED_SAMPLES_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(arr) ? arr.map(String) : []);
+  } catch (_) {
+    return new Set();
+  }
+}
+
+function dismissSampleKey(key) {
+  if (!key) return;
+  try {
+    const next = readDismissedSampleKeys();
+    next.add(String(key));
+    localStorage.setItem(DISMISSED_SAMPLES_KEY, JSON.stringify([...next]));
   } catch (_) {}
 }
 
@@ -159,6 +179,14 @@ const ENGINE_META = {
     cloning:    true,
     description:'Highest fidelity voice cloning. Uses most of your GPU. Fans will spin.'
   },
+  qwen_fast: {
+    label:      'Qwen TTS 0.6B Fast',
+    badge:      '🟢',
+    vram:       '~2.5 GB',
+    quality:    'Good (faster clone)',
+    cloning:    true,
+    description:'Smaller Qwen variant. Faster loads and generation, especially on CPU.'
+  },
   chatterbox: {
     label:      'Chatterbox 3B',
     badge:      '🟡',
@@ -169,18 +197,19 @@ const ENGINE_META = {
   },
   chatterbox_turbo: {
     label:      'Chatterbox Turbo',
-    badge:      '🟡',
+    badge:      '🟢',
     vram:       '~4 GB',
     quality:    'Good (English, fast)',
     cloning:    true,
-    description:'Faster Chatterbox variant. English-optimised with expression tags.'
+    description:'Faster Chatterbox variant. Best default for English clones.'
   },
 };
 
 const CLONING_ENGINE_OPTIONS = [
-  { value: 'qwen',             label: 'Qwen TTS 1.7B',      badge: '🔴', vram: '~7.6 GB',  note: 'Best quality' },
+  { value: 'chatterbox_turbo', label: 'Chatterbox Turbo',    badge: '🟢', vram: '~4 GB',    note: 'Fastest good clone (recommended)' },
+  { value: 'qwen_fast',        label: 'Qwen TTS 0.6B Fast',  badge: '🟢', vram: '~2.5 GB',  note: 'Smaller/faster; good on CPU' },
+  { value: 'qwen',             label: 'Qwen TTS 1.7B',      badge: '🔴', vram: '~7.6 GB',  note: 'Best quality (slower)' },
   { value: 'chatterbox',       label: 'Chatterbox 3B',       badge: '🟡', vram: '~4 GB',    note: 'Good quality, moderate GPU' },
-  { value: 'chatterbox_turbo', label: 'Chatterbox Turbo',    badge: '🟡', vram: '~4 GB',    note: 'Fast English cloning' },
 ];
 
 // ── Helpers ────────────────────────────────────
@@ -398,11 +427,13 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
 }
 
 function sampleNeedsPresetRepair(existing, sample) {
+  // Only repair rows we previously seeded (marker required). Never "repair" user clones.
   if (!existing) return false;
+  const stored = String(existing.personality || '');
+  if (!stored.includes(`${SAMPLE_SEED_MARKER}:${sample.key}`)) return false;
   const voiceType = String(existing.voice_type || '').toLowerCase();
   const presetId = existing.preset_voice_id || existing.presetVoiceId;
   const engine = existing.preset_engine || existing.default_engine;
-  // Minimal create fallback used to leave "cloned" rows with no samples — those 500 on TTS.
   if (sample.presetVoiceId && (!presetId || voiceType !== 'preset')) return true;
   if (sample.engine && engine && String(engine).toLowerCase() !== sample.engine) return true;
   return false;
@@ -411,20 +442,26 @@ function sampleNeedsPresetRepair(existing, sample) {
 async function seedSampleVoices(existingProfiles) {
   const list = Array.isArray(existingProfiles) ? existingProfiles : [];
   const byName = new Map(list.map((v) => [String(v.name || '').trim().toLowerCase(), v]));
+  const dismissed = readDismissedSampleKeys();
   let created = 0;
   let updated = 0;
 
   for (const sample of SAMPLE_VOICES) {
+    if (dismissed.has(sample.key)) continue;
+
     const existing = byName.get(sample.name.toLowerCase());
     const payload = buildSampleProfilePayload(sample);
 
     if (existing?.id) {
       const stored = String(existing.personality || '');
       const hasMarker = stored.includes(`${SAMPLE_SEED_MARKER}:${sample.key}`);
-      const looksConcatenated = hasMarker && !stored.includes('\n') && stored.length > 80;
+      // Name collision with a user-owned profile (clone/custom/no marker): never overwrite.
+      if (!hasMarker) continue;
+
+      const looksConcatenated = !stored.includes('\n') && stored.length > 80;
       const hasLegacyWrapper = /\[Voicebox sample persona:/i.test(stored);
       const needsPreset = sampleNeedsPresetRepair(existing, sample);
-      if (!hasMarker || !stored || looksConcatenated || hasLegacyWrapper || needsPreset) {
+      if (looksConcatenated || hasLegacyWrapper || needsPreset) {
         try {
           await apiFetch(`/profiles/${existing.id}`, {
             method: 'PUT',
@@ -507,7 +544,7 @@ function VoiceboxView() {
   const [voices, setVoices]               = useState([]);
   const [activeVoiceId, setActiveVoiceId] = useState('');
   const [cloneName, setCloneName]         = useState('');
-  const [cloneEngine, setCloneEngine]     = useState('qwen');
+  const [cloneEngine, setCloneEngine]     = useState('chatterbox_turbo');
   const [referenceText, setReferenceText] = useState('The quick brown fox jumps over the lazy dog.');
   const [deleteConfirmId, setDeleteConfirmId] = useState(null);
   const [isDeleting, setIsDeleting]       = useState(false);
@@ -836,11 +873,11 @@ function VoiceboxView() {
     };
   }, [fetchProfilesAndConfig, stopPlayback, revokeAudioUrl, clearRecordTimers, releaseMediaStream]);
 
-  // ── Auto-cancel delete confirmation after 5 seconds ──
+  // ── Auto-cancel delete confirmation after 12 seconds ──
   useEffect(() => {
     if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
     if (deleteConfirmId) {
-      deleteTimerRef.current = setTimeout(() => setDeleteConfirmId(null), 5000);
+      deleteTimerRef.current = setTimeout(() => setDeleteConfirmId(null), 12000);
     }
     return () => { if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current); };
   }, [deleteConfirmId]);
@@ -892,17 +929,41 @@ function VoiceboxView() {
   }, [persistPersona]);
 
   // ── Active Voice Selection ───────────────────
-  const handleVoiceChange = async (voiceId) => {
+  const handleVoiceChange = async (voiceId, voiceOverride = null) => {
     if (!voiceId) return;
     const id = String(voiceId);
     const previousId = activeVoiceId;
-    const voice = voices.find((v) => sameVoiceId(v.id, id));
+    let voice = voiceOverride && sameVoiceId(voiceOverride.id, id)
+      ? voiceOverride
+      : voices.find((v) => sameVoiceId(v.id, id));
     if (!voice) {
-      host.notify({ kind: 'error', title: 'Voice Update Failed', message: `Profile not found in list (${id}).` });
+      // Freshly cloned profiles are not in React state yet — fetch once.
+      try {
+        voice = await apiFetch(`/profiles/${id}`);
+        if (voice?.id) voice = { ...voice, id: String(voice.id) };
+      } catch (err) {
+        host.notify({
+          kind: 'error',
+          title: 'Voice Profile Load Failed',
+          message: err?.message || `Profile not found (${id}).`,
+        });
+        return;
+      }
+    }
+    if (!voice?.id) {
+      host.notify({
+        kind: 'error',
+        title: 'Voice Profile Load Failed',
+        message: `Profile not found in list (${id}).`,
+      });
       return;
     }
     const { engine, meta } = getEngineMeta(voice);
     setActiveVoiceId(id);
+    setVoices((prev) => {
+      if (prev.some((v) => sameVoiceId(v.id, id))) return prev;
+      return [voice, ...prev];
+    });
 
     let persistInfo = null;
     try {
@@ -932,9 +993,37 @@ function VoiceboxView() {
     const persona = displayPersonaPrompt(voice.personality)
       || (sample ? sample.personality : null)
       || personaMapping[voiceId]
-      || personaMapping[voiceName];
+      || personaMapping[voiceName]
+      || personaMapping[id];
 
     if (!persona) {
+      // For known sample names (e.g. Eric Cartman) still apply the stock parody persona.
+      const namedSample = SAMPLE_VOICES.find(
+        (s) => s.name.toLowerCase() === String(voiceName).trim().toLowerCase()
+      );
+      if (namedSample) {
+        try {
+          const result = await applyHermesPersona({
+            key: namedSample.key,
+            prompt: namedSample.personality,
+            voiceName,
+          });
+          const mode = result.modes.join(' + ');
+          host.notify({
+            kind: 'success',
+            title: 'Persona Applied',
+            message: `"${voiceName}" persona active (${mode}).`,
+          });
+        } catch (err) {
+          host.notify({
+            kind: 'info',
+            title: 'Voice Changed',
+            message: `Active voice set to "${voiceName}". (Persona apply skipped: ${err.message || 'error'})`,
+          });
+        }
+        void previousId;
+        return;
+      }
       host.notify({
         kind: 'info',
         title: 'Voice Changed',
@@ -975,16 +1064,26 @@ function VoiceboxView() {
   const handleDeleteVoice = async (voiceId) => {
     setIsDeleting(true);
     try {
+      const victim = voices.find((v) => sameVoiceId(v.id, voiceId));
+      const sample = findSampleByVoice(victim);
       await apiFetch(`/profiles/${voiceId}`, { method: 'DELETE' });
+      // Prevent sample seeder from immediately recreating demo voices after delete.
+      if (sample?.key) dismissSampleKey(sample.key);
       if (sameVoiceId(voiceId, activeVoiceId)) {
         setActiveVoiceId('');
         try { await saveActiveVoice(''); } catch (_) {}
       }
       setDeleteConfirmId(null);
+      // Optimistic UI update so delete feels instant even if refresh is slow.
+      setVoices((prev) => prev.filter((v) => !sameVoiceId(v.id, voiceId)));
       host.notify({ kind: 'success', title: 'Voice Deleted', message: 'Profile removed successfully.' });
       await fetchProfilesAndConfig();
     } catch (err) {
-      host.notify({ kind: 'error', title: 'Delete Failed', message: err.message });
+      host.notify({
+        kind: 'error',
+        title: 'Delete Failed',
+        message: err?.message || 'Voicebox rejected the delete request.',
+      });
     } finally {
       setIsDeleting(false);
     }
@@ -1097,10 +1196,26 @@ function VoiceboxView() {
       // Upload succeeded — profile is not orphaned
       createdProfileId = null;
 
-      // 3. Set as active
-      await handleVoiceChange(profile.id);
+      // 3. Set as active (pass profile object — it is not in voices[] yet)
+      await handleVoiceChange(profile.id, profile);
 
-      // 4. Reset
+      // 4. Also stamp a stock sample persona when the clone reuses a sample name
+      const namedSample = SAMPLE_VOICES.find(
+        (s) => s.name.toLowerCase() === savedName.toLowerCase()
+      );
+      if (namedSample) {
+        try {
+          await apiFetch(`/profiles/${profile.id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              personality: packSamplePersonality(namedSample, namedSample.personality),
+            }),
+          });
+        } catch (_) {}
+      }
+
+      // 5. Reset
       stopPlayback();
       revokeAudioUrl();
       setCloneName(''); setFileName(''); setUploadFileName('sample.wav');

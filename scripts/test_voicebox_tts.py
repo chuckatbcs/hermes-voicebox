@@ -78,6 +78,10 @@ class TestResolveProfileId(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_falls_back_when_active_voice_missing(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
         class MissingActiveVoice(Exception):
             pass
 
@@ -88,10 +92,21 @@ class TestResolveProfileId(unittest.TestCase):
                 return [{"id": "first-profile"}]
             raise AssertionError(url)
 
-        self.assertEqual(
-            resolve_profile_id("default", "http://127.0.0.1:17493", get_json=get_json),
-            "first-profile",
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("HERMES_DIR")
+            os.environ["HERMES_DIR"] = tmp
+            # Ensure no sidecar leaks from the developer machine.
+            Path(tmp, "voicebox_active_voice.json").unlink(missing_ok=True)
+            try:
+                self.assertEqual(
+                    resolve_profile_id("default", "http://127.0.0.1:17493", get_json=get_json),
+                    "first-profile",
+                )
+            finally:
+                if old is None:
+                    del os.environ["HERMES_DIR"]
+                else:
+                    os.environ["HERMES_DIR"] = old
 
 
 class TestProfilePreflight(unittest.TestCase):

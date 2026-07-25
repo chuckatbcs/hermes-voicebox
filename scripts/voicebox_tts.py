@@ -22,9 +22,9 @@ import urllib.error
 # on Blackwell GPU a 800-char chunk takes ~30-60 s.
 CHUNK_TIMEOUT   = 300
 # Maximum characters per chunk sent to the backend.
-# The backend itself also splits at 800 chars, but we stay well under that
-# so we control the boundaries at sentence level.
-MAX_CHARS       = 600
+# Match Voicebox's ~800-char internal split so long replies need fewer
+# round-trips (each round-trip can reload/switch engines on CPU).
+MAX_CHARS       = 800
 
 
 def get_base_url(cli_base_url: str = None) -> str:
@@ -245,12 +245,41 @@ def _get_bytes(url: str, timeout: int = 60) -> bytes:
         return r.read()
 
 
-def _profile_tts_preflight(profile: dict) -> str | None:
+def _profile_sample_count(profile: dict, base_url: str | None = None, profile_id: str | None = None) -> int:
+    """Voicebox list/detail often reports sample_count=0 even when /samples has rows."""
+    raw = profile.get("sample_count")
+    try:
+        count = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        count = 0
+    if count > 0:
+        return count
+    pid = profile_id or profile.get("id")
+    if not base_url or not pid:
+        return count
+    try:
+        samples = _get_json(f"{base_url}/profiles/{pid}/samples")
+        if isinstance(samples, list):
+            return len(samples)
+        if isinstance(samples, dict):
+            rows = samples.get("samples") or samples.get("items") or []
+            return len(rows) if isinstance(rows, list) else count
+    except Exception:
+        pass
+    return count
+
+
+def _profile_tts_preflight(
+    profile: dict,
+    *,
+    base_url: str | None = None,
+    profile_id: str | None = None,
+) -> str | None:
     """Return a human error if the profile cannot generate, else None."""
     if not profile:
         return "Profile not found."
     voice_type = str(profile.get("voice_type") or "").lower()
-    sample_count = profile.get("sample_count")
+    sample_count = _profile_sample_count(profile, base_url=base_url, profile_id=profile_id)
     preset_voice = profile.get("preset_voice_id") or profile.get("presetVoiceId")
     name = profile.get("name") or profile.get("id") or "profile"
 
@@ -260,7 +289,7 @@ def _profile_tts_preflight(profile: dict) -> str | None:
             "Open Voicebox → Profiles and set a Kokoro/Qwen preset voice, "
             "or re-open the Hermes Voicebox sidebar to repair sample presets."
         )
-    if voice_type in ("cloned", "") and sample_count == 0 and not preset_voice:
+    if voice_type in ("cloned", "custom", "") and sample_count == 0 and not preset_voice:
         return (
             f"Profile '{name}' has no reference samples (and is not a preset). "
             "Add a WAV/MP3 sample in Voicebox, or pick a Kokoro preset voice."
@@ -433,14 +462,19 @@ def main():
         profile = _get_json(f"{base_url}/profiles/{profile_id}")
         engine = profile.get("default_engine") or profile.get("preset_engine")
         language = profile.get("language") or language
+        live_samples = _profile_sample_count(
+            profile, base_url=base_url, profile_id=profile_id
+        )
         print(
             f"Profile '{profile.get('name') or profile_id}' "
             f"type={profile.get('voice_type')!r} engine={engine!r} "
             f"preset_voice_id={profile.get('preset_voice_id')!r} "
-            f"samples={profile.get('sample_count')!r}",
+            f"samples={live_samples!r}",
             file=sys.stderr,
         )
-        preflight = _profile_tts_preflight(profile)
+        preflight = _profile_tts_preflight(
+            profile, base_url=base_url, profile_id=profile_id
+        )
         if preflight:
             print(f"Error: {preflight}", file=sys.stderr)
             sys.exit(1)
@@ -479,12 +513,22 @@ def main():
             except Exception as e:
                 print(f"TTS failed on chunk {i}: {e}", file=sys.stderr)
                 print(_model_status_hint(base_url, engine), file=sys.stderr)
-                print(
-                    "Hint: confirm Voicebox can speak this profile in its own UI, "
-                    "and that the engine model is downloaded "
-                    f"(curl -s {base_url}/models/status).",
-                    file=sys.stderr,
-                )
+                err_l = str(e).lower()
+                if "cuda" in err_l or "unspecified launch failure" in err_l:
+                    print(
+                        "Hint: Voicebox hit a CUDA/GPU failure (often a wedged driver "
+                        "after suspend). Check `nvidia-smi` for ERR!, restart the "
+                        "Voicebox service with CUDA_VISIBLE_DEVICES= for CPU TTS, "
+                        "or reboot to clear the GPU, then retry.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "Hint: confirm Voicebox can speak this profile in its own UI, "
+                        "and that the engine model is downloaded "
+                        f"(curl -s {base_url}/models/status).",
+                        file=sys.stderr,
+                    )
                 sys.exit(1)
 
         if raw is None:

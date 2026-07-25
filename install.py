@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -207,10 +208,18 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     return plugin_dst, bridge_dst
 
 
+def _tts_marker_is_under_personalities(text: str) -> bool:
+    """True when the marked TTS block was wrongly nested under agent.personalities."""
+    if MARKER_BEGIN not in text:
+        return False
+    pre = text.split(MARKER_BEGIN, 1)[0].rstrip()
+    return bool(re.search(r"(?m)^[ \t]*personalities:\s*$", pre.splitlines()[-1] if pre else ""))
+
+
 def merge_config(config_path: Path, snippet: str, *, force: bool = False) -> str:
     """
     Merge voicebox TTS block into config.yaml.
-    Returns one of: created | replaced | appended | skipped_manual
+    Returns one of: created | replaced | appended | relocated | skipped_manual
     """
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,6 +231,17 @@ def merge_config(config_path: Path, snippet: str, *, force: bool = False) -> str
     backup.write_text(original, encoding="utf-8")
 
     if MARKER_BEGIN in original and MARKER_END in original:
+        # If a prior bug parked the TTS block under personalities:, strip it and
+        # append at EOF so YAML structure (and Hermes config.set) stays valid.
+        if _tts_marker_is_under_personalities(original):
+            pre = original.split(MARKER_BEGIN, 1)[0].rstrip()
+            post = original.split(MARKER_END, 1)[1].lstrip("\n")
+            cleaned = (pre + ("\n" + post if post else "\n")).rstrip() + "\n\n" + snippet
+            config_path.write_text(
+                cleaned if cleaned.endswith("\n") else cleaned + "\n", encoding="utf-8"
+            )
+            return "relocated"
+
         pre = original.split(MARKER_BEGIN, 1)[0].rstrip()
         post = original.split(MARKER_END, 1)[1].lstrip("\n")
         merged = (pre + "\n\n" if pre else "") + snippet + (("\n" + post) if post else "")

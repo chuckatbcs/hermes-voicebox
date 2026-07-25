@@ -50,7 +50,29 @@ ls -la "$HERMES_DIR/desktop-plugins/voice-switcher/plugin.js" 2>&1 || true
 ls -la "$HERMES_DIR/scripts/voicebox_tts.py" 2>&1 || true
 
 step "4) Voicebox /health"
-curl -sS -m 10 "$BASE_URL/health" || echo "HEALTH_FAILED"
+HEALTH_JSON=$(curl -sS -m 10 "$BASE_URL/health" || echo '{"status":"HEALTH_FAILED"}')
+echo "$HEALTH_JSON"
+if command -v jq >/dev/null 2>&1; then
+  echo "gpu_available=$(echo "$HEALTH_JSON" | jq -r '.gpu_available // "unknown"')"
+  echo "backend_variant=$(echo "$HEALTH_JSON" | jq -r '.backend_variant // "unknown"')"
+fi
+
+step "4b) Host GPU / CUDA sanity (common cause of /generate/stream HTTP 500)"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  # Capture without hanging forever if the driver is wedged
+  if NVIDIA_OUT=$(timeout 8 nvidia-smi 2>&1); then
+    echo "$NVIDIA_OUT" | head -20
+    if echo "$NVIDIA_OUT" | grep -q 'ERR!'; then
+      echo "DIAG: nvidia-smi reports ERR! — GPU driver is wedged (often after suspend)."
+      echo "DIAG: restart Voicebox on CPU (CUDA_VISIBLE_DEVICES=) or reboot to clear CUDA."
+    fi
+  else
+    echo "DIAG: nvidia-smi hung or failed (exit $?) — treat GPU as wedged."
+    echo "DIAG: systemctl --user restart voicebox.service after setting CUDA_VISIBLE_DEVICES="
+  fi
+else
+  echo "nvidia-smi not present (OK on CPU-only hosts)"
+fi
 
 step "5) Profile detail"
 if command -v jq >/dev/null 2>&1; then
