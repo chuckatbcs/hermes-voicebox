@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes Voicebox GPU lifecycle (idle unload + stop on Hermes exit)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.hermes/scripts/voicebox_gpu.py lifecycle-daemon
+Restart=on-failure
+RestartSec=5
+
+# Localhost control API only (127.0.0.1:17494)
+# Does not expose Voicebox beyond its existing bind.
+
+[Install]
+WantedBy=default.target

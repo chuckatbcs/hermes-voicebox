@@ -25,7 +25,9 @@ param(
     [switch]$SkipVoicebox,
     [switch]$SkipModels,
     [switch]$PreferDocker,
-    [switch]$PreferDesktop
+    [switch]$PreferDesktop,
+    [switch]$SkipGpuLifecycle,
+    [switch]$NoStopVoiceboxOnHermesExit
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,6 +103,8 @@ if ($PreferDocker) { $installArgs += "--prefer-docker" }
 if ($PreferDesktop) { $installArgs += "--prefer-desktop" }
 if ($AllProfiles) { $installArgs += "--all-profiles" }
 if ($Profile) { $installArgs += @("--profile", $Profile) }
+if ($SkipGpuLifecycle) { $installArgs += "--skip-gpu-lifecycle" }
+if ($NoStopVoiceboxOnHermesExit) { $installArgs += "--no-stop-voicebox-on-hermes-exit" }
 
 Write-Host "Using: $($py.File) $($py.Args -join ' ')" -ForegroundColor Cyan
 & $py.File @($py.Args + $installArgs)

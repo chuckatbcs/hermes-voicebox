@@ -405,6 +405,7 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     bridge_src = src_root / "scripts" / "voicebox_tts.py"
     bind_src = src_root / "scripts" / "voicebox_bind.py"
     streamer_src = src_root / "scripts" / "hermes_voicebox_streamer.py"
+    gpu_src = src_root / "scripts" / "voicebox_gpu.py"
 
     if not plugin_src.is_file():
         raise FileNotFoundError(f"Missing plugin source: {plugin_src}")
@@ -414,6 +415,8 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
         raise FileNotFoundError(f"Missing bind helper source: {bind_src}")
     if not streamer_src.is_file():
         raise FileNotFoundError(f"Missing speak-stream source: {streamer_src}")
+    if not gpu_src.is_file():
+        raise FileNotFoundError(f"Missing GPU lifecycle source: {gpu_src}")
 
     plugin_dst_dir = hermes_dir / "desktop-plugins" / PLUGIN_ID
     scripts_dst_dir = hermes_dir / "scripts"
@@ -423,6 +426,7 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     plugin_dst = plugin_dst_dir / "plugin.js"
     bridge_dst = scripts_dst_dir / "voicebox_tts.py"
     bind_dst = scripts_dst_dir / "voicebox_bind.py"
+    gpu_dst = scripts_dst_dir / "voicebox_gpu.py"
 
     # Copy plugin entry + companion modules/assets
     for src in plugin_src_dir.iterdir():
@@ -431,11 +435,86 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
 
     shutil.copy2(bridge_src, bridge_dst)
     shutil.copy2(bind_src, bind_dst)
+    shutil.copy2(gpu_src, gpu_dst)
     if platform.system() != "Windows":
-        bridge_dst.chmod(bridge_dst.stat().st_mode | 0o111)
-        bind_dst.chmod(bind_dst.stat().st_mode | 0o111)
+        for path in (bridge_dst, bind_dst, gpu_dst):
+            path.chmod(path.stat().st_mode | 0o111)
 
     return plugin_dst, bridge_dst
+
+
+def install_gpu_lifecycle(
+    hermes_root: Path,
+    *,
+    stop_on_hermes_exit: bool = True,
+    idle_minutes: int = 15,
+    enable: bool = True,
+) -> str:
+    """
+    Install GPU lifecycle config + Linux user systemd unit for the daemon.
+
+    Returns a short status string for the installer log.
+    """
+    # Seed config via the installed helper (or repo script during tests).
+    gpu_py = hermes_root / "scripts" / "voicebox_gpu.py"
+    if not gpu_py.is_file():
+        return "missing_gpu_script"
+
+    import subprocess
+
+    cmd = [
+        sys.executable,
+        str(gpu_py),
+        "--hermes-home",
+        str(hermes_root),
+        "config",
+        "--stop-on-hermes-exit",
+        "on" if stop_on_hermes_exit else "off",
+        "--idle-unload",
+        "on",
+        "--idle-minutes",
+        str(idle_minutes),
+    ]
+    subprocess.run(cmd, check=False, capture_output=True, text=True)
+
+    if platform.system() != "Linux" or not enable:
+        return "config_only" if not enable else "config_only_non_linux"
+
+    # Never enable a user systemd unit that points at a throwaway --hermes-dir
+    # (unit tests / smoke installs). Only wire the service for the real home.
+    real_home = (Path.home() / ".hermes").resolve()
+    if hermes_root.resolve() != real_home:
+        return "config_only_non_default_home"
+
+    unit_src = Path(__file__).resolve().parent / "installer" / "systemd" / "voicebox-gpu-lifecycle.service"
+    if not unit_src.is_file():
+        return "missing_unit_template"
+
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    unit_dst = unit_dir / "voicebox-gpu-lifecycle.service"
+
+    # Rewrite ExecStart to the absolute installed script path.
+    text = unit_src.read_text(encoding="utf-8")
+    text = text.replace(
+        "ExecStart=%h/.hermes/scripts/voicebox_gpu.py lifecycle-daemon",
+        f"ExecStart={sys.executable} {gpu_py} --hermes-home {hermes_root} lifecycle-daemon",
+    )
+    unit_dst.write_text(text, encoding="utf-8")
+
+    steps = []
+    for args in (
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "voicebox-gpu-lifecycle.service"],
+    ):
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=60, check=False)
+            steps.append(f"{' '.join(args)}=>{proc.returncode}")
+        except Exception as exc:
+            steps.append(f"{' '.join(args)}: {exc}")
+            return "unit_written:" + ",".join(steps)
+
+    return "enabled:" + ",".join(steps)
 
 
 def _tts_marker_is_under_personalities(text: str) -> bool:
@@ -556,6 +635,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-voicebox", action="store_true", help="Do not provision Voicebox")
     parser.add_argument("--skip-models", action="store_true", help="Do not download TTS models")
     parser.add_argument(
+        "--skip-gpu-lifecycle",
+        action="store_true",
+        help="Do not install/enable the Voicebox GPU lifecycle daemon (idle unload + Hermes-exit stop)",
+    )
+    parser.add_argument(
+        "--no-stop-voicebox-on-hermes-exit",
+        action="store_true",
+        help="Keep Voicebox running after Hermes Desktop quits (still idle-unloads models by default)",
+    )
+    parser.add_argument(
         "--model-profile",
         choices=sorted(MODEL_PROFILES.keys()),
         default="plugin",
@@ -642,6 +731,19 @@ def main(argv: list[str] | None = None) -> int:
     bind_dst = install_root / "scripts" / "voicebox_bind.py"
     if bind_dst.is_file():
         print(f"Installed binder: {bind_dst}")
+    gpu_dst = install_root / "scripts" / "voicebox_gpu.py"
+    if gpu_dst.is_file():
+        print(f"Installed GPU helper: {gpu_dst}")
+
+    if not args.skip_gpu_lifecycle:
+        gpu_status = install_gpu_lifecycle(
+            install_root,
+            stop_on_hermes_exit=not args.no_stop_voicebox_on_hermes_exit,
+            enable=True,
+        )
+        print(f"GPU lifecycle: {gpu_status}")
+    else:
+        print("GPU lifecycle: skipped (--skip-gpu-lifecycle)")
 
     stream_hook = install_speak_stream_hook(install_root)
     if stream_hook == "no_hermes_agent":
@@ -735,6 +837,11 @@ def main(argv: list[str] | None = None) -> int:
         "  • After a Hermes Agent update, re-run: "
         "python install.py -y --skip-prereqs --skip-hermes "
         "(re-applies speak-stream patches under hermes-agent/)"
+    )
+    print(
+        "  • Free GPU: plugin button, or "
+        "`python3 ~/.hermes/scripts/voicebox_gpu.py unload` "
+        "(idle unload + stop-on-Hermes-exit via voicebox-gpu-lifecycle)"
     )
     if platform.system() == "Windows":
         print()

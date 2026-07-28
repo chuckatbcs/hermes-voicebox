@@ -7,6 +7,7 @@ Cross-platform integration between the **Hermes Desktop Client** and **Voicebox 
 - **Smart Engine Routing** for Kokoro / Chatterbox / Qwen profiles
 - **Sentence chunking & WAV merging** for long AI responses (clone engines speak one sentence per request so Chatterbox early-stops don't truncate the rest)
 - **Desktop speak-stream hook** so read-aloud starts on the first sentence and look-ahead-synthesizes the next while the current one plays (plus a 600s command TTS timeout)
+- **GPU lifecycle** — Free GPU button, idle unload (~15 min after last TTS), and optional Voicebox stop when Hermes Desktop quits
 - **In-plugin microphone recording** (plus native OS file picker) for voice cloning samples
 - **Fun sample persona voices** (Vincent Price, Porky Pig, Cartman, Jarvis, GLaDOS) seeded as parody templates with Hermes `/personality` keys — not official voice clones / no copyrighted audio bundled
 - **Safe two-step voice deletion**
@@ -168,6 +169,27 @@ python3 install.py -y --skip-prereqs --skip-hermes
 
 If `hermes-agent` is missing, plugin + command TTS still work; Desktop read-aloud stays one-shot until the hook is installed.
 
+### GPU / VRAM lifecycle
+
+Voicebox keeps TTS models in VRAM after first speak. This package adds three release paths:
+
+| Path | How |
+|------|-----|
+| **Manual** | Plugin **Free GPU** button, or `python3 ~/.hermes/scripts/voicebox_gpu.py unload` |
+| **Idle** | `voicebox-gpu-lifecycle` user service unloads models ~15 minutes after last TTS (stamp file updated by the bridge) |
+| **Hermes exit** | Same service stops Voicebox after Hermes Desktop has been gone ~20s (toggle in plugin; default on) |
+
+Linux installer enables `~/.config/systemd/user/voicebox-gpu-lifecycle.service` (localhost control API on `127.0.0.1:17494`). Skip with `--skip-gpu-lifecycle`. Keep Voicebox running after Hermes quits with `--no-stop-voicebox-on-hermes-exit`.
+
+```bash
+python3 ~/.hermes/scripts/voicebox_gpu.py status
+python3 ~/.hermes/scripts/voicebox_gpu.py unload
+python3 ~/.hermes/scripts/voicebox_gpu.py stop    # unload + systemctl/docker stop
+python3 ~/.hermes/scripts/voicebox_gpu.py config --stop-on-hermes-exit off
+```
+
+Windows: use the plugin button / CLI; the systemd unit is Linux-only (you can still run `lifecycle-daemon` manually if desired).
+
 ---
 
 ## Manual Voicebox notes
@@ -182,9 +204,10 @@ If `hermes-agent` is missing, plugin + command TTS still work; Desktop read-alou
 
 ```bash
 python3 -m py_compile install.py installer/prereqs.py \
-  scripts/voicebox_tts.py scripts/voicebox_bind.py scripts/hermes_voicebox_streamer.py
+  scripts/voicebox_tts.py scripts/voicebox_bind.py scripts/voicebox_gpu.py \
+  scripts/hermes_voicebox_streamer.py
 python3 -m unittest test_install.py -v
-(cd scripts && python3 -m unittest test_voicebox_tts.py -v)
+(cd scripts && python3 -m unittest test_voicebox_tts.py test_voicebox_gpu.py -v)
 ./install.sh --hermes-dir /tmp/hermes-test --skip-prereqs
 ```
 
