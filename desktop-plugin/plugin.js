@@ -2,9 +2,11 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, host } from '@hermes/plugin-sdk';
 
 const DEFAULT_BACKEND_URL = 'http://127.0.0.1:17493';
+const GPU_CONTROL_URL = 'http://127.0.0.1:17494';
 const PERSONA_DEBOUNCE_MS = 400;
 const MIN_SAMPLE_SECONDS = 2;
 const MAX_SAMPLE_SECONDS = 120;
+const LS_STOP_ON_EXIT = 'voicebox_stop_on_hermes_exit';
 
 // Sample voices are inlined (Hermes plugin loader may not resolve relative imports).
 const SAMPLE_SEED_MARKER = 'hermes-voicebox-sample';
@@ -388,6 +390,64 @@ async function apiFetch(path, options = {}) {
   return res;
 }
 
+async function gpuControl(path, { method = 'GET', body = null } = {}) {
+  const opts = { method, headers: { Accept: 'application/json' } };
+  if (body != null) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(`${GPU_CONTROL_URL}${path}`, opts);
+  if (!res.ok) {
+    let detail = '';
+    try { detail = await res.text(); } catch (_) {}
+    throw new Error(detail || `GPU control failed (${res.status})`);
+  }
+  if (res.status === 204) return null;
+  try { return await res.json(); } catch (_) { return null; }
+}
+
+async function freeGpuMemory({ hardStop = false } = {}) {
+  // Prefer lifecycle daemon (also handles stop); fall back to Voicebox unload API.
+  try {
+    if (hardStop) {
+      return await gpuControl('/v1/stop', { method: 'POST' });
+    }
+    return await gpuControl('/v1/unload', { method: 'POST' });
+  } catch (_) {
+    // Direct Voicebox unload — works even if the daemon is not running.
+    const results = [];
+    try {
+      await apiFetch('/models/unload', { method: 'POST' });
+      results.push('default');
+    } catch (err) {
+      results.push(`default:${err.message || err}`);
+    }
+    try {
+      const status = await apiFetch('/models/status');
+      const models = Array.isArray(status?.models) ? status.models : [];
+      for (const m of models) {
+        if (!m?.loaded) continue;
+        const name = m.model_name || m.name;
+        if (!name) continue;
+        try {
+          await apiFetch(`/models/${encodeURIComponent(name)}/unload`, { method: 'POST' });
+          results.push(name);
+        } catch (_) {
+          try {
+            await apiFetch('/models/unload', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model_name: name }),
+            });
+            results.push(name);
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    return { unloaded: results, via: 'voicebox-api' };
+  }
+}
+
 // ─────────────────────────────────────────────
 // Voice selection persistence — per Hermes profile
 // ─────────────────────────────────────────────
@@ -699,6 +759,15 @@ function VoiceboxView() {
   // Connection & loading state
   const [isLoading, setIsLoading]         = useState(true);
   const [isConnected, setIsConnected]     = useState(null);
+  const [gpuStatus, setGpuStatus]         = useState(null);
+  const [stopOnHermesExit, setStopOnHermesExit] = useState(() => {
+    try {
+      const v = localStorage.getItem(LS_STOP_ON_EXIT);
+      if (v === '0' || v === 'false') return false;
+    } catch (_) {}
+    return true;
+  });
+  const [gpuBusy, setGpuBusy]             = useState(false);
 
   const playbackAudioRef = useRef(null);
   const deleteTimerRef   = useRef(null);
@@ -1030,6 +1099,82 @@ function VoiceboxView() {
     }
     return () => { if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current); };
   }, [deleteConfirmId]);
+
+  const refreshGpuStatus = useCallback(async () => {
+    try {
+      const st = await gpuControl('/v1/status');
+      setGpuStatus(st);
+      if (st?.config && typeof st.config.stop_on_hermes_exit === 'boolean') {
+        setStopOnHermesExit(st.config.stop_on_hermes_exit);
+        try {
+          localStorage.setItem(LS_STOP_ON_EXIT, st.config.stop_on_hermes_exit ? '1' : '0');
+        } catch (_) {}
+      }
+      return;
+    } catch (_) {}
+    // Daemon down — still show Voicebox health if reachable.
+    try {
+      const health = await apiFetch('/health');
+      setGpuStatus({
+        health,
+        loaded_models: [],
+        control: null,
+        config: { stop_on_hermes_exit: stopOnHermesExit },
+      });
+    } catch (_) {
+      setGpuStatus(null);
+    }
+  }, [stopOnHermesExit]);
+
+  useEffect(() => {
+    refreshGpuStatus();
+    const id = setInterval(refreshGpuStatus, 15000);
+    return () => clearInterval(id);
+  }, [refreshGpuStatus]);
+
+  const handleFreeGpu = useCallback(async () => {
+    setGpuBusy(true);
+    try {
+      await freeGpuMemory({ hardStop: false });
+      host.notify({ kind: 'success', title: 'GPU Freed', message: 'Voicebox TTS models unloaded from VRAM.' });
+      await refreshGpuStatus();
+    } catch (err) {
+      host.notify({
+        kind: 'error',
+        title: 'Free GPU Failed',
+        message: err?.message || String(err),
+      });
+    } finally {
+      setGpuBusy(false);
+    }
+  }, [refreshGpuStatus]);
+
+  const handleToggleStopOnExit = useCallback(async (enabled) => {
+    setStopOnHermesExit(enabled);
+    try { localStorage.setItem(LS_STOP_ON_EXIT, enabled ? '1' : '0'); } catch (_) {}
+    try {
+      await gpuControl('/v1/config', {
+        method: 'PUT',
+        body: { stop_on_hermes_exit: enabled },
+      });
+      host.notify({
+        kind: 'success',
+        title: 'GPU Lifecycle Updated',
+        message: enabled
+          ? 'Voicebox will stop when Hermes Desktop quits (after a short grace period).'
+          : 'Voicebox will keep running after Hermes quits (models still idle-unload).',
+      });
+    } catch (err) {
+      host.notify({
+        kind: 'warning',
+        title: 'Preference Saved Locally',
+        message: 'Lifecycle daemon not reachable — start it via install or: '
+          + 'systemctl --user enable --now voicebox-gpu-lifecycle. '
+          + (err?.message || ''),
+      });
+    }
+    await refreshGpuStatus();
+  }, [refreshGpuStatus]);
 
   const persistPersona = useCallback(async (voice, val) => {
     const sample = findSampleByVoice(voice) || SAMPLE_VOICES.find(s => s.name === voice.name);
@@ -1503,6 +1648,46 @@ function VoiceboxView() {
         ])
       ]),
 
+      // ── GPU / VRAM lifecycle ─────────────────
+      React.createElement('div', { key: 'gpu-card', className: 'flex flex-col gap-3 bg-card border border-border rounded-lg p-6 shadow-sm' }, [
+        React.createElement('h2', { key: 'h', className: 'text-xl font-semibold' }, 'GPU Memory'),
+        React.createElement('p', { key: 'desc', className: 'text-xs text-muted-foreground' },
+          'Voicebox keeps TTS models loaded after speak. Free VRAM manually, on idle, or by stopping Voicebox when Hermes quits.'
+        ),
+        React.createElement('p', { key: 'stat', className: 'text-sm font-mono text-muted-foreground' }, (() => {
+          const h = gpuStatus?.health;
+          if (!h) return 'Voicebox status: unknown (is the API up?)';
+          const vram = h.vram_used_mb != null ? `${Math.round(h.vram_used_mb)} MB` : '?';
+          const loaded = h.model_loaded ? 'model loaded' : 'no model loaded';
+          const backend = h.backend_variant || h.gpu_type || '';
+          return `VRAM ~${vram}  •  ${loaded}  •  ${backend}`;
+        })()),
+        React.createElement('div', { key: 'actions', className: 'flex flex-wrap items-center gap-3' }, [
+          React.createElement(Button, {
+            key: 'free',
+            variant: 'secondary',
+            disabled: gpuBusy,
+            onClick: handleFreeGpu,
+          }, gpuBusy ? 'Freeing…' : 'Free GPU (unload models)'),
+          React.createElement('label', {
+            key: 'stop-toggle',
+            className: 'flex items-center gap-2 text-sm cursor-pointer select-none',
+          }, [
+            React.createElement('input', {
+              key: 'cb',
+              type: 'checkbox',
+              checked: !!stopOnHermesExit,
+              onChange: (e) => handleToggleStopOnExit(!!e.target.checked),
+            }),
+            React.createElement('span', { key: 'lbl' }, 'Stop Voicebox when Hermes quits'),
+          ]),
+        ]),
+        React.createElement('p', { key: 'hint', className: 'text-[11px] text-muted-foreground' },
+          'Idle unload (~15 min after last TTS) runs via voicebox-gpu-lifecycle. '
+          + (gpuStatus?.control ? `Control: ${gpuStatus.control}` : 'Daemon not detected on :17494 — re-run installer or start the user service.')
+        ),
+      ]),
+
       // ── Manage Voices ────────────────────────
       React.createElement('div', { key: 'manage-card', className: 'flex flex-col gap-4 bg-card border border-border rounded-lg p-6 shadow-sm' }, [
         React.createElement('h2', { key: 'h', className: 'text-xl font-semibold' }, 'Manage Voices'),
@@ -1704,5 +1889,26 @@ export default {
       render: () => React.createElement(VoiceboxView) });
     ctx.register({ id: 'voicebox-nav', area: 'sidebar.nav',
       data: { codicon: 'mic', label: 'Voicebox', path: '/voicebox' } });
+
+    // Soft free only on renderer teardown (reload / pagehide). Never hard-stop
+    // here — pagehide also fires on reload while Hermes stays open. Hard stop
+    // on Hermes exit is owned by voicebox-gpu-lifecycle's process watcher.
+    const disposeGpuSoft = () => {
+      const url = `${GPU_CONTROL_URL}/v1/unload`;
+      try {
+        if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
+          navigator.sendBeacon(url);
+        }
+      } catch (_) {}
+      try {
+        fetch(url, { method: 'POST', keepalive: true }).catch(() => {});
+      } catch (_) {}
+      try {
+        fetch(`${DEFAULT_BACKEND_URL}/models/unload`, { method: 'POST', keepalive: true }).catch(() => {});
+      } catch (_) {}
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('pagehide', disposeGpuSoft);
+    }
   }
 };

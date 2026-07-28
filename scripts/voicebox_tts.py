@@ -476,6 +476,18 @@ def generate_wav(base_url: str, payload: dict, timeout: int) -> bytes:
 # Main
 # ---------------------------------------------------------------------------
 
+def _touch_tts_activity() -> None:
+    """Stamp last TTS time so idle GPU unload knows when to free VRAM."""
+    try:
+        home = _hermes_home()
+        os.makedirs(home, exist_ok=True)
+        path = os.path.join(home, "voicebox_tts_activity")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"touched_at": time.time(), "pid": os.getpid()}, f)
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="Hermes-Voicebox TTS Bridge")
     parser.add_argument("--text-file", "-t", required=True, help="Path to temp text file")
@@ -583,8 +595,16 @@ def main():
     wav_format = None   # (sample_rate, num_channels, bits_per_sample)
     pcm_segments = []
 
+    # Stamp before synthesis so idle-unload cannot race a long first request
+    # after the idle threshold (daemon polls ~every 10s).
+    _touch_tts_activity()
+
     for i, chunk_text in enumerate(chunks, 1):
         print(f"  Chunk {i}/{n} ({len(chunk_text)} chars)...", file=sys.stderr)
+        # Refresh during multi-chunk / slow jobs so mid-request idle unload
+        # cannot fire while we are still synthesizing.
+        if i > 1:
+            _touch_tts_activity()
         payload = {
             "profile_id": profile_id,
             "text": chunk_text,
@@ -666,6 +686,7 @@ def main():
             f.write(output_wav)
         total_kb = len(output_wav) // 1024
         print(f"Done — {total_kb}K WAV written to {args.out}", file=sys.stderr)
+        _touch_tts_activity()
     except Exception as e:
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)

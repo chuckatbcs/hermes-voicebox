@@ -376,6 +376,32 @@ class SpeakStreamHookTests(unittest.TestCase):
             self.assertTrue(plugin.is_file())
             self.assertTrue(bridge.is_file())
             self.assertTrue((root / "scripts" / "voicebox_bind.py").is_file())
+            self.assertTrue((root / "scripts" / "voicebox_gpu.py").is_file())
+            self.assertEqual(
+                install.install_gpu_lifecycle(root, enable=True),
+                "config_only_non_default_home",
+            )
+            self.assertTrue((root / "voicebox_gpu.json").is_file())
+
+    def test_install_gpu_lifecycle_embeds_base_url_in_unit(self):
+        src = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            root = fake_home / ".hermes"
+            install.install_files(src, root)
+            unit_dir = fake_home / ".config" / "systemd" / "user"
+            custom = "http://127.0.0.1:18000"
+            with mock.patch.object(install.Path, "home", return_value=fake_home), mock.patch(
+                "subprocess.run", return_value=mock.Mock(returncode=0, stdout="", stderr="")
+            ):
+                status = install.install_gpu_lifecycle(
+                    root, enable=True, base_url=custom
+                )
+            self.assertTrue(status.startswith("enabled:"), status)
+            unit_text = (unit_dir / "voicebox-gpu-lifecycle.service").read_text(encoding="utf-8")
+            self.assertIn(f"--base-url {custom}", unit_text)
+            self.assertIn("lifecycle-daemon", unit_text)
 
 
 class PrefetchPipelineTests(unittest.TestCase):

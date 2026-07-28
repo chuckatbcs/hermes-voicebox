@@ -18,6 +18,8 @@ Bounded local execution engineer for this repository unless explicitly assigned 
 | `scripts/voicebox_tts.py` | Hermes TTS command bridge (clone sentence chunking + WAV merge) |
 | `scripts/hermes_voicebox_streamer.py` | Hermes speak-stream adapter (sentence PCM + look-ahead; installed as `voicebox_command_streamer.py`) |
 | `scripts/voicebox_bind.py` | CLI helper to bind voice → `$HERMES_HOME` config + `voicebox_binding.json` |
+| `scripts/voicebox_gpu.py` | GPU lifecycle: unload / idle / stop-on-Hermes-exit + localhost control API |
+| `installer/systemd/voicebox-gpu-lifecycle.service` | Linux user unit for the lifecycle daemon |
 | `install.py` | Cross-platform installer entrypoint (`--profile` / `--all-profiles`) |
 | `install.sh` / `install.ps1` | OS launchers (bootstrap Python, then `install.py`) |
 | `installer/` | Prerequisite detection + provisioning (Hermes, Voicebox, models) |
@@ -70,8 +72,8 @@ None currently designated. Do not invent protected paths.
 
 Before claiming complete, run applicable checks:
 
-- Python syntax: `python3 -m py_compile scripts/voicebox_tts.py scripts/voicebox_bind.py scripts/hermes_voicebox_streamer.py install.py installer/prereqs.py`
-- Unit tests: `python3 -m unittest test_install.py -v` and `cd scripts && python3 -m unittest test_voicebox_tts.py -v`
+- Python syntax: `python3 -m py_compile scripts/voicebox_tts.py scripts/voicebox_bind.py scripts/voicebox_gpu.py scripts/hermes_voicebox_streamer.py install.py installer/prereqs.py`
+- Unit tests: `python3 -m unittest test_install.py -v` and `cd scripts && python3 -m unittest test_voicebox_tts.py test_voicebox_gpu.py -v`
 - Installer smoke test: `./install.sh --hermes-dir <tmpdir> --skip-prereqs`
 - Manual sanity review of plugin fetch/error paths when UI tests are unavailable
 
