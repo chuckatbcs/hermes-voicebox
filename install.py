@@ -449,6 +449,7 @@ def install_gpu_lifecycle(
     stop_on_hermes_exit: bool = True,
     idle_minutes: int = 15,
     enable: bool = True,
+    base_url: str | None = None,
 ) -> str:
     """
     Install GPU lifecycle config + Linux user systemd unit for the daemon.
@@ -494,11 +495,12 @@ def install_gpu_lifecycle(
     unit_dir.mkdir(parents=True, exist_ok=True)
     unit_dst = unit_dir / "voicebox-gpu-lifecycle.service"
 
-    # Rewrite ExecStart to the absolute installed script path.
+    # Rewrite ExecStart to the absolute installed script path (+ optional base URL).
+    base_url_args = f" --base-url {base_url}" if base_url else ""
     text = unit_src.read_text(encoding="utf-8")
     text = text.replace(
         "ExecStart=%h/.hermes/scripts/voicebox_gpu.py lifecycle-daemon",
-        f"ExecStart={sys.executable} {gpu_py} --hermes-home {hermes_root} lifecycle-daemon",
+        f"ExecStart={sys.executable} {gpu_py} --hermes-home {hermes_root}{base_url_args} lifecycle-daemon",
     )
     unit_dst.write_text(text, encoding="utf-8")
 
@@ -740,6 +742,7 @@ def main(argv: list[str] | None = None) -> int:
             install_root,
             stop_on_hermes_exit=not args.no_stop_voicebox_on_hermes_exit,
             enable=True,
+            base_url=args.base_url,
         )
         print(f"GPU lifecycle: {gpu_status}")
     else:

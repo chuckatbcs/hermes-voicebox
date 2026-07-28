@@ -78,5 +78,33 @@ class CliSmokeTests(unittest.TestCase):
             self.assertEqual(cfg["idle_unload_minutes"], 9)
 
 
+class HermesReturnRestartTests(unittest.TestCase):
+    def test_daemon_starts_voicebox_when_hermes_returns(self):
+        """After stop-on-exit, coming back from down→up must call start_voicebox()."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            gpu.save_config(
+                {
+                    "stop_on_hermes_exit": True,
+                    "idle_unload_enabled": False,
+                    "idle_unload_minutes": 15,
+                },
+                home=home,
+            )
+            daemon = gpu.LifecycleDaemon(base_url="http://127.0.0.1:17493", home=home, control_port=0)
+            daemon._hermes_was_up = False  # simulate prior Hermes-exit stop
+            daemon._stop = mock.Mock()
+            # One loop iteration then exit
+            daemon._stop.wait = mock.Mock(side_effect=[False, True])
+
+            with mock.patch.object(gpu, "hermes_desktop_running", return_value=True), mock.patch.object(
+                gpu, "start_voicebox", return_value={"actions": []}
+            ) as start, mock.patch.object(gpu, "idle_check"):
+                daemon._loop()
+
+            start.assert_called_once()
+            self.assertTrue(daemon._hermes_was_up)
+
+
 if __name__ == "__main__":
     unittest.main()

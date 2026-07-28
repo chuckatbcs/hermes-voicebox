@@ -490,10 +490,16 @@ class LifecycleDaemon:
                 except Exception:
                     pass
 
-            # Hermes exit → stop Voicebox
+            # Hermes exit → stop Voicebox; Hermes return → start it again
+            # (Docker compose down leaves no auto-restart otherwise).
             if cfg.get("stop_on_hermes_exit", True):
                 up = hermes_desktop_running()
                 if up:
+                    if not self._hermes_was_up:
+                        try:
+                            start_voicebox()
+                        except Exception:
+                            pass
                     self._hermes_was_up = True
                     self._hermes_down_since = None
                 elif self._hermes_was_up:

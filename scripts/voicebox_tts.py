@@ -595,8 +595,16 @@ def main():
     wav_format = None   # (sample_rate, num_channels, bits_per_sample)
     pcm_segments = []
 
+    # Stamp before synthesis so idle-unload cannot race a long first request
+    # after the idle threshold (daemon polls ~every 10s).
+    _touch_tts_activity()
+
     for i, chunk_text in enumerate(chunks, 1):
         print(f"  Chunk {i}/{n} ({len(chunk_text)} chars)...", file=sys.stderr)
+        # Refresh during multi-chunk / slow jobs so mid-request idle unload
+        # cannot fire while we are still synthesizing.
+        if i > 1:
+            _touch_tts_activity()
         payload = {
             "profile_id": profile_id,
             "text": chunk_text,

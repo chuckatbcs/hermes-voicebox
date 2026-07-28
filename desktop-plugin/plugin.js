@@ -1890,15 +1890,11 @@ export default {
     ctx.register({ id: 'voicebox-nav', area: 'sidebar.nav',
       data: { codicon: 'mic', label: 'Voicebox', path: '/voicebox' } });
 
-    // Soft free on renderer teardown. Hard stop-on-exit is handled by
-    // voicebox-gpu-lifecycle watching the Hermes Desktop process.
-    const disposeGpu = () => {
-      let stop = true;
-      try {
-        const v = localStorage.getItem(LS_STOP_ON_EXIT);
-        if (v === '0' || v === 'false') stop = false;
-      } catch (_) {}
-      const url = stop ? `${GPU_CONTROL_URL}/v1/stop` : `${GPU_CONTROL_URL}/v1/unload`;
+    // Soft free only on renderer teardown (reload / pagehide). Never hard-stop
+    // here — pagehide also fires on reload while Hermes stays open. Hard stop
+    // on Hermes exit is owned by voicebox-gpu-lifecycle's process watcher.
+    const disposeGpuSoft = () => {
+      const url = `${GPU_CONTROL_URL}/v1/unload`;
       try {
         if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
           navigator.sendBeacon(url);
@@ -1907,14 +1903,12 @@ export default {
       try {
         fetch(url, { method: 'POST', keepalive: true }).catch(() => {});
       } catch (_) {}
-      if (!stop) {
-        try {
-          fetch(`${DEFAULT_BACKEND_URL}/models/unload`, { method: 'POST', keepalive: true }).catch(() => {});
-        } catch (_) {}
-      }
+      try {
+        fetch(`${DEFAULT_BACKEND_URL}/models/unload`, { method: 'POST', keepalive: true }).catch(() => {});
+      } catch (_) {}
     };
     if (typeof window !== 'undefined') {
-      window.addEventListener('pagehide', disposeGpu);
+      window.addEventListener('pagehide', disposeGpuSoft);
     }
   }
 };
