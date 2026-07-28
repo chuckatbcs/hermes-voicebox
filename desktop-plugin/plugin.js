@@ -362,68 +362,36 @@ async function loadActiveVoice(signal) {
 }
 
 /**
- * Resolve the Hermes scope a persona must be confined to.
- *
- * Priority: an explicit *active agent profile* id when the host exposes one,
- * then the active session id. Returns '' when nothing is resolvable — callers
- * MUST treat '' as "do not apply" and never fall back to a global config.set,
- * because a global (session-less) write leaks the persona onto every agent
- * profile. The exact host.state key for the active agent profile varies between
- * Hermes builds, so probe the known candidates before the session id.
+ * Name of the active Hermes agent profile (host.state.profile) — for messaging
+ * only. The gateway's config.set already writes the active profile's config, so
+ * this is informational and never used to gate the write.
  */
-function resolveAgentScopeId() {
-  const state = host && host.state;
-  if (!state) return '';
-
-  const idGetters = [
-    state.activeAgentProfileId,
-    state.activeAgentId,
-    state.activeProfileId,
-    state.activeSessionId,
-  ];
-  for (const getter of idGetters) {
-    try {
-      const value = getter && typeof getter.get === 'function' ? getter.get() : undefined;
-      if (value) return String(value);
-    } catch (_) {
-      // Try the next candidate.
-    }
+function activeProfileName() {
+  try {
+    const value = host?.state?.profile?.get?.();
+    return value ? String(value) : '';
+  } catch (_) {
+    return '';
   }
-
-  // Some SDK builds expose the active agent/profile as an object, not an id getter.
-  const objectGetters = [state.activeAgentProfile, state.activeAgent, state.activeProfile];
-  for (const getter of objectGetters) {
-    try {
-      const obj = getter && typeof getter.get === 'function' ? getter.get() : undefined;
-      const id = obj && (obj.id || obj.profileId || obj.agentId);
-      if (id) return String(id);
-    } catch (_) {
-      // Try the next candidate.
-    }
-  }
-
-  return '';
 }
 
 /**
- * Apply a voice persona the Hermes-native way, scoped to the ACTIVE AGENT PROFILE only:
+ * Apply a voice persona the Hermes-native way, to the ACTIVE AGENT PROFILE:
  * 1) config.set personality=<named key>  (same as /personality <key>)
  * 2) fallback to full prompt text if the named key is not registered yet
  * 3) also set agent.system_prompt (Desktop has historically ignored display-only personality)
  *
- * Every config.set carries the resolved agent/session scope. If no scope is
- * resolvable we throw NO_ACTIVE_AGENT WITHOUT writing anything, so a persona can
- * never leak globally onto other agent profiles.
+ * config.set is intentionally called WITHOUT session_id. The Hermes gateway is
+ * bound to the active profile, so a session-less config.set writes that
+ * profile's config (~/.hermes/profiles/<name>/config.yaml) — the persona then
+ * applies across every chat in that profile and, because profiles are isolated,
+ * never touches other agent profiles. Passing a session_id would instead pin the
+ * persona to a single chat so it would not stick across the profile (the
+ * original bug). This mirrors persistHermesTtsVoice(), which also omits
+ * session_id as the reliable profile-wide path.
  */
 async function applyHermesPersona({ key, prompt, voiceName }) {
-  const scopeId = resolveAgentScopeId();
-  if (!scopeId) {
-    const err = new Error(
-      'open or focus an agent profile first — the voice persona is applied only to the active profile, never globally.'
-    );
-    err.code = 'NO_ACTIVE_AGENT';
-    throw err;
-  }
+  const profileName = activeProfileName();
   const modes = [];
   const cleanPrompt = displayPersonaPrompt(prompt) || prompt;
   const sample = key ? SAMPLE_VOICES.find((s) => s.key === key) : null;
@@ -440,7 +408,6 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
       await host.request('config.set', {
         key: 'personality',
         value: key,
-        session_id: scopeId,
       });
       modes.push(`named:${key}`);
       personalitySet = true;
@@ -454,7 +421,6 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
       await host.request('config.set', {
         key: 'personality',
         value: systemPrompt,
-        session_id: scopeId,
       });
       modes.push('prompt-text');
       personalitySet = true;
@@ -471,14 +437,13 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
     await host.request('config.set', {
       key: 'agent.system_prompt',
       value: systemPrompt,
-      session_id: scopeId,
     });
     modes.push('agent.system_prompt');
   } catch (err) {
     console.warn('agent.system_prompt update skipped:', err);
   }
 
-  return { scopeId, modes, voiceName };
+  return { profileName, modes, voiceName };
 }
 
 function sampleNeedsPresetRepair(existing, sample) {
@@ -966,19 +931,11 @@ function VoiceboxView() {
       }
     } catch (err) {
       console.warn('Persona sync failed:', err);
-      host.notify(
-        err.code === 'NO_ACTIVE_AGENT'
-          ? {
-              kind: 'info',
-              title: 'Persona Saved',
-              message: `Saved to "${voice.name}", but ${err.message} It applies when you select this voice with that profile focused.`,
-            }
-          : {
-              kind: 'error',
-              title: 'Persona Sync Failed',
-              message: err.message || 'Could not save persona prompt.',
-            }
-      );
+      host.notify({
+        kind: 'error',
+        title: 'Persona Sync Failed',
+        message: err.message || 'Could not save persona prompt.',
+      });
     }
   }, [activeVoiceId]);
 
@@ -1075,22 +1032,16 @@ function VoiceboxView() {
           host.notify({
             kind: 'success',
             title: 'Persona Applied',
-            message: `"${voiceName}" persona active for the current agent profile (${mode}).`,
+            message: result.profileName
+              ? `"${voiceName}" persona active for profile "${result.profileName}" (${mode}).`
+              : `"${voiceName}" persona active for the active profile (${mode}).`,
           });
         } catch (err) {
-          host.notify(
-            err.code === 'NO_ACTIVE_AGENT'
-              ? {
-                  kind: 'warning',
-                  title: 'Persona Not Applied',
-                  message: `Active voice set to "${voiceName}", but ${err.message}`,
-                }
-              : {
-                  kind: 'info',
-                  title: 'Voice Changed',
-                  message: `Active voice set to "${voiceName}". (Persona apply skipped: ${err.message || 'error'})`,
-                }
-          );
+          host.notify({
+            kind: 'info',
+            title: 'Voice Changed',
+            message: `Active voice set to "${voiceName}". (Persona apply skipped: ${err.message || 'error'})`,
+          });
         }
         void previousId;
         return;
@@ -1113,24 +1064,18 @@ function VoiceboxView() {
       host.notify({
         kind: 'success',
         title: 'Persona Applied',
-        message: `"${voiceName}" persona active for the current agent profile (${mode}).`,
+        message: result.profileName
+          ? `"${voiceName}" persona active for profile "${result.profileName}" (${mode}).`
+          : `"${voiceName}" persona active for the active profile (${mode}).`,
       });
     } catch (err) {
       console.warn('Persona update failed:', err);
       // Keep the selected voice even if persona RPC fails.
-      host.notify(
-        err.code === 'NO_ACTIVE_AGENT'
-          ? {
-              kind: 'warning',
-              title: 'Persona Not Applied',
-              message: `Active voice set to "${voiceName}", but ${err.message}`,
-            }
-          : {
-              kind: 'error',
-              title: 'Persona Update Failed',
-              message: err.message || 'Failed to update system persona.',
-            }
-      );
+      host.notify({
+        kind: 'error',
+        title: 'Persona Update Failed',
+        message: err.message || 'Failed to update system persona.',
+      });
     }
 
     // previousId kept for possible future undo; selection intentionally not rolled back
