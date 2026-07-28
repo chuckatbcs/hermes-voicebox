@@ -6,9 +6,11 @@ from voicebox_tts import (
     _build_wav,
     _parse_wav_header,
     _profile_tts_preflight,
+    _split_one_sentence_chunks,
     _split_sentences,
     get_base_url,
     resolve_profile_id,
+    split_tts_chunks,
 )
 
 
@@ -28,6 +30,28 @@ class TestSplitSentences(unittest.TestCase):
         chunks = _split_sentences(words, max_chars=40)
         self.assertTrue(all(len(c) <= 40 for c in chunks))
         self.assertEqual(" ".join(chunks).replace("  ", " "), words)
+
+
+class TestSentenceIsolatedChunks(unittest.TestCase):
+    def test_one_sentence_per_chunk_for_clones(self):
+        text = (
+            "Ugh, what do you want? I was in the middle of something important. "
+            "Make it quick, k? I don't have all day."
+        )
+        chunks = split_tts_chunks(text, "chatterbox_turbo")
+        self.assertEqual(len(chunks), 4)
+        self.assertTrue(all("?" in c or "." in c for c in chunks))
+
+    def test_kokoro_still_packs_sentences(self):
+        text = "Hello world. " * 20
+        clone_chunks = split_tts_chunks(text, "chatterbox_turbo")
+        kokoro_chunks = split_tts_chunks(text, "kokoro")
+        self.assertGreater(len(clone_chunks), len(kokoro_chunks))
+
+    def test_paragraph_break_without_punct(self):
+        text = "First paragraph line\n\nSecond paragraph line"
+        chunks = _split_one_sentence_chunks(text, max_chars=400)
+        self.assertEqual(chunks, ["First paragraph line", "Second paragraph line"])
 
 
 class TestWavHelpers(unittest.TestCase):
@@ -77,6 +101,79 @@ class TestResolveProfileId(unittest.TestCase):
         )
         self.assertEqual(calls, [])
 
+    def test_binding_json_beats_active_voice(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        def get_json(url):
+            if url.endswith("/settings/active-voice"):
+                return {"voice_id": "global-should-not-win"}
+            if url.endswith("/profiles"):
+                return [{"id": "first-profile"}]
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "voicebox_binding.json").write_text(
+                '{"voice_id": "bound-profile-id"}\n', encoding="utf-8"
+            )
+            old_home = os.environ.get("HERMES_HOME")
+            old_dir = os.environ.get("HERMES_DIR")
+            os.environ["HERMES_HOME"] = tmp
+            os.environ.pop("HERMES_DIR", None)
+            try:
+                self.assertEqual(
+                    resolve_profile_id("default", "http://127.0.0.1:17493", get_json=get_json),
+                    "bound-profile-id",
+                )
+            finally:
+                if old_home is None:
+                    os.environ.pop("HERMES_HOME", None)
+                else:
+                    os.environ["HERMES_HOME"] = old_home
+                if old_dir is None:
+                    os.environ.pop("HERMES_DIR", None)
+                else:
+                    os.environ["HERMES_DIR"] = old_dir
+
+    def test_hermes_home_wins_over_hermes_dir(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        def get_json(url):
+            raise AssertionError(f"unexpected fetch {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            other = Path(tmp) / "other"
+            home.mkdir()
+            other.mkdir()
+            (home / "voicebox_binding.json").write_text(
+                '{"voice_id": "from-hermes-home"}\n', encoding="utf-8"
+            )
+            (other / "voicebox_binding.json").write_text(
+                '{"voice_id": "from-hermes-dir"}\n', encoding="utf-8"
+            )
+            old_home = os.environ.get("HERMES_HOME")
+            old_dir = os.environ.get("HERMES_DIR")
+            os.environ["HERMES_HOME"] = str(home)
+            os.environ["HERMES_DIR"] = str(other)
+            try:
+                self.assertEqual(
+                    resolve_profile_id("default", "http://127.0.0.1:17493", get_json=get_json),
+                    "from-hermes-home",
+                )
+            finally:
+                if old_home is None:
+                    os.environ.pop("HERMES_HOME", None)
+                else:
+                    os.environ["HERMES_HOME"] = old_home
+                if old_dir is None:
+                    os.environ.pop("HERMES_DIR", None)
+                else:
+                    os.environ["HERMES_DIR"] = old_dir
+
     def test_falls_back_when_active_voice_missing(self):
         import os
         import tempfile
@@ -93,20 +190,27 @@ class TestResolveProfileId(unittest.TestCase):
             raise AssertionError(url)
 
         with tempfile.TemporaryDirectory() as tmp:
-            old = os.environ.get("HERMES_DIR")
+            old_home = os.environ.get("HERMES_HOME")
+            old_dir = os.environ.get("HERMES_DIR")
+            os.environ["HERMES_HOME"] = tmp
             os.environ["HERMES_DIR"] = tmp
             # Ensure no sidecar leaks from the developer machine.
             Path(tmp, "voicebox_active_voice.json").unlink(missing_ok=True)
+            Path(tmp, "voicebox_binding.json").unlink(missing_ok=True)
             try:
                 self.assertEqual(
                     resolve_profile_id("default", "http://127.0.0.1:17493", get_json=get_json),
                     "first-profile",
                 )
             finally:
-                if old is None:
-                    del os.environ["HERMES_DIR"]
+                if old_home is None:
+                    os.environ.pop("HERMES_HOME", None)
                 else:
-                    os.environ["HERMES_DIR"] = old
+                    os.environ["HERMES_HOME"] = old_home
+                if old_dir is None:
+                    os.environ.pop("HERMES_DIR", None)
+                else:
+                    os.environ["HERMES_DIR"] = old_dir
 
 
 class TestProfilePreflight(unittest.TestCase):

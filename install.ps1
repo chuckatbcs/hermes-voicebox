@@ -5,6 +5,8 @@
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Yes
 #   .\install.ps1 -Yes
 #   .\install.ps1 -SkipPrereqs
+#   .\install.ps1 -SkipPrereqs -AllProfiles
+#   .\install.ps1 -SkipPrereqs -Profile work
 #
 # Encoding: ASCII / UTF-8 with BOM for Windows PowerShell 5.1 compatibility.
 [CmdletBinding()]
@@ -12,6 +14,8 @@ param(
     [string]$HermesDir = $env:HERMES_DIR,
     [string]$BaseUrl = $(if ($env:VOICEBOX_BASE_URL) { $env:VOICEBOX_BASE_URL } else { "http://127.0.0.1:17493" }),
     [string]$ModelProfile = "plugin",
+    [string]$Profile = "",
+    [switch]$AllProfiles,
     [switch]$NoConfig,
     [switch]$ForceConfig,
     [switch]$PrintSnippet,
@@ -95,6 +99,8 @@ if ($SkipVoicebox) { $installArgs += "--skip-voicebox" }
 if ($SkipModels) { $installArgs += "--skip-models" }
 if ($PreferDocker) { $installArgs += "--prefer-docker" }
 if ($PreferDesktop) { $installArgs += "--prefer-desktop" }
+if ($AllProfiles) { $installArgs += "--all-profiles" }
+if ($Profile) { $installArgs += @("--profile", $Profile) }
 
 Write-Host "Using: $($py.File) $($py.Args -join ' ')" -ForegroundColor Cyan
 & $py.File @($py.Args + $installArgs)

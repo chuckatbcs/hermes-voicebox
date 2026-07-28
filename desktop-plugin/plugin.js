@@ -83,42 +83,150 @@ function sameVoiceId(a, b) {
   return String(a ?? '') !== '' && String(a) === String(b);
 }
 
-const ACTIVE_VOICE_LS_KEY = 'voicebox_active_voice_id';
-const DISMISSED_SAMPLES_KEY = 'voicebox_dismissed_sample_keys';
+const ACTIVE_VOICE_LS_PREFIX = 'voicebox_active_voice_id';
+const DISMISSED_SAMPLES_PREFIX = 'voicebox_dismissed_sample_keys';
+const LEGACY_ACTIVE_VOICE_LS_KEY = 'voicebox_active_voice_id';
+const LEGACY_DISMISSED_SAMPLES_KEY = 'voicebox_dismissed_sample_keys';
 
-function readLocalActiveVoice() {
+function normalizeHermesProfile(name) {
+  const value = String(name ?? '').trim();
+  return value || 'default';
+}
+
+function currentHermesProfile() {
   try {
-    return String(localStorage.getItem(ACTIVE_VOICE_LS_KEY) || '');
+    const raw = host.state?.profile?.get?.();
+    return normalizeHermesProfile(raw);
   } catch (_) {
-    return '';
+    return 'default';
   }
 }
 
-function writeLocalActiveVoice(voiceId) {
+function activeVoiceLsKey(profile) {
+  return `${ACTIVE_VOICE_LS_PREFIX}:${normalizeHermesProfile(profile)}`;
+}
+
+function dismissedSamplesLsKey(profile) {
+  return `${DISMISSED_SAMPLES_PREFIX}:${normalizeHermesProfile(profile)}`;
+}
+
+function readLocalActiveVoice(profile) {
+  const key = activeVoiceLsKey(profile);
   try {
+    const scoped = String(localStorage.getItem(key) || '');
+    if (scoped) return scoped;
+    // One-time migrate unscoped legacy key into the default profile.
+    if (normalizeHermesProfile(profile) === 'default') {
+      const legacy = String(localStorage.getItem(LEGACY_ACTIVE_VOICE_LS_KEY) || '');
+      if (legacy && !legacy.includes(':')) {
+        localStorage.setItem(key, legacy);
+        return legacy;
+      }
+    }
+  } catch (_) {}
+  return '';
+}
+
+function writeLocalActiveVoice(voiceId, profile) {
+  try {
+    const key = activeVoiceLsKey(profile);
     const id = voiceId == null ? '' : String(voiceId);
-    if (id) localStorage.setItem(ACTIVE_VOICE_LS_KEY, id);
-    else localStorage.removeItem(ACTIVE_VOICE_LS_KEY);
+    if (id) localStorage.setItem(key, id);
+    else localStorage.removeItem(key);
   } catch (_) {}
 }
 
-function readDismissedSampleKeys() {
+function readDismissedSampleKeys(profile) {
   try {
-    const raw = localStorage.getItem(DISMISSED_SAMPLES_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return new Set(Array.isArray(arr) ? arr.map(String) : []);
-  } catch (_) {
-    return new Set();
-  }
+    const raw = localStorage.getItem(dismissedSamplesLsKey(profile));
+    if (raw) {
+      const arr = JSON.parse(raw);
+      return new Set(Array.isArray(arr) ? arr.map(String) : []);
+    }
+    if (normalizeHermesProfile(profile) === 'default') {
+      const legacy = localStorage.getItem(LEGACY_DISMISSED_SAMPLES_KEY);
+      if (legacy) {
+        const arr = JSON.parse(legacy);
+        return new Set(Array.isArray(arr) ? arr.map(String) : []);
+      }
+    }
+  } catch (_) {}
+  return new Set();
 }
 
-function dismissSampleKey(key) {
+function dismissSampleKey(key, profile) {
   if (!key) return;
   try {
-    const next = readDismissedSampleKeys();
+    const next = readDismissedSampleKeys(profile);
     next.add(String(key));
-    localStorage.setItem(DISMISSED_SAMPLES_KEY, JSON.stringify([...next]));
+    localStorage.setItem(
+      dismissedSamplesLsKey(profile),
+      JSON.stringify([...next])
+    );
   } catch (_) {}
+}
+
+function desktopApiAvailable() {
+  try {
+    return typeof window !== 'undefined'
+      && window.hermesDesktop
+      && typeof window.hermesDesktop.api === 'function';
+  } catch (_) {
+    return false;
+  }
+}
+
+async function desktopConfigGet(profile) {
+  if (!desktopApiAvailable()) return null;
+  const p = normalizeHermesProfile(profile);
+  const opts = {
+    path: '/api/config',
+    method: 'GET',
+  };
+  if (p && p !== 'default') opts.profile = p;
+  else if (p === 'default') opts.profile = 'default';
+  try {
+    return await window.hermesDesktop.api(opts);
+  } catch (err) {
+    console.warn('GET /api/config failed:', err);
+    return null;
+  }
+}
+
+async function desktopConfigPutVoice(voiceId, profile) {
+  if (!desktopApiAvailable()) {
+    throw new Error('Hermes Desktop config API unavailable');
+  }
+  const p = normalizeHermesProfile(profile);
+  const value = voiceId ? String(voiceId) : 'default';
+  const opts = {
+    path: '/api/config',
+    method: 'PUT',
+    body: {
+      config: {
+        tts: {
+          providers: {
+            voicebox: {
+              voice: value,
+            },
+          },
+        },
+      },
+    },
+  };
+  // Always pass profile so Electron routes to the correct HERMES_HOME process.
+  opts.profile = p;
+  await window.hermesDesktop.api(opts);
+  return 'tts.providers.voicebox.voice';
+}
+
+function voiceIdFromConfigRecord(cfg) {
+  if (!cfg || typeof cfg !== 'object') return '';
+  const tts = cfg.tts || cfg.config?.tts || cfg;
+  const providers = tts?.providers || {};
+  const vb = providers.voicebox || {};
+  const vid = vb.voice || tts?.voice || '';
+  return String(vid || '').trim();
 }
 
 function findSampleByVoice(voice) {
@@ -281,13 +389,22 @@ async function apiFetch(path, options = {}) {
 }
 
 // ─────────────────────────────────────────────
-// Voice selection persistence via Voicebox API
-// instead of Hermes config store (which crashes)
+// Voice selection persistence — per Hermes profile
 // ─────────────────────────────────────────────
-async function persistHermesTtsVoice(voiceId) {
-  // Hermes command TTS substitutes {voice} from provider config — this is the
-  // reliable path because many Voicebox builds have no /settings/active-voice.
+async function persistHermesTtsVoice(voiceId, profile) {
+  // Desktop gateway config.set does NOT allow tts.providers.voicebox.voice.
+  // Use profile-scoped PUT /api/config (deep-merge) instead.
   const value = voiceId ? String(voiceId) : 'default';
+  let desktopErr = null;
+  try {
+    const key = await desktopConfigPutVoice(value, profile);
+    return key;
+  } catch (err) {
+    desktopErr = err;
+    console.warn('Desktop PUT /api/config voice failed:', err);
+  }
+
+  // Last resort: gateway allowlist may grow someday.
   const keys = [
     'tts.providers.voicebox.voice',
     'tts.voice',
@@ -301,56 +418,59 @@ async function persistHermesTtsVoice(voiceId) {
       lastErr = err;
     }
   }
-  throw lastErr || new Error('Could not update Hermes TTS voice');
+  throw lastErr || desktopErr || new Error('Could not update Hermes TTS voice');
 }
 
-async function saveActiveVoice(voiceId) {
+async function saveActiveVoice(voiceId, profile, { personaKey = null } = {}) {
   const id = voiceId == null ? '' : String(voiceId);
-  writeLocalActiveVoice(id);
+  const hermesProfile = normalizeHermesProfile(profile ?? currentHermesProfile());
+  writeLocalActiveVoice(id, hermesProfile);
 
   let hermesKey = null;
+  let hermesErr = null;
   try {
-    hermesKey = await persistHermesTtsVoice(id);
+    hermesKey = await persistHermesTtsVoice(id, hermesProfile);
   } catch (err) {
+    hermesErr = err;
     console.warn('Hermes TTS voice persist skipped:', err);
   }
 
-  // Optional: some forks expose an active-voice settings route; most do not.
-  const payloads = [
-    { voice_id: id },
-    { profile_id: id },
-    { active_voice_id: id },
-    { id },
-  ];
-  for (const body of payloads) {
-    try {
-      await apiFetch('/settings/active-voice', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      return { hermesKey, voicebox: true };
-    } catch (_) {
-      // keep trying
-    }
-  }
-  try {
-    await apiFetch('/settings/active-voice', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ voice_id: id, profile_id: id }),
-    });
-    return { hermesKey, voicebox: true };
-  } catch (_) {}
+  // Do NOT write Voicebox /settings/active-voice — it is process-global and
+  // bleeds across Hermes profiles. Per-profile config + localStorage is enough.
 
-  if (hermesKey || id === '' || readLocalActiveVoice() === id) {
-    // Local + Hermes persistence is enough for plugin UI and TTS bridge.
-    return { hermesKey, voicebox: false };
+  if (hermesKey || id === '' || readLocalActiveVoice(hermesProfile) === id) {
+    return {
+      hermesKey,
+      voicebox: false,
+      hermesProfile,
+      personaKey: personaKey || null,
+      warned: hermesErr ? String(hermesErr?.message || hermesErr) : null,
+    };
   }
-  throw new Error('Could not persist active voice');
+  throw hermesErr || new Error(
+    'Could not persist active voice for this Hermes profile. '
+    + 'Try: HERMES_HOME=… python3 ~/.hermes/scripts/voicebox_bind.py --voice <id>'
+  );
 }
 
-async function loadActiveVoice(signal) {
+async function loadActiveVoice(signal, profile) {
+  const hermesProfile = normalizeHermesProfile(profile ?? currentHermesProfile());
+
+  // Prefer this Hermes profile's config.yaml voice.
+  try {
+    if (signal?.aborted) return readLocalActiveVoice(hermesProfile);
+    const cfg = await desktopConfigGet(hermesProfile);
+    const fromCfg = voiceIdFromConfigRecord(cfg);
+    if (fromCfg && fromCfg.toLowerCase() !== 'default') {
+      writeLocalActiveVoice(fromCfg, hermesProfile);
+      return fromCfg;
+    }
+  } catch (_) {}
+
+  const local = readLocalActiveVoice(hermesProfile);
+  if (local) return local;
+
+  // Demoted: Voicebox global active-voice (cross-profile bleed risk).
   try {
     const data = await apiFetch('/settings/active-voice', signal ? { signal } : {});
     const fromApi = data?.voice_id || data?.profile_id || data?.active_voice_id || data?.id || '';
@@ -358,7 +478,7 @@ async function loadActiveVoice(signal) {
   } catch {
     // Voicebox may not expose this route.
   }
-  return readLocalActiveVoice();
+  return '';
 }
 
 /**
@@ -439,10 +559,10 @@ function sampleNeedsPresetRepair(existing, sample) {
   return false;
 }
 
-async function seedSampleVoices(existingProfiles) {
+async function seedSampleVoices(existingProfiles, profile) {
   const list = Array.isArray(existingProfiles) ? existingProfiles : [];
   const byName = new Map(list.map((v) => [String(v.name || '').trim().toLowerCase(), v]));
-  const dismissed = readDismissedSampleKeys();
+  const dismissed = readDismissedSampleKeys(profile);
   let created = 0;
   let updated = 0;
 
@@ -541,6 +661,7 @@ async function seedSampleVoices(existingProfiles) {
 // Main view
 // ─────────────────────────────────────────────
 function VoiceboxView() {
+  const [hermesProfile, setHermesProfile] = useState(() => currentHermesProfile());
   const [voices, setVoices]               = useState([]);
   const [activeVoiceId, setActiveVoiceId] = useState('');
   const [cloneName, setCloneName]         = useState('');
@@ -803,11 +924,13 @@ function VoiceboxView() {
     stopRecording,
   ]);
 
-  // ── Fetch profiles + active voice ──────────
-  const fetchProfilesAndConfig = useCallback(async () => {
+  // ── Fetch profiles + active voice for the current Hermes profile ──
+  const fetchProfilesAndConfig = useCallback(async (profileOverride) => {
     if (fetchAbortRef.current) fetchAbortRef.current.abort();
     const controller = new AbortController();
     fetchAbortRef.current = controller;
+    const profile = normalizeHermesProfile(profileOverride ?? currentHermesProfile());
+    setHermesProfile(profile);
 
     try {
       let data = await apiFetch('/profiles', { signal: controller.signal });
@@ -816,7 +939,7 @@ function VoiceboxView() {
 
       // Seed fun sample persona voices once Voicebox is reachable.
       try {
-        const seed = await seedSampleVoices(data);
+        const seed = await seedSampleVoices(data, profile);
         if ((seed.created || seed.updated) && !controller.signal.aborted) {
           data = await apiFetch('/profiles', { signal: controller.signal });
           if (seed.created > 0) {
@@ -835,10 +958,14 @@ function VoiceboxView() {
       const profiles = Array.isArray(data) ? data.map((v) => ({ ...v, id: String(v.id) })) : [];
       setVoices(profiles);
 
-      const savedVoice = await loadActiveVoice(controller.signal);
-      if (!controller.signal.aborted && savedVoice) {
-        const match = profiles.find((v) => sameVoiceId(v.id, savedVoice));
-        setActiveVoiceId(match ? match.id : String(savedVoice));
+      const savedVoice = await loadActiveVoice(controller.signal, profile);
+      if (!controller.signal.aborted) {
+        if (savedVoice) {
+          const match = profiles.find((v) => sameVoiceId(v.id, savedVoice));
+          setActiveVoiceId(match ? match.id : String(savedVoice));
+        } else {
+          setActiveVoiceId('');
+        }
       }
     } catch (err) {
       if (err?.name === 'AbortError') return;
@@ -854,7 +981,29 @@ function VoiceboxView() {
   useEffect(() => {
     fetchProfilesAndConfig();
 
+    // Re-bind UI when the user switches Hermes Desktop profiles.
+    let unsub = null;
+    try {
+      const atom = host.state?.profile;
+      if (atom && typeof atom.listen === 'function') {
+        unsub = atom.listen((next) => {
+          const profile = normalizeHermesProfile(next);
+          setHermesProfile(profile);
+          setIsLoading(true);
+          fetchProfilesAndConfig(profile);
+        });
+      } else if (atom && typeof atom.subscribe === 'function') {
+        unsub = atom.subscribe((next) => {
+          const profile = normalizeHermesProfile(next);
+          setHermesProfile(profile);
+          setIsLoading(true);
+          fetchProfilesAndConfig(profile);
+        });
+      }
+    } catch (_) {}
+
     return () => {
+      if (typeof unsub === 'function') unsub();
       if (fetchAbortRef.current) fetchAbortRef.current.abort();
       if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
       Object.values(personaTimersRef.current).forEach(clearTimeout);
@@ -966,15 +1115,16 @@ function VoiceboxView() {
     });
 
     let persistInfo = null;
+    const profile = hermesProfile || currentHermesProfile();
     try {
-      persistInfo = await saveActiveVoice(id);
+      persistInfo = await saveActiveVoice(id, profile);
     } catch (err) {
       // Do not roll back UI selection — local active + persona can still work.
       console.warn('Active-voice persistence failed:', err);
       host.notify({
         kind: 'warning',
         title: 'Active Voice Saved Locally Only',
-        message: `${err.message || 'Not Found'} — selection kept for this Hermes session.`,
+        message: `${err.message || 'Not Found'} — selection kept for Hermes profile "${profile}".`,
       });
     }
 
@@ -982,9 +1132,7 @@ function VoiceboxView() {
       host.notify({
         kind: 'success',
         title: 'Voice Updated',
-        message: persistInfo.voicebox
-          ? `Active voice: ${voice.name}  •  ${meta.label || engine}  •  VRAM ${meta.vram || '?'}`
-          : `Active voice: ${voice.name} (Hermes TTS + local). Voicebox has no active-voice API on this build.`,
+        message: `Hermes profile "${profile}" → ${voice.name}  •  ${meta.label || engine}  •  ${meta.vram || '?'} VRAM`,
       });
     }
 
@@ -1068,10 +1216,10 @@ function VoiceboxView() {
       const sample = findSampleByVoice(victim);
       await apiFetch(`/profiles/${voiceId}`, { method: 'DELETE' });
       // Prevent sample seeder from immediately recreating demo voices after delete.
-      if (sample?.key) dismissSampleKey(sample.key);
+      if (sample?.key) dismissSampleKey(sample.key, hermesProfile);
       if (sameVoiceId(voiceId, activeVoiceId)) {
         setActiveVoiceId('');
-        try { await saveActiveVoice(''); } catch (_) {}
+        try { await saveActiveVoice('', hermesProfile); } catch (_) {}
       }
       setDeleteConfirmId(null);
       // Optimistic UI update so delete feels instant even if refresh is slow.
@@ -1283,6 +1431,8 @@ function VoiceboxView() {
         ]),
         React.createElement('p', { key: 'desc', className: 'text-muted-foreground text-sm' },
           'Smart engine routing — each voice uses the right model automatically. Fun sample personas seed on first connect (parody templates, not official clones).'),
+        React.createElement('p', { key: 'profile', className: 'text-xs text-muted-foreground mt-1' },
+          `Binding to Hermes profile: ${hermesProfile}`),
         isConnected === false && React.createElement('div', {
           key: 'reconnect',
           className: 'flex items-center gap-2 mt-2 text-xs text-red-400'
@@ -1290,7 +1440,7 @@ function VoiceboxView() {
           React.createElement('span', { key: 'msg' }, 'Backend unreachable.'),
           React.createElement(Button, {
             key: 'retry', variant: 'outline', size: 'sm',
-            onClick: () => { setIsLoading(true); fetchProfilesAndConfig(); }
+            onClick: () => { setIsLoading(true); fetchProfilesAndConfig(hermesProfile); }
           }, '🔄 Retry')
         ])
       ]),

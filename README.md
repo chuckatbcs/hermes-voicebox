@@ -5,7 +5,8 @@ Cross-platform integration between the **Hermes Desktop Client** and **Voicebox 
 ## Features
 
 - **Smart Engine Routing** for Kokoro / Chatterbox / Qwen profiles
-- **Sentence chunking & WAV merging** for long AI responses
+- **Sentence chunking & WAV merging** for long AI responses (clone engines speak one sentence per request so Chatterbox early-stops don't truncate the rest)
+- **Desktop speak-stream hook** so read-aloud starts on the first sentence and look-ahead-synthesizes the next while the current one plays (plus a 600s command TTS timeout)
 - **In-plugin microphone recording** (plus native OS file picker) for voice cloning samples
 - **Fun sample persona voices** (Vincent Price, Porky Pig, Cartman, Jarvis, GLaDOS) seeded as parody templates with Hermes `/personality` keys — not official voice clones / no copyrighted audio bundled
 - **Safe two-step voice deletion**
@@ -94,13 +95,42 @@ python install.py -y
 ## Configuration
 
 - **`VOICEBOX_PORT`** / **`--base-url`**: TTS bridge backend URL (default `http://127.0.0.1:17493`)
-- **`HERMES_DIR`**: Hermes data directory override (default `~/.hermes`)
+- **`HERMES_HOME`** / **`HERMES_DIR`**: Hermes profile home (default `~/.hermes`). Named Desktop profiles use `~/.hermes/profiles/<name>/`.
 - **`localStorage.voicebox_backend_url`**: optional plugin UI override
-- **Active voice**: the plugin stores selection in `localStorage` and updates Hermes `tts.providers.voicebox.voice` (so the bridge’s `{voice}` is correct). Upstream Voicebox often has **no** `/settings/active-voice` route — a 404 there is expected and non-fatal.
+- **Active voice (per Hermes profile)**: selecting a voice in the plugin binds it to the **current** Hermes Desktop profile (`host.state.profile`):
+  - writes `tts.providers.voicebox.voice` via Desktop `PUT /api/config` (profile-scoped)
+  - applies persona via gateway `config.set personality` (already profile-scoped)
+  - caches UI selection in `localStorage` keyed by profile (`voicebox_active_voice_id:<profile>`)
+  - optional sidecar `$HERMES_HOME/voicebox_binding.json` for CLI/non-Desktop agents
+- **Not used as source of truth**: Voicebox `/settings/active-voice` is process-global and would bleed across Hermes profiles — the plugin no longer prefers it.
+
+Bridge voice precedence: CLI `--voice` → `$HERMES_HOME/voicebox_binding.json` (or legacy `voicebox_active_voice.json`) → Voicebox active-voice (demoted) → first Voicebox profile.
+
+CLI bind helper (for gateway / other apps):
+
+```bash
+HERMES_HOME=~/.hermes/profiles/work python3 ~/.hermes/scripts/voicebox_bind.py \
+  --voice <voicebox-profile-uuid> --persona-key jarvis
+```
+
+Installer can merge the TTS block into every profile home:
+
+```bash
+./install.sh --skip-prereqs --all-profiles
+# or one profile:
+./install.sh --skip-prereqs --profile work
+```
+
+Windows:
+
+```powershell
+.\install.ps1 -SkipPrereqs -AllProfiles
+.\install.ps1 -SkipPrereqs -Profile work
+```
 
 Bridge URL precedence: `--base-url` → `VOICEBOX_PORT` → default `17493`.
 
-The installer writes a marked block into `config.yaml`:
+The installer writes a marked block into each target profile’s `config.yaml`:
 
 ```yaml
 # BEGIN hermes-voicebox
@@ -112,10 +142,31 @@ tts:
       command: python3 /absolute/path/to/voicebox_tts.py --text-file {input_path} --out {output_path} --voice {voice}
       voice: default
       output_format: wav
+      timeout: 600
 # END hermes-voicebox
 ```
 
 On Windows the command uses `python` or `py -3` plus your absolute bridge path.
+
+### Hermes Agent patches (speak-stream)
+
+When `$HERMES_HOME/hermes-agent` is present, the installer also:
+
+| Target | Marker | Purpose |
+|--------|--------|---------|
+| `hermes-agent/tools/voicebox_command_streamer.py` | (copied from `scripts/hermes_voicebox_streamer.py`) | Sentence PCM streamer with look-ahead synth |
+| `hermes-agent/tools/tts_streaming.py` | `# BEGIN hermes-voicebox-streamer` | Import/register the Voicebox streamer |
+| `hermes-agent/hermes_cli/web_server.py` | `# BEGIN hermes-voicebox-prefetch` | Prefetch next sentence while current audio plays |
+
+First patch creates sibling `*.voicebox.bak` backups. **Hermes updates overwrite these files** — re-run after upgrading Hermes:
+
+```bash
+python3 install.py -y --skip-prereqs --skip-hermes
+# Windows:
+.\install.ps1 -Yes -SkipPrereqs -SkipHermes
+```
+
+If `hermes-agent` is missing, plugin + command TTS still work; Desktop read-aloud stays one-shot until the hook is installed.
 
 ---
 
@@ -130,7 +181,8 @@ On Windows the command uses `python` or `py -3` plus your absolute bridge path.
 ## Development / validation
 
 ```bash
-python3 -m py_compile install.py installer/prereqs.py scripts/voicebox_tts.py
+python3 -m py_compile install.py installer/prereqs.py \
+  scripts/voicebox_tts.py scripts/voicebox_bind.py scripts/hermes_voicebox_streamer.py
 python3 -m unittest test_install.py -v
 (cd scripts && python3 -m unittest test_voicebox_tts.py -v)
 ./install.sh --hermes-dir /tmp/hermes-test --skip-prereqs

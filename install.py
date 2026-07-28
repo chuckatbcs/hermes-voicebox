@@ -32,6 +32,12 @@ MARKER_BEGIN = "# BEGIN hermes-voicebox"
 MARKER_END = "# END hermes-voicebox"
 PERSONA_MARKER_BEGIN = "# BEGIN hermes-voicebox-personalities"
 PERSONA_MARKER_END = "# END hermes-voicebox-personalities"
+STREAMER_IMPORT_BEGIN = "# BEGIN hermes-voicebox-streamer"
+STREAMER_IMPORT_END = "# END hermes-voicebox-streamer"
+PRODUCE_PATCH_BEGIN = "# BEGIN hermes-voicebox-prefetch"
+PRODUCE_PATCH_END = "# END hermes-voicebox-prefetch"
+# Hermes command TTS defaults to 120s — too short for long cloned replies on CPU.
+COMMAND_TTS_TIMEOUT_SECONDS = 600
 PLUGIN_ID = "voice-switcher"
 
 
@@ -40,10 +46,34 @@ def repo_root() -> Path:
 
 
 def default_hermes_dir() -> Path:
-    override = os.environ.get("HERMES_DIR")
+    override = os.environ.get("HERMES_DIR") or os.environ.get("HERMES_HOME")
     if override:
         return Path(override).expanduser().resolve()
     return (Path.home() / ".hermes").resolve()
+
+
+def resolve_profile_hermes_dir(profile: str | None, root: Path | None = None) -> Path:
+    """
+    Map Hermes Desktop profile key to its HERMES_HOME.
+    default / empty → root (~/.hermes); otherwise root/profiles/<name>.
+    """
+    root = (root or default_hermes_dir()).resolve()
+    name = (profile or "").strip()
+    if not name or name.lower() in {"default", "root", "."}:
+        return root
+    return (root / "profiles" / name).resolve()
+
+
+def list_profile_hermes_dirs(root: Path | None = None) -> list[Path]:
+    """Root default home plus every ~/.hermes/profiles/<name> directory."""
+    root = (root or default_hermes_dir()).resolve()
+    homes = [root]
+    profiles = root / "profiles"
+    if profiles.is_dir():
+        for child in sorted(profiles.iterdir()):
+            if child.is_dir():
+                homes.append(child.resolve())
+    return homes
 
 
 def quote_for_command(path: Path) -> str:
@@ -72,8 +102,197 @@ def build_snippet(python_cmd: str, bridge_path: Path) -> str:
         f"      command: {command}\n"
         "      voice: default\n"
         "      output_format: wav\n"
+        f"      timeout: {COMMAND_TTS_TIMEOUT_SECONDS}\n"
         f"{MARKER_END}\n"
     )
+
+
+def ensure_voicebox_timeout(
+    config_path: Path, timeout: int = COMMAND_TTS_TIMEOUT_SECONDS
+) -> str:
+    """Ensure ``tts.providers.voicebox.timeout`` is set (works without markers)."""
+    if not config_path.is_file():
+        return "missing"
+    original = config_path.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
+
+    # Find the indented ``voicebox:`` key (providers.voicebox), not a top-level one.
+    voicebox_idx = None
+    indent = ""
+    for i, line in enumerate(lines):
+        m = re.match(r"^([ \t]{2,})voicebox:\s*(#.*)?$", line)
+        if m:
+            voicebox_idx = i
+            indent = m.group(1)
+            break
+    if voicebox_idx is None:
+        return "no_voicebox"
+
+    child_re = re.compile(rf"^{re.escape(indent)}[ \t]+\S")
+    sibling_or_outdent = re.compile(rf"^(?:{re.escape(indent)}\S|\S)")
+    timeout_re = re.compile(rf"^{re.escape(indent)}[ \t]+timeout\s*:")
+
+    timeout_idx = None
+    insert_at = voicebox_idx + 1
+    for j in range(voicebox_idx + 1, len(lines)):
+        line = lines[j]
+        if not line.strip() or line.lstrip().startswith("#"):
+            insert_at = j + 1
+            continue
+        if timeout_re.match(line):
+            timeout_idx = j
+            break
+        if sibling_or_outdent.match(line) and not child_re.match(line):
+            insert_at = j
+            break
+        if child_re.match(line):
+            insert_at = j + 1
+
+    # Match child indent from an existing child key, else indent + two spaces.
+    child_indent = indent + "  "
+    for j in range(voicebox_idx + 1, min(voicebox_idx + 12, len(lines))):
+        m = re.match(rf"^({re.escape(indent)}[ \t]+)\S", lines[j])
+        if m:
+            child_indent = m.group(1)
+            break
+
+    new_line = f"{child_indent}timeout: {timeout}\n"
+    if timeout_idx is not None:
+        if re.search(rf":\s*{timeout}\s*$", lines[timeout_idx].rstrip()):
+            return "unchanged"
+        lines[timeout_idx] = new_line
+        action = "updated"
+    else:
+        lines.insert(insert_at, new_line)
+        action = "inserted"
+
+    backup = config_path.with_suffix(config_path.suffix + ".bak")
+    if not backup.exists():
+        backup.write_text(original, encoding="utf-8")
+    text = "".join(lines)
+    config_path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    return action
+
+
+def _streamer_import_block() -> str:
+    return (
+        f"{STREAMER_IMPORT_BEGIN}\n"
+        "try:\n"
+        "    from tools import voicebox_command_streamer  # noqa: F401\n"
+        "except Exception:\n"
+        "    pass\n"
+        f"{STREAMER_IMPORT_END}\n"
+    )
+
+
+def _prefetch_produce_block() -> str:
+    """Indented body inside speak-stream ``_produce`` try-block (12 spaces)."""
+    return f"""            {PRODUCE_PATCH_BEGIN}
+            from tools.voicebox_command_streamer import produce_speak_stream_pcm
+
+            produce_speak_stream_pcm(
+                sentences_fn=_sentences,
+                streamer=streamer,
+                cap=cap,
+                stop=stop,
+                emit=lambda c: loop.call_soon_threadsafe(chunks.put_nowait, c),
+                strip_md=_strip_markdown_for_tts,
+                split_fn=_split_text_for_speak_stream,
+            )
+            {PRODUCE_PATCH_END}
+"""
+
+
+def _patch_speak_stream_produce(web_server_py: Path) -> str:
+    """Replace serial synth loop with look-ahead prefetch (marked, idempotent)."""
+    original = web_server_py.read_text(encoding="utf-8")
+    block = _prefetch_produce_block()
+
+    if PRODUCE_PATCH_BEGIN in original and PRODUCE_PATCH_END in original:
+        pre = original.split(PRODUCE_PATCH_BEGIN, 1)[0].rstrip()
+        post = original.split(PRODUCE_PATCH_END, 1)[1].lstrip("\n")
+        # pre ends at the line before the marker content; restore try: indent
+        if not pre.endswith("try:"):
+            # Keep whatever preceded the marker (should be `        try:`)
+            pass
+        merged = pre + "\n" + block + post
+        if merged == original:
+            return "produce_unchanged"
+        action = "produce_replaced"
+    else:
+        pattern = re.compile(
+            r"(?ms)"
+            r"(^        try:\n)"
+            r"(            for sentence in _sentences\(\):\n"
+            r"                cleaned = _strip_markdown_for_tts\(sentence\)\n"
+            r"                if not cleaned:\n"
+            r"                    continue\n"
+            r"                for piece in _split_text_for_speak_stream\(cleaned, cap\):\n"
+            r"                    for chunk in streamer\.stream\(piece\):\n"
+            r"                        if stop\.is_set\(\):\n"
+            r"                            return\n"
+            r"                        loop\.call_soon_threadsafe\(chunks\.put_nowait, chunk\)\n)"
+        )
+        match = pattern.search(original)
+        if not match:
+            return "produce_pattern_miss"
+        merged = original[: match.start()] + match.group(1) + block + original[match.end() :]
+        action = "produce_patched"
+
+    bak = web_server_py.with_suffix(web_server_py.suffix + ".voicebox.bak")
+    if not bak.exists():
+        bak.write_text(original, encoding="utf-8")
+    web_server_py.write_text(
+        merged if merged.endswith("\n") else merged + "\n", encoding="utf-8"
+    )
+    return action
+
+
+def install_speak_stream_hook(hermes_root: Path) -> str:
+    """
+    Install Voicebox speak-stream adapter into a local hermes-agent checkout.
+
+    Enables Desktop read-aloud to speak sentence-by-sentence (faster start)
+    with look-ahead synthesis so the next sentence is prepared while the
+    current one plays.
+    """
+    agent_dir = hermes_root / "hermes-agent"
+    agent_tools = agent_dir / "tools"
+    streaming_py = agent_tools / "tts_streaming.py"
+    web_server_py = agent_dir / "hermes_cli" / "web_server.py"
+    src = Path(__file__).resolve().parent / "scripts" / "hermes_voicebox_streamer.py"
+    if not src.is_file():
+        return "missing_src"
+    if not streaming_py.is_file():
+        return "no_hermes_agent"
+
+    dst = agent_tools / "voicebox_command_streamer.py"
+    shutil.copy2(src, dst)
+
+    original = streaming_py.read_text(encoding="utf-8")
+    block = _streamer_import_block()
+    if STREAMER_IMPORT_BEGIN in original and STREAMER_IMPORT_END in original:
+        pre = original.split(STREAMER_IMPORT_BEGIN, 1)[0].rstrip()
+        post = original.split(STREAMER_IMPORT_END, 1)[1].lstrip("\n")
+        merged = pre + "\n\n" + block + (("\n" + post) if post else "")
+        import_action = "replaced_import"
+    else:
+        merged = original.rstrip() + "\n\n" + block
+        import_action = "appended_import"
+
+    if merged != original:
+        bak = streaming_py.with_suffix(streaming_py.suffix + ".voicebox.bak")
+        if not bak.exists():
+            bak.write_text(original, encoding="utf-8")
+        streaming_py.write_text(
+            merged if merged.endswith("\n") else merged + "\n", encoding="utf-8"
+        )
+
+    produce_action = "produce_skipped"
+    if web_server_py.is_file():
+        produce_action = _patch_speak_stream_produce(web_server_py)
+
+    return f"{import_action}+{produce_action}"
 
 
 def _yaml_literal_block(text: str, indent: int = 6) -> str:
@@ -142,17 +361,20 @@ def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
     backup = config_path.with_suffix(config_path.suffix + ".bak")
     backup.write_text(original, encoding="utf-8")
 
+    # Repair a known corruption: a bare ``-personalities`` line after our
+    # marker block (invalid YAML; Hermes then wipes config on update).
+    original = re.sub(r"(?m)^-personalities\s*\n", "", original)
+
     if PERSONA_MARKER_BEGIN in original and PERSONA_MARKER_END in original:
         pre = original.split(PERSONA_MARKER_BEGIN, 1)[0].rstrip()
         post = original.split(PERSONA_MARKER_END, 1)[1].lstrip("\n")
         # Keep surrounding structure; replace only marked entries block.
         merged = (pre + "\n" if pre else "") + entries + ("\n" + post if post else "\n")
+        merged = re.sub(r"(?m)^-personalities\s*\n", "", merged)
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
         return "replaced"
 
     # Insert under existing agent.personalities: if present.
-    import re
-
     personalities_hdr = re.search(r"(?m)^([ \t]*)personalities:\s*$", original)
     agent_hdr = re.search(r"(?m)^agent:\s*$", original)
 
@@ -181,11 +403,17 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     plugin_src_dir = src_root / "desktop-plugin"
     plugin_src = plugin_src_dir / "plugin.js"
     bridge_src = src_root / "scripts" / "voicebox_tts.py"
+    bind_src = src_root / "scripts" / "voicebox_bind.py"
+    streamer_src = src_root / "scripts" / "hermes_voicebox_streamer.py"
 
     if not plugin_src.is_file():
         raise FileNotFoundError(f"Missing plugin source: {plugin_src}")
     if not bridge_src.is_file():
         raise FileNotFoundError(f"Missing bridge source: {bridge_src}")
+    if not bind_src.is_file():
+        raise FileNotFoundError(f"Missing bind helper source: {bind_src}")
+    if not streamer_src.is_file():
+        raise FileNotFoundError(f"Missing speak-stream source: {streamer_src}")
 
     plugin_dst_dir = hermes_dir / "desktop-plugins" / PLUGIN_ID
     scripts_dst_dir = hermes_dir / "scripts"
@@ -194,6 +422,7 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
 
     plugin_dst = plugin_dst_dir / "plugin.js"
     bridge_dst = scripts_dst_dir / "voicebox_tts.py"
+    bind_dst = scripts_dst_dir / "voicebox_bind.py"
 
     # Copy plugin entry + companion modules/assets
     for src in plugin_src_dir.iterdir():
@@ -201,9 +430,10 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
             shutil.copy2(src, plugin_dst_dir / src.name)
 
     shutil.copy2(bridge_src, bridge_dst)
-
+    shutil.copy2(bind_src, bind_dst)
     if platform.system() != "Windows":
         bridge_dst.chmod(bridge_dst.stat().st_mode | 0o111)
+        bind_dst.chmod(bind_dst.stat().st_mode | 0o111)
 
     return plugin_dst, bridge_dst
 
@@ -278,7 +508,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--hermes-dir",
         default=None,
-        help="Target Hermes directory (default: ~/.hermes or $HERMES_DIR)",
+        help="Target Hermes directory (default: ~/.hermes or $HERMES_DIR / $HERMES_HOME)",
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="Merge TTS config into Hermes Desktop profile home "
+        "(default → ~/.hermes; other names → ~/.hermes/profiles/<name>)",
+    )
+    parser.add_argument(
+        "--all-profiles",
+        action="store_true",
+        help="Merge Voicebox TTS into default + every ~/.hermes/profiles/* config.yaml",
     )
     parser.add_argument(
         "--base-url",
@@ -339,16 +580,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     src_root = repo_root()
-    hermes_dir = Path(args.hermes_dir).expanduser().resolve() if args.hermes_dir else default_hermes_dir()
+    root_hermes = Path(args.hermes_dir).expanduser().resolve() if args.hermes_dir else default_hermes_dir()
+    if args.profile and args.all_profiles:
+        print("ERROR: use --profile or --all-profiles, not both", file=sys.stderr)
+        return 2
+    hermes_dir = (
+        resolve_profile_hermes_dir(args.profile, root_hermes) if args.profile else root_hermes
+    )
     python_cmd = find_python_command() or ("python" if platform.system() == "Windows" else "python3")
-    bridge_path = hermes_dir / "scripts" / "voicebox_tts.py"
+    # Plugin + bridge always install under the root Hermes dir (Desktop loads them once).
+    install_root = root_hermes
+    bridge_path = install_root / "scripts" / "voicebox_tts.py"
     snippet = build_snippet(python_cmd, bridge_path)
 
     print(f"=== Installing Hermes Voicebox Integration ({platform.system()}) ===")
-    print(f"Repo:        {src_root}")
-    print(f"Hermes dir:  {hermes_dir}")
-    print(f"Python cmd:  {python_cmd}")
-    print(f"Voicebox:    {args.base_url}")
+    print(f"Repo:         {src_root}")
+    print(f"Hermes root:  {install_root}")
+    if hermes_dir != install_root:
+        print(f"Profile home: {hermes_dir}")
+    print(f"Python cmd:   {python_cmd}")
+    print(f"Voicebox:     {args.base_url}")
 
     if args.print_snippet:
         print()
@@ -365,7 +616,7 @@ def main(argv: list[str] | None = None) -> int:
                 prefer_docker = False  # Windows default: desktop installer first
 
         report = run_prerequisite_flow(
-            hermes_dir=hermes_dir,
+            hermes_dir=install_root,
             base_url=args.base_url,
             assume_yes=args.yes,
             skip_hermes=args.skip_hermes,
@@ -384,44 +635,81 @@ def main(argv: list[str] | None = None) -> int:
                 print("ERROR: Prerequisites failed; aborting.", file=sys.stderr)
                 return 1
 
-    plugin_dst, bridge_dst = install_files(src_root, hermes_dir)
+    plugin_dst, bridge_dst = install_files(src_root, install_root)
     verify_install(plugin_dst, bridge_dst)
     print(f"Installed plugin: {plugin_dst}")
     print(f"Installed bridge: {bridge_dst}")
+    bind_dst = install_root / "scripts" / "voicebox_bind.py"
+    if bind_dst.is_file():
+        print(f"Installed binder: {bind_dst}")
+
+    stream_hook = install_speak_stream_hook(install_root)
+    if stream_hook == "no_hermes_agent":
+        print(
+            "Speak-stream hook: skipped (no hermes-agent under Hermes root). "
+            "Desktop read-aloud will keep using one-shot TTS."
+        )
+    elif stream_hook == "missing_src":
+        print("Speak-stream hook: skipped (streamer source missing).", file=sys.stderr)
+    else:
+        print(f"Speak-stream hook: {stream_hook} → hermes-agent/tools/voicebox_command_streamer.py")
 
     # Refresh snippet with possibly updated python after prereq install
     python_cmd = find_python_command() or python_cmd
     snippet = build_snippet(python_cmd, bridge_dst)
-    snippet_path = hermes_dir / "voicebox-provider.snippet.yaml"
+    snippet_path = install_root / "voicebox-provider.snippet.yaml"
     snippet_path.write_text(snippet, encoding="utf-8")
     print(f"Wrote snippet:    {snippet_path}")
 
-    config_path = hermes_dir / "config.yaml"
     samples = load_sample_voices(src_root)
     persona_snippet = build_personalities_snippet(samples)
-    persona_snippet_path = hermes_dir / "voicebox-personalities.snippet.yaml"
+    persona_snippet_path = install_root / "voicebox-personalities.snippet.yaml"
     if persona_snippet.strip():
         persona_snippet_path.write_text(persona_snippet, encoding="utf-8")
         print(f"Wrote personas:   {persona_snippet_path}")
 
+    if args.all_profiles:
+        config_homes = list_profile_hermes_dirs(install_root)
+    elif args.profile:
+        hermes_dir.mkdir(parents=True, exist_ok=True)
+        config_homes = [hermes_dir]
+    else:
+        config_homes = [install_root]
+
     if args.no_config:
         print("Skipped config.yaml (--no-config).")
     else:
-        result = merge_config(config_path, snippet, force=args.force_config)
-        if result == "created":
-            print(f"Created {config_path} with Voicebox TTS provider.")
-        elif result == "replaced":
-            print(f"Updated marked Voicebox block in {config_path} (backup: config.yaml.bak).")
-        elif result == "appended":
-            print(f"Appended Voicebox TTS provider to {config_path} (backup: config.yaml.bak).")
-        else:
-            print(f"Left existing TTS block in {config_path} unchanged.")
-            print("Re-run with --force-config to append the marked TTS block, or merge the snippet below manually:")
+        for home in config_homes:
+            home.mkdir(parents=True, exist_ok=True)
+            config_path = home / "config.yaml"
+            label = "default" if home == install_root else home.name
+            result = merge_config(config_path, snippet, force=args.force_config)
+            if result == "created":
+                print(f"[{label}] Created {config_path} with Voicebox TTS provider.")
+            elif result == "replaced":
+                print(f"[{label}] Updated marked Voicebox block in {config_path}.")
+            elif result == "appended":
+                print(f"[{label}] Appended Voicebox TTS provider to {config_path}.")
+            elif result == "relocated":
+                print(f"[{label}] Relocated Voicebox TTS block in {config_path}.")
+            else:
+                print(f"[{label}] Left existing TTS block in {config_path} unchanged.")
 
-        # Always upsert named sample personalities (Hermes /personality keys).
-        if samples:
-            presult = merge_personalities_config(config_path, samples)
-            print(f"Sample personalities in config.yaml: {presult}")
+            timeout_result = ensure_voicebox_timeout(config_path)
+            if timeout_result in ("inserted", "updated"):
+                print(
+                    f"[{label}] Set tts.providers.voicebox.timeout="
+                    f"{COMMAND_TTS_TIMEOUT_SECONDS}s ({timeout_result})."
+                )
+            elif timeout_result == "unchanged":
+                print(
+                    f"[{label}] Command TTS timeout already "
+                    f"{COMMAND_TTS_TIMEOUT_SECONDS}s."
+                )
+
+            if samples:
+                presult = merge_personalities_config(config_path, samples)
+                print(f"[{label}] Sample personalities: {presult}")
 
     print()
     print("=== Setup Complete ===")
@@ -435,9 +723,19 @@ def main(argv: list[str] | None = None) -> int:
     if not healthy:
         print("  1. Start Voicebox (desktop app or `docker compose up -d` in ~/.hermes/vendor/voicebox)")
         print("  2. Re-run with: python install.py -y --skip-hermes")
-    print("  • Restart Hermes Desktop so it reloads plugins + config")
-    print("  • Open the Voicebox sidebar — fun sample voices seed on first connect")
-    print("  • Selecting a sample voice applies its Hermes persona (agent.personalities / /personality)")
+    print("  • Restart Hermes Desktop so it reloads plugins + config (+ speak-stream hook)")
+    print("  • Open the Voicebox sidebar — voice + persona bind to the active Hermes profile")
+    print(
+        f"  • Long read-aloud starts per sentence via speak-stream; "
+        f"command timeout is {COMMAND_TTS_TIMEOUT_SECONDS}s"
+    )
+    print("  • For other profiles: python install.py --skip-prereqs --profile <name>  (or --all-profiles)")
+    print("  • CLI bind: HERMES_HOME=~/.hermes/profiles/<name> python3 scripts/voicebox_bind.py --voice <uuid>")
+    print(
+        "  • After a Hermes Agent update, re-run: "
+        "python install.py -y --skip-prereqs --skip-hermes "
+        "(re-applies speak-stream patches under hermes-agent/)"
+    )
     if platform.system() == "Windows":
         print()
         print("Windows tip: if script execution is blocked, run:")

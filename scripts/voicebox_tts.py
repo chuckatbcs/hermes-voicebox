@@ -21,10 +21,33 @@ import urllib.error
 # Per-chunk HTTP timeout (seconds).  Each chunk is ≤MAX_CHARS characters;
 # on Blackwell GPU a 800-char chunk takes ~30-60 s.
 CHUNK_TIMEOUT   = 300
-# Maximum characters per chunk sent to the backend.
-# Match Voicebox's ~800-char internal split so long replies need fewer
-# round-trips (each round-trip can reload/switch engines on CPU).
+# Maximum characters per chunk for preset/fast engines (Kokoro, etc.).
 MAX_CHARS       = 800
+# Cloning engines (Chatterbox / Qwen) often hit early EOS mid-paragraph.
+# Prefer one sentence per request so a truncated generation only loses that
+# sentence, not the rest of the reply.
+CLONE_SENTENCE_MAX_CHARS = 400
+
+_CLONE_ENGINES = frozenset({
+    "chatterbox",
+    "chatterbox_turbo",
+    "qwen",
+    "qwen_fast",
+    "qwen3",
+})
+
+
+def _engine_prefers_sentence_chunks(engine: str | None) -> bool:
+    if not engine:
+        # Unknown engine — assume clone-like (safer for incomplete reads).
+        return True
+    return str(engine).strip().lower() in _CLONE_ENGINES
+
+
+def chunk_max_chars_for_engine(engine: str | None) -> int:
+    if _engine_prefers_sentence_chunks(engine):
+        return CLONE_SENTENCE_MAX_CHARS
+    return MAX_CHARS
 
 
 def get_base_url(cli_base_url: str = None) -> str:
@@ -137,6 +160,40 @@ def _split_sentences(text: str, max_chars: int) -> list:
     return [c for c in chunks if c.strip()]
 
 
+def _split_one_sentence_chunks(text: str, max_chars: int) -> list:
+    """
+    One sentence per chunk (never pack multiple sentences together).
+
+    Isolates Chatterbox/Qwen early-EOS failures to a single sentence so the
+    rest of the reply still gets spoken.
+    """
+    sentence_re = re.compile(r'(?<=[.!?])\s+')
+    # Also treat blank lines as hard breaks (paragraphs without terminal punct).
+    parts = []
+    for para in re.split(r'\n+', text.strip()):
+        para = para.strip()
+        if not para:
+            continue
+        parts.extend(s.strip() for s in sentence_re.split(para) if s.strip())
+
+    chunks = []
+    for sentence in parts:
+        if len(sentence) <= max_chars:
+            chunks.append(sentence)
+            continue
+        # Oversized single sentence — reuse word hard-split from _split_sentences.
+        chunks.extend(_split_sentences(sentence, max_chars))
+    return chunks
+
+
+def split_tts_chunks(text: str, engine: str | None = None) -> list:
+    """Choose sentence-isolated vs packed chunking based on engine."""
+    max_chars = chunk_max_chars_for_engine(engine)
+    if _engine_prefers_sentence_chunks(engine):
+        return _split_one_sentence_chunks(text, max_chars)
+    return _split_sentences(text, max_chars)
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
@@ -157,33 +214,60 @@ _INVALID_VOICE_IDS = {
 }
 
 
+def _hermes_home() -> str:
+    """Profile-scoped Hermes home: HERMES_HOME → HERMES_DIR → ~/.hermes."""
+    return (
+        os.environ.get("HERMES_HOME")
+        or os.environ.get("HERMES_DIR")
+        or os.path.expanduser("~/.hermes")
+    )
+
+
 def _hermes_dir() -> str:
-    return os.environ.get("HERMES_DIR") or os.path.expanduser("~/.hermes")
+    """Back-compat alias for _hermes_home()."""
+    return _hermes_home()
+
+
+def _read_voice_id_from_json(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return ""
+        vid = data.get("voice_id") or data.get("profile_id") or data.get("id") or ""
+        vid = str(vid).strip()
+        if vid and vid.lower() not in _INVALID_VOICE_IDS:
+            return vid
+    except Exception:
+        pass
+    return ""
 
 
 def _read_local_active_voice() -> str:
-    """Optional sidecar; many Voicebox builds lack /settings/active-voice."""
+    """Per-profile binding / legacy sidecar under the active Hermes home."""
+    home = _hermes_home()
     candidates = [
-        os.path.join(_hermes_dir(), "voicebox_active_voice.json"),
+        os.path.join(home, "voicebox_binding.json"),
+        os.path.join(home, "voicebox_active_voice.json"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "voicebox_binding.json"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "voicebox_active_voice.json"),
     ]
     for path in candidates:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            vid = data.get("voice_id") or data.get("profile_id") or data.get("id") or ""
-            vid = str(vid).strip()
-            if vid and vid.lower() not in _INVALID_VOICE_IDS:
-                return vid
-        except Exception:
-            continue
+        vid = _read_voice_id_from_json(path)
+        if vid:
+            return vid
     return ""
 
 
 def resolve_profile_id(cli_voice: str, base_url: str, get_json=None) -> str:
     """
     Resolve which Voicebox profile to use.
-    Precedence: CLI --voice > local sidecar > /settings/active-voice > first profile.
+
+    Precedence:
+      1) CLI --voice (Hermes substitutes tts.providers.voicebox.voice here)
+      2) Per-profile binding / sidecar under HERMES_HOME
+      3) Voicebox /settings/active-voice (demoted — process-global, cross-profile bleed)
+      4) First Voicebox profile
     """
     fetcher = get_json or _get_json
     voice = (cli_voice or "").strip()
@@ -206,6 +290,11 @@ def resolve_profile_id(cli_voice: str, base_url: str, get_json=None) -> str:
             )
             active_id = str(active_id).strip()
             if active_id and active_id.lower() not in _INVALID_VOICE_IDS:
+                print(
+                    "Note: using Voicebox process-global active-voice; "
+                    "prefer per-Hermes-profile binding via voicebox_bind.py.",
+                    file=sys.stderr,
+                )
                 return active_id
     except Exception as e:
         print(
@@ -481,10 +570,14 @@ def main():
     except Exception as e:
         print(f"Warning: could not fetch profile details ({e}), engine left unset.", file=sys.stderr)
 
-    # 4. Split text into chunks
-    chunks = _split_sentences(text, MAX_CHARS)
+    # 4. Split text into chunks (sentence-isolated for clone engines)
+    chunks = split_tts_chunks(text, engine)
     n = len(chunks)
-    print(f"Generating TTS for profile '{profile_id}' in {n} chunk(s)...", file=sys.stderr)
+    print(
+        f"Generating TTS for profile '{profile_id}' in {n} chunk(s)"
+        f"{' (sentence mode)' if _engine_prefers_sentence_chunks(engine) else ''}...",
+        file=sys.stderr,
+    )
 
     # 5. Generate each chunk
     wav_format = None   # (sample_rate, num_channels, bits_per_sample)
@@ -492,7 +585,13 @@ def main():
 
     for i, chunk_text in enumerate(chunks, 1):
         print(f"  Chunk {i}/{n} ({len(chunk_text)} chars)...", file=sys.stderr)
-        payload = {"profile_id": profile_id, "text": chunk_text, "language": language}
+        payload = {
+            "profile_id": profile_id,
+            "text": chunk_text,
+            "language": language,
+            # Keep Voicebox's internal splitter aligned with our chunk size.
+            "max_chunk_chars": max(len(chunk_text), 100),
+        }
         if engine:
             payload["engine"] = engine
 

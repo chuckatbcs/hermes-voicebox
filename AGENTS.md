@@ -14,12 +14,28 @@ Bounded local execution engineer for this repository unless explicitly assigned 
 
 | Path | Purpose |
 |------|---------|
-| `desktop-plugin/plugin.js` | Hermes desktop plugin UI (voice select / clone / delete / personas) |
-| `scripts/voicebox_tts.py` | Hermes TTS command bridge (chunked generate + WAV merge) |
-| `install.py` | Cross-platform installer entrypoint |
-| `installer/` | Prerequisite detection + provisioning (Hermes, Voicebox, models) |
+| `desktop-plugin/plugin.js` | Hermes desktop plugin UI (voice select / clone / delete / personas; per-profile binding) |
+| `scripts/voicebox_tts.py` | Hermes TTS command bridge (clone sentence chunking + WAV merge) |
+| `scripts/hermes_voicebox_streamer.py` | Hermes speak-stream adapter (sentence PCM + look-ahead; installed as `voicebox_command_streamer.py`) |
+| `scripts/voicebox_bind.py` | CLI helper to bind voice → `$HERMES_HOME` config + `voicebox_binding.json` |
+| `install.py` | Cross-platform installer entrypoint (`--profile` / `--all-profiles`) |
 | `install.sh` / `install.ps1` | OS launchers (bootstrap Python, then `install.py`) |
+| `installer/` | Prerequisite detection + provisioning (Hermes, Voicebox, models) |
 | `README.md` | User-facing docs |
+
+### Install-time Hermes Agent patches
+
+When `$HERMES_HOME/hermes-agent` exists, `install_speak_stream_hook()` applies:
+
+| Target under `hermes-agent/` | Marker / artifact |
+|------------------------------|-------------------|
+| `tools/voicebox_command_streamer.py` | Copied from `scripts/hermes_voicebox_streamer.py` |
+| `tools/tts_streaming.py` | `# BEGIN hermes-voicebox-streamer` … `# END hermes-voicebox-streamer` |
+| `hermes_cli/web_server.py` | `# BEGIN hermes-voicebox-prefetch` … `# END hermes-voicebox-prefetch` |
+
+Return codes / suffixes: `missing_src`, `no_hermes_agent`, `produce_pattern_miss`, `produce_patched`, `produce_replaced`, `produce_skipped`. Re-run install after Hermes updates (those files get overwritten).
+
+Also written into profile `config.yaml`: marked TTS block with `timeout: 600`, sample personalities (strips corrupt bare `-personalities` lines).
 
 ## Authorized scope
 
@@ -54,7 +70,7 @@ None currently designated. Do not invent protected paths.
 
 Before claiming complete, run applicable checks:
 
-- Python syntax: `python3 -m py_compile scripts/voicebox_tts.py install.py installer/prereqs.py`
+- Python syntax: `python3 -m py_compile scripts/voicebox_tts.py scripts/voicebox_bind.py scripts/hermes_voicebox_streamer.py install.py installer/prereqs.py`
 - Unit tests: `python3 -m unittest test_install.py -v` and `cd scripts && python3 -m unittest test_voicebox_tts.py -v`
 - Installer smoke test: `./install.sh --hermes-dir <tmpdir> --skip-prereqs`
 - Manual sanity review of plugin fetch/error paths when UI tests are unavailable
