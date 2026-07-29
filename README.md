@@ -195,6 +195,16 @@ python3 ~/.hermes/scripts/voicebox_gpu.py config --stop-on-hermes-exit off
 
 Windows: use the plugin button / CLI; the systemd unit is Linux-only (you can still run `lifecycle-daemon` manually if desired).
 
+**OOM recovery:** the TTS bridge (`voicebox_tts.py`) detects CUDA out-of-memory, calls Voicebox `/models/unload`, forces Qwen `model_size=0.6B`, and retries once. If unload reports success but VRAM barely drops, restart Voicebox (`systemctl --user restart voicebox.service`) — the unload API can be a no-op while the process still holds memory.
+
+### Diagnose script
+
+```bash
+bash scripts/diagnose_tts.sh [voice-profile-uuid]
+```
+
+Checks Voicebox `/health`, GPU/`nvidia-smi`, profile metadata, a direct `/generate/stream` smoke test, the installed bridge, and **MCP `voicebox`** (`hermes mcp list` / `hermes mcp test voicebox` + shim process presence).
+
 ---
 
 ## Manual Voicebox notes

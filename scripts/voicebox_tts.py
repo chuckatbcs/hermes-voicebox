@@ -14,6 +14,7 @@ import subprocess
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 
 # ---------------------------------------------------------------------------
 # Tunables & Configuration
@@ -35,6 +36,47 @@ _CLONE_ENGINES = frozenset({
     "qwen_fast",
     "qwen3",
 })
+
+# Voicebox removed standalone engine id `qwen_fast` (0.6B is now model_size on
+# `qwen`). Older profiles still store default_engine=qwen_fast and 500 if we
+# forward that id on /generate.
+_ENGINE_ALIASES = {
+    "qwen_fast": "qwen",
+    "qwen3": "qwen",
+}
+
+
+def normalize_engine(engine: str | None) -> str | None:
+    """Map deprecated Voicebox engine ids to ones the running API accepts."""
+    if engine is None:
+        return None
+    raw = str(engine).strip()
+    if not raw:
+        return None
+    return _ENGINE_ALIASES.get(raw.lower(), raw)
+
+
+def model_size_for_engine(engine: str | None) -> str | None:
+    """Pick a Qwen checkpoint size that fits typical laptop GPUs.
+
+    Voicebox defaults ``qwen`` to ``1.7B`` (~7+ GiB), which OOMs on 8 GiB cards
+    (RTX PRO 2000 / similar). Prefer ``0.6B`` unless overridden.
+
+    Override with ``VOICEBOX_QWEN_MODEL_SIZE=1.7B`` (or ``0.6B``) when needed.
+    Deprecated ``qwen_fast`` always maps to ``0.6B``.
+    """
+    if engine is None:
+        return None
+    raw = str(engine).strip().lower()
+    override = (os.environ.get("VOICEBOX_QWEN_MODEL_SIZE") or "").strip()
+    if raw in {"qwen", "qwen_fast", "qwen3"}:
+        if override in {"0.6B", "1.7B", "1B", "3B"}:
+            return override
+        # qwen_fast historically meant the small checkpoint.
+        if raw == "qwen_fast":
+            return "0.6B"
+        return "0.6B"
+    return None
 
 
 def _engine_prefers_sentence_chunks(engine: str | None) -> bool:
@@ -102,6 +144,85 @@ def _build_wav(pcm_chunks: list, sample_rate: int, num_channels: int, bits_per_s
         b'data', data_size,
     )
     return header + pcm
+
+
+# ---------------------------------------------------------------------------
+# Spoken-text cleanup (stage directions / emphasis markup)
+# ---------------------------------------------------------------------------
+# LLMs (especially theatrical personas like Cartman) often insert stage
+# directions the chat UI may render lightly, but Qwen TTS reads them aloud:
+#   [sarcastically]  [whiny voice]  (sighs dramatically)  *with emphasis*
+# Chatterbox Turbo understands a small set of paralinguistic tags; keep those,
+# strip everything else.
+
+_CHATTERBOX_PARALINGUISTIC = frozenset({
+    "laugh",
+    "chuckle",
+    "cough",
+    "sigh",
+    "gasp",
+    "groan",
+    "sniff",
+    "shush",
+    "clear throat",
+    "whisper",
+})
+
+_BRACKET_TAG_RE = re.compile(r"\[([^\[\]]{1,80})\]")
+_PAREN_STAGE_RE = re.compile(
+    r"\((?:laughs?|giggles?|chuckles?|snickers?|gasps?|pants?|sighs?|groans?|"
+    r"coughs?|clears?\s+throat|whispers?|shouts?|yells?|screams?|"
+    r"emphasi[sz](?:e|ing|is)?|angrily|sadly|happily|sarcastically|"
+    r"dramatically|maniacally|whiny|in\s+a\s+[\w\s]{1,40}\s+voice)"
+    r"(?:\s+[^)]{0,60})?\)",
+    flags=re.IGNORECASE,
+)
+_PAREN_GENERIC_RE = re.compile(r"\(([^)]{1,80})\)")
+_MD_EMPHASIS_RE = re.compile(
+    r"(\*\*|__)(.+?)\1|(\*|_)(.+?)\3",
+    flags=re.DOTALL,
+)
+
+
+def sanitize_spoken_text_for_voicebox(text: str, engine: str | None = None) -> str:
+    """Remove stage-direction / emphasis markup that TTS would speak aloud."""
+    if not text:
+        return ""
+    eng = (engine or "").strip().lower()
+    keep_turbo_tags = "chatterbox" in eng  # turbo + multilingual chatterbox
+
+    def _bracket_sub(match: re.Match) -> str:
+        inner = (match.group(1) or "").strip().lower()
+        # Normalize "clear throat" style multi-word tags
+        key = re.sub(r"\s+", " ", inner)
+        if keep_turbo_tags and key in _CHATTERBOX_PARALINGUISTIC:
+            return match.group(0)
+        return " "
+
+    out = _BRACKET_TAG_RE.sub(_bracket_sub, text)
+    out = _PAREN_STAGE_RE.sub(" ", out)
+    # Drop remaining short parentheticals that look like directions (no digits /
+    # URLs) — keeps normal prose like "(or so they say)" only when longer... 
+    # Actually strip short alpha parentheticals that are direction-like.
+    def _paren_generic(match: re.Match) -> str:
+        inner = (match.group(1) or "").strip()
+        if not inner:
+            return " "
+        # Keep parentheticals that look like real asides with punctuation/length
+        if len(inner) > 48:
+            return match.group(0)
+        if re.search(r"\d|https?://|www\.", inner, flags=re.IGNORECASE):
+            return match.group(0)
+        # Short alphabetic stagey asides → drop
+        if re.fullmatch(r"[A-Za-z][A-Za-z\s,'-]{0,47}", inner):
+            return " "
+        return match.group(0)
+
+    out = _PAREN_GENERIC_RE.sub(_paren_generic, out)
+    # Leftover markdown emphasis markers (Hermes usually strips these first)
+    out = _MD_EMPHASIS_RE.sub(lambda m: m.group(2) or m.group(4) or "", out)
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +541,144 @@ def _model_status_hint(base_url: str, engine: str | None) -> str:
     return "Model status: " + "; ".join(relevant[:6])
 
 
+def _is_cuda_oom_error(err: BaseException | str) -> bool:
+    """True when Voicebox/PyTorch reports GPU memory exhaustion."""
+    s = str(err).lower()
+    needles = (
+        "out of memory",
+        "cuda out of memory",
+        "cudaoom",
+        "cudnn_status_alloc_failed",
+        "hip out of memory",
+        "failed to allocate",
+        "oom",
+    )
+    # Avoid matching unrelated "boom"/"room" — require cuda/gpu context for bare oom.
+    if "out of memory" in s or "cudaoom" in s or "cudnn_status_alloc_failed" in s:
+        return True
+    if "failed to allocate" in s and ("cuda" in s or "gpu" in s or "vram" in s):
+        return True
+    if re.search(r"\boom\b", s) and ("cuda" in s or "gpu" in s or "vram" in s):
+        return True
+    return any(n in s for n in needles if n not in {"oom"})
+
+
+def _nvidia_vram_mb() -> tuple[int | None, int | None]:
+    """Return (used_miB, free_miB) from nvidia-smi, or (None, None)."""
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None, None
+        line = (proc.stdout or "").strip().splitlines()[0]
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            return None, None
+        return int(float(parts[0])), int(float(parts[1]))
+    except Exception:
+        return None, None
+
+
+def _post_json_ok(url: str, body: dict | None = None, timeout: float = 60.0) -> tuple[bool, str]:
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json"} if data is not None else {},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return True, (resp.read().decode("utf-8", errors="ignore") or "")[:300]
+    except Exception as e:
+        return False, str(e)
+
+
+def unload_voicebox_models(base_url: str) -> dict:
+    """Best-effort unload of loaded TTS models via Voicebox public API.
+
+    Voicebox sometimes reports unload success while VRAM stays full — callers
+    should compare nvidia-smi before/after and restart Voicebox when needed.
+    """
+    base = base_url.rstrip("/")
+    result: dict = {"unloaded": [], "errors": [], "default": None, "vram_before": None, "vram_after": None}
+    used0, free0 = _nvidia_vram_mb()
+    result["vram_before"] = {"used_mb": used0, "free_mb": free0}
+
+    loaded: list[str] = []
+    try:
+        status = _get_json(f"{base}/models/status")
+        rows = status if isinstance(status, list) else status.get("models") or status.get("engines") or []
+        if isinstance(status, dict) and isinstance(status.get("models"), dict):
+            rows = [
+                {"model_name": k, **(v if isinstance(v, dict) else {"loaded": bool(v)})}
+                for k, v in status["models"].items()
+            ]
+        elif isinstance(status, dict) and not rows:
+            rows = [
+                {"model_name": k, **(v if isinstance(v, dict) else {"loaded": bool(v)})}
+                for k, v in status.items()
+                if isinstance(v, (dict, bool))
+            ]
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or not row.get("loaded"):
+                continue
+            name = row.get("model_name") or row.get("name") or row.get("engine")
+            if name:
+                loaded.append(str(name))
+    except Exception as e:
+        result["errors"].append({"list": str(e)})
+
+    for name in loaded:
+        ok, detail = _post_json_ok(f"{base}/models/{urllib.parse.quote(name, safe='')}/unload")
+        if ok:
+            result["unloaded"].append(name)
+        else:
+            ok2, detail2 = _post_json_ok(f"{base}/models/unload", body={"model_name": name})
+            if ok2:
+                result["unloaded"].append(name)
+            else:
+                result["errors"].append({"model": name, "error": detail or detail2})
+
+    ok, detail = _post_json_ok(f"{base}/models/unload")
+    result["default"] = {"ok": ok, "detail": detail}
+
+    used1, free1 = _nvidia_vram_mb()
+    result["vram_after"] = {"used_mb": used1, "free_mb": free1}
+    return result
+
+
+def _gpu_recovery_hint(base_url: str, unload_result: dict | None = None) -> str:
+    used, free = _nvidia_vram_mb()
+    lines = [
+        "Hint: CUDA/GPU memory pressure. Prefer Qwen model_size=0.6B "
+        "(default), use the Desktop plugin Free GPU button, or:",
+        f"  python3 ~/.hermes/scripts/voicebox_gpu.py unload",
+        f"  systemctl --user restart voicebox.service   # when unload leaves VRAM full",
+        f"  curl -s {base_url.rstrip('/')}/health",
+    ]
+    if used is not None:
+        lines.append(f"  nvidia-smi VRAM now: used={used} MiB free={free} MiB")
+    if unload_result is not None:
+        before = (unload_result.get("vram_before") or {}).get("used_mb")
+        after = (unload_result.get("vram_after") or {}).get("used_mb")
+        if before is not None and after is not None and after >= before - 64:
+            lines.append(
+                "  Note: unload API ran but VRAM did not drop meaningfully — "
+                "restart Voicebox (systemctl --user restart voicebox.service)."
+            )
+    return "\n".join(lines)
+
+
 def _generate_via_async_job(base_url: str, payload: dict, timeout: int) -> bytes:
     """Fallback when /generate/stream 500s: queue /generate then fetch /audio/{id}."""
     job = _post_json(f"{base_url}/generate", payload, timeout=min(60, timeout))
@@ -557,18 +816,27 @@ def main():
 
     # 3. Resolve engine + language from profile metadata
     engine = None
+    model_size = None
     language = "en"
     profile = {}
     try:
         profile = _get_json(f"{base_url}/profiles/{profile_id}")
-        engine = profile.get("default_engine") or profile.get("preset_engine")
+        raw_engine = profile.get("default_engine") or profile.get("preset_engine")
+        engine = normalize_engine(raw_engine)
+        model_size = model_size_for_engine(raw_engine)
         language = profile.get("language") or language
         live_samples = _profile_sample_count(
             profile, base_url=base_url, profile_id=profile_id
         )
+        eng_note = (
+            f" (remapped from {raw_engine!r})"
+            if raw_engine and engine and str(raw_engine) != str(engine)
+            else ""
+        )
         print(
             f"Profile '{profile.get('name') or profile_id}' "
-            f"type={profile.get('voice_type')!r} engine={engine!r} "
+            f"type={profile.get('voice_type')!r} engine={engine!r}{eng_note} "
+            f"model_size={model_size!r} "
             f"preset_voice_id={profile.get('preset_voice_id')!r} "
             f"samples={live_samples!r}",
             file=sys.stderr,
@@ -581,6 +849,20 @@ def main():
             sys.exit(1)
     except Exception as e:
         print(f"Warning: could not fetch profile details ({e}), engine left unset.", file=sys.stderr)
+
+    # Strip stage directions / emphasis markup Qwen would otherwise speak aloud
+    # (e.g. [sarcastically], [whiny voice], (sighs dramatically)).
+    cleaned = sanitize_spoken_text_for_voicebox(text, engine)
+    if cleaned != text:
+        print(
+            f"Note: stripped stage-direction/emphasis markup for TTS "
+            f"({len(text)} → {len(cleaned)} chars).",
+            file=sys.stderr,
+        )
+        text = cleaned
+    if not text.strip():
+        print("Error: text empty after stripping stage-direction markup.", file=sys.stderr)
+        sys.exit(1)
 
     # 4. Split text into chunks (sentence-isolated for clone engines)
     chunks = split_tts_chunks(text, engine)
@@ -614,10 +896,13 @@ def main():
         }
         if engine:
             payload["engine"] = engine
+        if model_size:
+            payload["model_size"] = model_size
 
         raw = None
         last_err = None
-        for attempt in range(2):
+        oom_retried = False
+        for attempt in range(3):
             try:
                 raw = generate_wav(base_url, payload, CHUNK_TIMEOUT)
                 break
@@ -633,12 +918,27 @@ def main():
                 print(f"TTS failed on chunk {i}: {e}", file=sys.stderr)
                 print(_model_status_hint(base_url, engine), file=sys.stderr)
                 err_l = str(e).lower()
-                if "cuda" in err_l or "unspecified launch failure" in err_l:
+                if _is_cuda_oom_error(e) and not oom_retried:
+                    oom_retried = True
+                    # Force the small Qwen checkpoint on retry when applicable.
+                    if engine and str(engine).lower() in {"qwen", "qwen3"}:
+                        payload["model_size"] = "0.6B"
+                        model_size = "0.6B"
                     print(
-                        "Hint: Voicebox hit a CUDA/GPU failure (often a wedged driver "
-                        "after suspend). Check `nvidia-smi` for ERR!, restart the "
-                        "Voicebox service with CUDA_VISIBLE_DEVICES= for CPU TTS, "
-                        "or reboot to clear the GPU, then retry.",
+                        "CUDA OOM detected — unloading Voicebox models and retrying "
+                        f"chunk {i} at model_size={payload.get('model_size')!r}...",
+                        file=sys.stderr,
+                    )
+                    unload_info = unload_voicebox_models(base_url)
+                    print(f"Unload result: {json.dumps(unload_info)}", file=sys.stderr)
+                    print(_gpu_recovery_hint(base_url, unload_info), file=sys.stderr)
+                    time.sleep(2)
+                    continue
+                if "cuda" in err_l or "unspecified launch failure" in err_l or _is_cuda_oom_error(e):
+                    print(_gpu_recovery_hint(base_url), file=sys.stderr)
+                    print(
+                        "Also check `nvidia-smi` for ERR! (wedged driver after suspend); "
+                        "CPU fallback: restart Voicebox with CUDA_VISIBLE_DEVICES=.",
                         file=sys.stderr,
                     )
                 else:

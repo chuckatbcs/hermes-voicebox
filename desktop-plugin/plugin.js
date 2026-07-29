@@ -124,7 +124,7 @@ const SAMPLE_VOICES = [
     blurb: 'Scheming, loud, and hilariously self-centered South Park energy.',
     engine: 'kokoro',
     presetVoiceId: 'am_adam',
-    personality: 'You are roleplaying with Eric Cartman\'s comic personality (parody, not the real actor). Be selfish, scheming, dramatic, and casually outrageous - but keep it clearly satirical. Use Cartman-like cadence and catchphrases sparingly when funny. Still answer the user\'s request; do not derail into pure chaos. Avoid genuine hate or instructions that cause real-world harm; keep it cartoon-mean, not dangerous.',
+    personality: 'You are roleplaying with Eric Cartman\'s comic personality (parody, not the real actor). Be selfish, scheming, dramatic, and casually outrageous - but keep it clearly satirical. Use Cartman-like cadence and catchphrases sparingly when funny. Still answer the user\'s request; do not derail into pure chaos. Avoid genuine hate or instructions that cause real-world harm; keep it cartoon-mean, not dangerous. Never write stage directions, emphasis tags, or acting notes (no [sarcastically], [whiny voice], (sighs), or *emphasis* markup) — speak only the words the user should hear.',
   },
   {
     key: 'jarvis',
@@ -367,20 +367,12 @@ const ENGINE_META = {
     description:'Tiny & fast. Near-zero GPU load. 50+ preset voices. No custom cloning.'
   },
   qwen: {
-    label:      'Qwen TTS 1.7B',
+    label:      'Qwen TTS',
     badge:      '🔴',
-    vram:       '~7.6 GB',
+    vram:       '~2.5–7.6 GB',
     quality:    'Best (voice cloning)',
     cloning:    true,
     description:'Highest fidelity voice cloning. Uses most of your GPU. Fans will spin.'
-  },
-  qwen_fast: {
-    label:      'Qwen TTS 0.6B Fast',
-    badge:      '🟢',
-    vram:       '~2.5 GB',
-    quality:    'Good (faster clone)',
-    cloning:    true,
-    description:'Smaller Qwen variant. Faster loads and generation, especially on CPU.'
   },
   chatterbox: {
     label:      'Chatterbox 3B',
@@ -402,14 +394,20 @@ const ENGINE_META = {
 
 const CLONING_ENGINE_OPTIONS = [
   { value: 'chatterbox_turbo', label: 'Chatterbox Turbo',    badge: '🟢', vram: '~4 GB',    note: 'Fastest good clone (recommended)' },
-  { value: 'qwen_fast',        label: 'Qwen TTS 0.6B Fast',  badge: '🟢', vram: '~2.5 GB',  note: 'Smaller/faster; good on CPU' },
-  { value: 'qwen',             label: 'Qwen TTS 1.7B',      badge: '🔴', vram: '~7.6 GB',  note: 'Best quality (slower)' },
+  { value: 'qwen',             label: 'Qwen TTS',            badge: '🔴', vram: '~2.5–7.6 GB', note: 'Best quality (Voicebox picks size)' },
   { value: 'chatterbox',       label: 'Chatterbox 3B',       badge: '🟡', vram: '~4 GB',    note: 'Good quality, moderate GPU' },
 ];
 
 // ── Helpers ────────────────────────────────────
+function normalizeEngineId(eng) {
+  // Voicebox dropped standalone qwen_fast; map for badges / clone UI.
+  if (eng === 'qwen_fast' || eng === 'qwen3') return 'qwen';
+  return eng;
+}
+
 function getVoiceEngine(voice) {
-  return voice?.preset_engine || voice?.default_engine || (voice?.voice_type === 'preset' ? 'kokoro' : 'qwen');
+  const raw = voice?.preset_engine || voice?.default_engine || (voice?.voice_type === 'preset' ? 'kokoro' : 'qwen');
+  return normalizeEngineId(raw);
 }
 
 function getEngineMeta(voice) {
@@ -671,17 +669,16 @@ async function desktopConfigPutPersonality(systemPrompt, profile, { personaKey =
     throw new Error('Hermes Desktop config API unavailable');
   }
   const p = normalizeHermesProfile(profile);
+  // Deep-merge PUT: only send fields we intend to set. Never clear
+  // display.personality with '' — that blanks the Desktop persona overlay and
+  // has confused the model/gateway UI after voice binding.
   const config = {
     agent: {
       system_prompt: systemPrompt,
     },
-    display: {
-      // Named key when we have one; blank clears a stale overlay.
-      personality: personaKey || '',
-    },
   };
   if (personaKey) {
-    // Ensure the gateway's allowlist sees this key before / with config.set.
+    config.display = { personality: personaKey };
     config.agent.personalities = {
       [personaKey]: systemPrompt,
     };

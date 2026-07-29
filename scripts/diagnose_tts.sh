@@ -129,6 +129,44 @@ else
   echo "Bridge not installed at $BRIDGE"
 fi
 
+step "10) MCP voicebox health"
+CONFIG_YAML="${HERMES_HOME:-$HERMES_DIR}/config.yaml"
+if [[ -f "$CONFIG_YAML" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$CONFIG_YAML" <<'PY' || true
+import sys
+from pathlib import Path
+try:
+    import yaml
+except ImportError:
+    print("DIAG: PyYAML missing; skip mcp_servers parse")
+    raise SystemExit(0)
+cfg = yaml.safe_load(Path(sys.argv[1]).read_text()) or {}
+mcp = (cfg.get("mcp_servers") or {})
+vb = mcp.get("voicebox") if isinstance(mcp, dict) else None
+print(f"mcp_servers.voicebox present={bool(vb)}")
+if isinstance(vb, dict):
+    print(f"  enabled={vb.get('enabled')}")
+    print(f"  command={vb.get('command')}")
+    print(f"  args={vb.get('args')}")
+PY
+  fi
+else
+  echo "DIAG: no config.yaml at $CONFIG_YAML"
+fi
+if command -v pgrep >/dev/null 2>&1; then
+  echo "mcp_shim processes:"
+  pgrep -af 'backend.mcp_shim|mcp_stdio_watchdog' || echo "  (none)"
+fi
+if command -v hermes >/dev/null 2>&1; then
+  set +e
+  hermes mcp list 2>&1 | head -30 || true
+  hermes mcp test voicebox 2>&1 | head -40 || true
+  set -e
+else
+  echo "DIAG: hermes CLI not on PATH — skip mcp test"
+fi
+
 step "Done"
 echo "Full trace saved to: $TRACE_LOG"
 echo "Paste this entire terminal output (or the log file) back to the agent."

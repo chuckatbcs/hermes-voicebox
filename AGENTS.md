@@ -16,10 +16,11 @@ Bounded local execution engineer for this repository unless explicitly assigned 
 |------|---------|
 | `desktop-plugin/plugin.js` | Hermes desktop plugin UI (voice select / clone / delete / personas; per-profile binding; `defaultEnabled: false`) |
 | `desktop-plugin/plugin_storage.mjs` | Storage/migration helpers (unit-tested; mirrored inline in `plugin.js`) |
-| `scripts/voicebox_tts.py` | Hermes TTS command bridge (clone sentence chunking + WAV merge) |
+| `scripts/voicebox_tts.py` | Hermes TTS command bridge (clone sentence chunking + WAV merge; CUDA OOM unload/retry at 0.6B) |
 | `scripts/hermes_voicebox_streamer.py` | Hermes speak-stream adapter (sentence PCM + look-ahead; installed as `voicebox_command_streamer.py`) |
 | `scripts/voicebox_bind.py` | CLI helper to bind voice → `$HERMES_HOME` config + `voicebox_binding.json` |
 | `scripts/voicebox_gpu.py` | GPU lifecycle: unload / idle / stop-on-Hermes-exit + localhost control API |
+| `scripts/diagnose_tts.sh` | TTS + GPU + MCP voicebox health trace |
 | `installer/systemd/voicebox-gpu-lifecycle.service` | Linux user unit for the lifecycle daemon |
 | `install.py` | Cross-platform installer entrypoint (`--profile` / `--all-profiles`) |
 | `install.sh` / `install.ps1` | OS launchers (bootstrap Python, then `install.py`) |
