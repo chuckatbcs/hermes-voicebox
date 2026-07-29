@@ -412,6 +412,7 @@ class SpeakStreamHookTests(unittest.TestCase):
             self.assertTrue(bridge.is_file())
             self.assertTrue((root / "scripts" / "voicebox_bind.py").is_file())
             self.assertTrue((root / "scripts" / "voicebox_gpu.py").is_file())
+            self.assertTrue((root / "scripts" / "diagnose_tts.sh").is_file())
             self.assertEqual(
                 install.install_gpu_lifecycle(root, enable=True),
                 "config_only_non_default_home",

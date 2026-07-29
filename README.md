@@ -4,14 +4,19 @@ Cross-platform integration between the **Hermes Desktop Client** and **Voicebox 
 
 ## Features
 
-- **Smart Engine Routing** for Kokoro / Chatterbox / Qwen profiles
+- **Smart Engine Routing** for Kokoro / Chatterbox / Qwen profiles (deprecated `qwen_fast` / `qwen3` remapped to `qwen`)
+- **Laptop-safe Qwen default** — bridge sends `model_size=0.6B` unless `VOICEBOX_QWEN_MODEL_SIZE` overrides (avoids CUDA OOM on ~8 GiB GPUs)
+- **CUDA OOM recovery** — on out-of-memory, unload Voicebox models, force 0.6B, retry once; hints for Free GPU / service restart when unload is a no-op
+- **Stage-direction sanitization** — strips `[acting notes]`, theatrical `(parens)`, and `*emphasis*` so Qwen does not speak markup aloud (keeps Chatterbox tags like `[laugh]`)
 - **Sentence chunking & WAV merging** for long AI responses (clone engines speak one sentence per request so Chatterbox early-stops don't truncate the rest)
 - **Desktop speak-stream hook** so read-aloud starts on the first sentence and look-ahead-synthesizes the next while the current one plays (plus a 600s command TTS timeout)
+- **Per-profile voice + persona binding** — Desktop selection writes profile-scoped config + `$HERMES_HOME/voicebox_binding.json` (does not clear `display.personality` or prefer Voicebox’s process-global active voice)
 - **GPU lifecycle** — Free GPU button, idle unload (~15 min after last TTS), and optional Voicebox stop when Hermes Desktop quits
 - **In-plugin microphone recording** (plus native OS file picker) for voice cloning samples
 - **Fun sample persona voices** (Vincent Price, Porky Pig, Cartman, Jarvis, GLaDOS) seeded as parody templates with Hermes `/personality` keys — not official voice clones / no copyrighted audio bundled
 - **Safe two-step voice deletion**
 - **Installer that checks prerequisites and provisions what’s missing** (Hermes, Voicebox, TTS models)
+- **Diagnose script** — TTS + GPU + MCP `voicebox` health (`scripts/diagnose_tts.sh`, also installed under `~/.hermes/scripts/`)
 
 ---
 
@@ -108,6 +113,17 @@ python install.py -y
 
 Bridge voice precedence: CLI `--voice` → `$HERMES_HOME/voicebox_binding.json` (or legacy `voicebox_active_voice.json`) → Voicebox active-voice (demoted) → first Voicebox profile.
 
+### TTS bridge behavior
+
+| Concern | Behavior |
+|---------|----------|
+| Engine ids | `qwen_fast` / `qwen3` → `qwen` before `/generate` |
+| Qwen VRAM | Default `model_size=0.6B`; override with `VOICEBOX_QWEN_MODEL_SIZE=1.7B` (or `0.6B`) |
+| Spoken text | Strips stage directions / emphasis markup; keeps Chatterbox paralinguistic tags |
+| CUDA OOM | Unload via `/models/*/unload` + `/models/unload`, force 0.6B, retry once |
+| Stuck VRAM | If unload does not free memory, `systemctl --user restart voicebox.service` (or plugin Free GPU then restart) |
+| Activity stamp | Updates `$HERMES_HOME/voicebox_tts_activity` so idle GPU unload does not race mid-speak |
+
 CLI bind helper (for gateway / other apps):
 
 ```bash
@@ -200,10 +216,15 @@ Windows: use the plugin button / CLI; the systemd unit is Linux-only (you can st
 ### Diagnose script
 
 ```bash
+# From the repo:
 bash scripts/diagnose_tts.sh [voice-profile-uuid]
+# After install:
+bash ~/.hermes/scripts/diagnose_tts.sh [voice-profile-uuid]
 ```
 
 Checks Voicebox `/health`, GPU/`nvidia-smi`, profile metadata, a direct `/generate/stream` smoke test, the installed bridge, and **MCP `voicebox`** (`hermes mcp list` / `hermes mcp test voicebox` + shim process presence).
+
+Optional MCP (Hermes `mcp_servers.voicebox` → Voicebox `backend.mcp_shim`) is separate from command TTS: the bridge always talks HTTP to `:17493`; MCP exposes `voicebox.speak` / `transcribe` / `list_*` tools when configured and connected.
 
 ---
 

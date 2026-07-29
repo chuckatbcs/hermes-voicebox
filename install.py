@@ -531,6 +531,7 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     bind_src = src_root / "scripts" / "voicebox_bind.py"
     streamer_src = src_root / "scripts" / "hermes_voicebox_streamer.py"
     gpu_src = src_root / "scripts" / "voicebox_gpu.py"
+    diagnose_src = src_root / "scripts" / "diagnose_tts.sh"
 
     if not plugin_src.is_file():
         raise FileNotFoundError(f"Missing plugin source: {plugin_src}")
@@ -542,6 +543,8 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
         raise FileNotFoundError(f"Missing speak-stream source: {streamer_src}")
     if not gpu_src.is_file():
         raise FileNotFoundError(f"Missing GPU lifecycle source: {gpu_src}")
+    if not diagnose_src.is_file():
+        raise FileNotFoundError(f"Missing diagnose script source: {diagnose_src}")
 
     plugin_dst_dir = hermes_dir / "desktop-plugins" / PLUGIN_ID
     scripts_dst_dir = hermes_dir / "scripts"
@@ -552,6 +555,7 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     bridge_dst = scripts_dst_dir / "voicebox_tts.py"
     bind_dst = scripts_dst_dir / "voicebox_bind.py"
     gpu_dst = scripts_dst_dir / "voicebox_gpu.py"
+    diagnose_dst = scripts_dst_dir / "diagnose_tts.sh"
 
     # Copy plugin entry + companion modules/assets
     for src in plugin_src_dir.iterdir():
@@ -561,8 +565,9 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     shutil.copy2(bridge_src, bridge_dst)
     shutil.copy2(bind_src, bind_dst)
     shutil.copy2(gpu_src, gpu_dst)
+    shutil.copy2(diagnose_src, diagnose_dst)
     if platform.system() != "Windows":
-        for path in (bridge_dst, bind_dst, gpu_dst):
+        for path in (bridge_dst, bind_dst, gpu_dst, diagnose_dst):
             path.chmod(path.stat().st_mode | 0o111)
 
     return plugin_dst, bridge_dst
