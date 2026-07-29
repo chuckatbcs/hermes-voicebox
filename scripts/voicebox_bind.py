@@ -148,7 +148,7 @@ def set_tts_voice_in_config(config_path: Path, voice_id: str) -> str:
         # Marker block exists but no voice line — insert under voicebox provider.
         insert = re.sub(
             r"(providers:\s*\n\s*voicebox:\s*\n)",
-            rf"\1      voice: {voice_id}\n",
+            rf"\g<1>      voice: {voice_id}\n",
             block,
             count=1,
         )
@@ -157,9 +157,11 @@ def set_tts_voice_in_config(config_path: Path, voice_id: str) -> str:
             return "appended_voice"
 
     # Unmarked voicebox provider
+    # Use \g<n> so UUIDs that start with a digit (e.g. 5d06…) are not parsed as
+    # group references like \25 when concatenated after \2.
     new_text, n = re.subn(
         r"(providers:\s*\n\s*voicebox:(?:\n[ \t]+[^\n]*)*?)\n([ \t]+voice:[ \t]*).*$",
-        rf"\1\n\2{voice_id}",
+        rf"\g<1>\n\g<2>{voice_id}",
         text,
         count=1,
         flags=re.MULTILINE,
@@ -171,7 +173,7 @@ def set_tts_voice_in_config(config_path: Path, voice_id: str) -> str:
     # Has voicebox provider but no voice key
     new_text, n = re.subn(
         r"(providers:\s*\n\s*voicebox:\s*\n)",
-        rf"\1      voice: {voice_id}\n",
+        rf"\g<1>      voice: {voice_id}\n",
         text,
         count=1,
     )

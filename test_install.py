@@ -248,6 +248,34 @@ class VoiceBindTests(unittest.TestCase):
             self.assertIn("voice: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", text)
             self.assertNotIn("voice: default", text)
 
+    def test_bind_digit_leading_uuid_on_unmarked_config(self):
+        """Regression: re.sub \\2 + '5d06…' must not become group reference 25."""
+        import sys
+        scripts = Path(__file__).resolve().parent / "scripts"
+        sys.path.insert(0, str(scripts))
+        import voicebox_bind  # noqa: E402
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cfg = home / "config.yaml"
+            cfg.write_text(
+                "tts:\n"
+                "  provider: voicebox\n"
+                "  providers:\n"
+                "    voicebox:\n"
+                "      type: command\n"
+                "      voice: default\n"
+                "      output_format: wav\n"
+                "      timeout: 600\n",
+                encoding="utf-8",
+            )
+            vid = "5d06502a-7a16-4d3a-91f7-54dec8e85179"
+            info = voicebox_bind.bind_voice(vid, persona_key="jarvis", home=home)
+            self.assertEqual(info["config"], "updated")
+            text = cfg.read_text(encoding="utf-8")
+            self.assertIn(f"voice: {vid}", text)
+            self.assertNotIn("voice: default", text)
+
 
 class TimeoutEnsureTests(unittest.TestCase):
     def test_inserts_timeout_under_providers_voicebox(self):
