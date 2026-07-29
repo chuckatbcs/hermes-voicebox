@@ -75,6 +75,8 @@ Before claiming complete, run applicable checks:
 
 - Python syntax: `python3 -m py_compile scripts/voicebox_tts.py scripts/voicebox_bind.py scripts/voicebox_gpu.py scripts/hermes_voicebox_streamer.py install.py installer/prereqs.py`
 - Unit tests: `python3 -m unittest test_install.py -v` and `cd scripts && python3 -m unittest test_voicebox_tts.py test_voicebox_gpu.py -v`
+- Plugin storage: `node --test desktop-plugin/test_plugin_storage.mjs`
+- Root-to-tip E2E (multi-profile install/bind/idempotency): `python3 scripts/test_e2e_root_to_tip.py`
 - Installer smoke test: `./install.sh --hermes-dir <tmpdir> --skip-prereqs`
 - Manual sanity review of plugin fetch/error paths when UI tests are unavailable
 

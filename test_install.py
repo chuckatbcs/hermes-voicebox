@@ -532,6 +532,67 @@ class PersonalitiesMergeTests(unittest.TestCase):
             self.assertIn("cartman", personalities)
             self.assertIn("glados", personalities)
 
+    def test_skips_when_markers_stripped_but_keys_exist(self):
+        """Hermes often strips # BEGIN markers; re-install must not duplicate keys."""
+        samples = install.load_sample_voices(Path(__file__).resolve().parent)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.yaml"
+            # Simulate post-Hermes-rewrite: personalities present, markers gone.
+            body = ["agent:", "  personalities:"]
+            for s in samples:
+                body.append(f"    {s['key']}: |")
+                body.append(f"      {s['personality'][:40]}")
+            cfg.write_text("\n".join(body) + "\n", encoding="utf-8")
+            before = cfg.read_text(encoding="utf-8")
+            result = install.merge_personalities_config(cfg, samples)
+            self.assertEqual(result, "skipped_existing")
+            after = cfg.read_text(encoding="utf-8")
+            self.assertEqual(before, after)
+            for s in samples:
+                self.assertEqual(after.count(f"{s['key']}:"), 1)
+
+    def test_rerun_with_markers_replaces_not_duplicates(self):
+        samples = install.load_sample_voices(Path(__file__).resolve().parent)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.yaml"
+            cfg.write_text("agent:\n  model: keep-me\n", encoding="utf-8")
+            r1 = install.merge_personalities_config(cfg, samples)
+            self.assertEqual(r1, "inserted_under_agent")
+            r2 = install.merge_personalities_config(cfg, samples)
+            self.assertEqual(r2, "replaced")
+            text = cfg.read_text(encoding="utf-8")
+            self.assertEqual(text.count("vincent_price:"), 1)
+            self.assertEqual(text.count("jarvis:"), 1)
+            self.assertIn("keep-me", text)
+
+    def test_appended_agent_snippet_after_tts_replaces_cleanly(self):
+        """Markers after a TTS providers block must replace, not false-repair."""
+        samples = install.load_sample_voices(Path(__file__).resolve().parent)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.yaml"
+            cfg.write_text(
+                "# BEGIN hermes-voicebox\n"
+                "tts:\n"
+                "  provider: voicebox\n"
+                "  providers:\n"
+                "    voicebox:\n"
+                "      type: command\n"
+                "      voice: default\n"
+                "      timeout: 600\n"
+                "# END hermes-voicebox\n",
+                encoding="utf-8",
+            )
+            r1 = install.merge_personalities_config(cfg, samples)
+            self.assertEqual(r1, "appended")
+            r2 = install.merge_personalities_config(cfg, samples)
+            self.assertEqual(r2, "replaced")
+            text = cfg.read_text(encoding="utf-8")
+            data = __import__("yaml").safe_load(text)
+            self.assertEqual(text.count("vincent_price:"), 1)
+            self.assertEqual(text.count("jarvis:"), 1)
+            self.assertIn("voicebox", data["tts"]["providers"])
+            self.assertIn("jarvis", data["agent"]["personalities"])
+
 
 if __name__ == "__main__":
     unittest.main()

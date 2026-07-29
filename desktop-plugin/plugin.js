@@ -626,14 +626,63 @@ async function loadActiveVoice(signal, profile) {
   return '';
 }
 
+async function configSetPersonality(value, sessionId) {
+  const attempts = [];
+  // Prefer with session when present; always retry without — some gateway
+  // sessions reject personality updates while profile-scoped still works.
+  if (sessionId) {
+    attempts.push({ key: 'personality', value, session_id: sessionId });
+  }
+  attempts.push({ key: 'personality', value });
+  let lastErr = null;
+  for (const payload of attempts) {
+    try {
+      await host.request('config.set', payload);
+      return true;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  if (lastErr) throw lastErr;
+  return false;
+}
+
+async function desktopConfigPutPersonality(systemPrompt, profile) {
+  if (!desktopApiAvailable()) {
+    throw new Error('Hermes Desktop config API unavailable');
+  }
+  const p = normalizeHermesProfile(profile);
+  const opts = {
+    path: '/api/config',
+    method: 'PUT',
+    body: {
+      config: {
+        personality: systemPrompt,
+        agent: {
+          system_prompt: systemPrompt,
+        },
+      },
+    },
+  };
+  opts.profile = p;
+  await window.hermesDesktop.api(opts);
+  return 'desktop-put';
+}
+
 /**
  * Apply a voice persona the Hermes-native way:
  * 1) config.set personality=<named key>  (same as /personality <key>)
  * 2) fallback to full prompt text if the named key is not registered yet
- * 3) also set agent.system_prompt (Desktop has historically ignored display-only personality)
+ * 3) Desktop PUT /api/config fallback (profile-scoped) when gateway config.set fails
+ * 4) also set agent.system_prompt (Desktop has historically ignored display-only personality)
+ *
+ * When the Hermes profile name equals the persona key (e.g. profile "jarvis" +
+ * sample key "jarvis"), prefer prompt-text first — named `personality=jarvis`
+ * has been observed to fail while other sample keys succeed on that profile.
  */
 async function applyHermesPersona({ key, prompt, voiceName }) {
   const sessionId = host.state?.activeSessionId?.get();
+  const hermesProfile = normalizeHermesProfile(host.state?.profile);
   const modes = [];
   const cleanPrompt = displayPersonaPrompt(prompt) || prompt;
   const sample = key ? SAMPLE_VOICES.find((s) => s.key === key) : null;
@@ -641,35 +690,51 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
     ? samplePersonalityForHermes({ ...sample, personality: cleanPrompt })
     : cleanPrompt;
 
-  // Named keys match /personality — but many Desktop sessions 404 until restart
-  // after installer merge. Prefer named, then fall back to full prompt text.
-  // Never set named *after* prompt-text (that overwrites a working prompt).
+  const keyCollidesWithProfile = Boolean(
+    key && normalizeHermesProfile(key) === hermesProfile
+  );
+
   let personalitySet = false;
-  if (key) {
+
+  const tryNamed = async () => {
+    if (!key || personalitySet) return;
     try {
-      await host.request('config.set', {
-        key: 'personality',
-        value: key,
-        session_id: sessionId || undefined,
-      });
+      await configSetPersonality(key, sessionId);
       modes.push(`named:${key}`);
       personalitySet = true;
     } catch (err) {
       console.warn('Named personality set skipped:', err);
     }
-  }
+  };
 
-  if (!personalitySet) {
+  const tryPromptText = async () => {
+    if (personalitySet) return;
     try {
-      await host.request('config.set', {
-        key: 'personality',
-        value: systemPrompt,
-        session_id: sessionId || undefined,
-      });
+      await configSetPersonality(systemPrompt, sessionId);
       modes.push('prompt-text');
       personalitySet = true;
     } catch (err) {
       console.warn('Prompt-text personality set failed:', err);
+    }
+  };
+
+  // Collision: skip named-first (profile "jarvis" + key "jarvis").
+  if (keyCollidesWithProfile) {
+    modes.push('collision-prompt-first');
+    await tryPromptText();
+    await tryNamed();
+  } else {
+    await tryNamed();
+    await tryPromptText();
+  }
+
+  if (!personalitySet) {
+    try {
+      const via = await desktopConfigPutPersonality(systemPrompt, hermesProfile);
+      modes.push(via);
+      personalitySet = true;
+    } catch (err) {
+      console.warn('Desktop PUT personality failed:', err);
     }
   }
 
@@ -678,11 +743,19 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
   }
 
   try {
-    await host.request('config.set', {
+    const payload = {
       key: 'agent.system_prompt',
       value: systemPrompt,
-      session_id: sessionId || undefined,
-    });
+    };
+    if (sessionId) {
+      try {
+        await host.request('config.set', { ...payload, session_id: sessionId });
+      } catch (_) {
+        await host.request('config.set', payload);
+      }
+    } else {
+      await host.request('config.set', payload);
+    }
     modes.push('agent.system_prompt');
   } catch (err) {
     console.warn('agent.system_prompt update skipped:', err);

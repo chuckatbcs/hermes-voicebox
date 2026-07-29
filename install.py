@@ -424,10 +424,18 @@ def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
         # If markers sit under tts.providers (no agent.personalities parent),
         # drop the marked block and append a proper agent.personalities snippet.
         pre = original.split(PERSONA_MARKER_BEGIN, 1)[0].rstrip()
+        between = original.split(PERSONA_MARKER_BEGIN, 1)[1].split(PERSONA_MARKER_END, 1)[0]
         post = original.split(PERSONA_MARKER_END, 1)[1].lstrip("\n")
         pre_tail = "\n".join(pre.splitlines()[-8:])
-        under_providers = bool(re.search(r"(?m)^[ \t]+providers:\s*$", pre_tail)) and (
-            "agent:" not in pre_tail and "personalities:" not in pre_tail
+        # Markers wrapping a top-level `agent:` snippet (common after `appended`)
+        # must NOT be treated as under providers — the TTS `providers:` key often
+        # appears in the preceding tail and caused false repairs on every re-install.
+        marked_is_agent_doc = bool(re.search(r"(?m)^agent:\s*$", between))
+        under_providers = (
+            not marked_is_agent_doc
+            and bool(re.search(r"(?m)^[ \t]+providers:\s*$", pre_tail))
+            and "agent:" not in pre_tail
+            and "personalities:" not in pre_tail
         )
         if under_providers:
             cleaned = (pre + ("\n" + post if post else "\n")).rstrip() + "\n\n"
@@ -437,7 +445,14 @@ def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
             )
             return "repaired_providers_nesting"
 
-        merged = (pre + "\n" if pre else "") + entries + ("\n" + post if post else "\n")
+        # Replace marked body. If the old marked region was a full agent: doc
+        # (from build_personalities_snippet), keep that shape instead of the
+        # indented-entries-only form used under agent.personalities.
+        if marked_is_agent_doc:
+            replacement = build_personalities_snippet(samples).rstrip() + "\n"
+        else:
+            replacement = entries + "\n"
+        merged = (pre + "\n" if pre else "") + replacement + (post if post else "")
         merged = re.sub(r"(?m)^-personalities\s*\n", "", merged)
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
         return "replaced"
@@ -468,9 +483,29 @@ def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
     personalities_hdr = re.search(r"(?m)^([ \t]*)personalities:\s*$", original)
     agent_hdr = re.search(r"(?m)^agent:\s*$", original)
 
+    def _sample_keys_present(text: str) -> set[str]:
+        """Keys already defined under a personalities mapping (markers may be gone)."""
+        found: set[str] = set()
+        for key in sample_keys:
+            if not key:
+                continue
+            # Match `    jarvis: |` / `    jarvis: "..."` / `    jarvis:` blocks.
+            if re.search(rf"(?m)^[ \t]+{re.escape(key)}:\s*(?:\||[\"'].*|[|>].*)?$", text):
+                found.add(key)
+        return found
+
     if personalities_hdr:
-        # entries use 4-space keys, matching typical `agent: / personalities:` nesting
-        block = entries
+        present = _sample_keys_present(original)
+        missing = {k for k in sample_keys if k and k not in present}
+        # Hermes Desktop often strips our # BEGIN/# END comment markers on rewrite.
+        # Re-inserting the full block every install duplicated keys and bloated
+        # config.yaml (seen at 2.7k+ lines) — skip when all samples already exist.
+        if not missing:
+            return "repaired_providers_nesting" if changed else "skipped_existing"
+
+        # Only append missing sample keys (keep markers so a later run can replace).
+        missing_samples = [s for s in samples if s.get("key") in missing]
+        block = build_personalities_entries(missing_samples)
         insert_at = personalities_hdr.end()
         merged = original[:insert_at] + "\n" + block + original[insert_at:]
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
