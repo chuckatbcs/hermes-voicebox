@@ -343,6 +343,55 @@ def build_personalities_snippet(samples: list[dict]) -> str:
     )
 
 
+def _strip_persona_keys_from_tts_providers(text: str, sample_keys: set[str]) -> tuple[str, bool]:
+    """
+    Remove sample-persona keys wrongly nested under tts.providers.* (a known
+    corruption from marker replace / Hermes config rewrite). Returns (text, changed).
+    """
+    if not sample_keys or "tts:" not in text:
+        return text, False
+    try:
+        import yaml  # local import: installer already depends on PyYAML via Hermes env or std path
+    except ImportError:
+        return text, False
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        return text, False
+    if not isinstance(data, dict):
+        return text, False
+    tts = data.get("tts")
+    if not isinstance(tts, dict):
+        return text, False
+    providers = tts.get("providers")
+    if not isinstance(providers, dict):
+        return text, False
+    removed = [k for k in list(providers) if k in sample_keys or (
+        k != "voicebox" and isinstance(providers.get(k), str)
+    )]
+    if not removed:
+        return text, False
+    stolen: dict[str, str] = {}
+    for k in removed:
+        val = providers.pop(k, None)
+        if isinstance(val, str) and val.strip():
+            stolen[k] = val
+    tts["providers"] = providers
+    data["tts"] = tts
+    if stolen:
+        agent = data.get("agent")
+        if not isinstance(agent, dict):
+            agent = {}
+            data["agent"] = agent
+        personalities = agent.get("personalities")
+        if not isinstance(personalities, dict):
+            personalities = {}
+            agent["personalities"] = personalities
+        for key, val in stolen.items():
+            personalities.setdefault(key, val)
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=1000), True
+
+
 def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
     """
     Upsert sample personalities under agent.personalities without clobbering
@@ -351,6 +400,7 @@ def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
     if not samples:
         return "skipped_empty"
 
+    sample_keys = {str(s.get("key") or "") for s in samples if s.get("key")}
     entries = build_personalities_entries(samples)
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -365,14 +415,54 @@ def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
     # marker block (invalid YAML; Hermes then wipes config on update).
     original = re.sub(r"(?m)^-personalities\s*\n", "", original)
 
+    # Repair personas wrongly nested under tts.providers (breaks profile updates).
+    repaired, changed = _strip_persona_keys_from_tts_providers(original, sample_keys)
+    if changed:
+        original = repaired
+
     if PERSONA_MARKER_BEGIN in original and PERSONA_MARKER_END in original:
+        # If markers sit under tts.providers (no agent.personalities parent),
+        # drop the marked block and append a proper agent.personalities snippet.
         pre = original.split(PERSONA_MARKER_BEGIN, 1)[0].rstrip()
         post = original.split(PERSONA_MARKER_END, 1)[1].lstrip("\n")
-        # Keep surrounding structure; replace only marked entries block.
+        pre_tail = "\n".join(pre.splitlines()[-8:])
+        under_providers = bool(re.search(r"(?m)^[ \t]+providers:\s*$", pre_tail)) and (
+            "agent:" not in pre_tail and "personalities:" not in pre_tail
+        )
+        if under_providers:
+            cleaned = (pre + ("\n" + post if post else "\n")).rstrip() + "\n\n"
+            cleaned += build_personalities_snippet(samples)
+            config_path.write_text(
+                cleaned if cleaned.endswith("\n") else cleaned + "\n", encoding="utf-8"
+            )
+            return "repaired_providers_nesting"
+
         merged = (pre + "\n" if pre else "") + entries + ("\n" + post if post else "\n")
         merged = re.sub(r"(?m)^-personalities\s*\n", "", merged)
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
         return "replaced"
+
+    # After YAML rewrite stripped markers but left persona keys under providers.
+    if changed:
+        # Ensure agent.personalities exists via append path below if needed.
+        if re.search(r"(?m)^agent:\s*$", original) and re.search(
+            r"(?m)^[ \t]*personalities:\s*$", original
+        ):
+            pass
+        elif re.search(r"(?m)^agent:\s*$", original):
+            agent_hdr = re.search(r"(?m)^agent:\s*$", original)
+            assert agent_hdr is not None
+            insert_at = agent_hdr.end()
+            block = "\n  personalities:\n" + entries + "\n"
+            merged = original[:insert_at] + block + original[insert_at:]
+            config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
+            return "repaired_providers_nesting"
+        else:
+            appended = original.rstrip() + "\n\n" + build_personalities_snippet(samples)
+            config_path.write_text(
+                appended if appended.endswith("\n") else appended + "\n", encoding="utf-8"
+            )
+            return "repaired_providers_nesting"
 
     # Insert under existing agent.personalities: if present.
     personalities_hdr = re.search(r"(?m)^([ \t]*)personalities:\s*$", original)
@@ -384,19 +474,19 @@ def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
         insert_at = personalities_hdr.end()
         merged = original[:insert_at] + "\n" + block + original[insert_at:]
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
-        return "inserted_personalities"
+        return "repaired_providers_nesting" if changed else "inserted_personalities"
 
     if agent_hdr:
         insert_at = agent_hdr.end()
         block = "\n  personalities:\n" + entries + "\n"
         merged = original[:insert_at] + block + original[insert_at:]
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
-        return "inserted_under_agent"
+        return "repaired_providers_nesting" if changed else "inserted_under_agent"
 
     # No agent section — append a complete one (safe: nothing to clobber).
     appended = original.rstrip() + "\n\n" + build_personalities_snippet(samples)
     config_path.write_text(appended if appended.endswith("\n") else appended + "\n", encoding="utf-8")
-    return "appended"
+    return "repaired_providers_nesting" if changed else "appended"
 
 
 def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
@@ -594,13 +684,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--profile",
         default=None,
-        help="Merge TTS config into Hermes Desktop profile home "
+        help="Install plugin/scripts + merge TTS into one Hermes Desktop profile home "
         "(default → ~/.hermes; other names → ~/.hermes/profiles/<name>)",
     )
     parser.add_argument(
         "--all-profiles",
         action="store_true",
-        help="Merge Voicebox TTS into default + every ~/.hermes/profiles/* config.yaml",
+        help="Install plugin/scripts + merge TTS into default and every "
+        "~/.hermes/profiles/* home (Desktop loads plugins per profile HERMES_HOME)",
     )
     parser.add_argument(
         "--base-url",
@@ -679,7 +770,8 @@ def main(argv: list[str] | None = None) -> int:
         resolve_profile_hermes_dir(args.profile, root_hermes) if args.profile else root_hermes
     )
     python_cmd = find_python_command() or ("python" if platform.system() == "Windows" else "python3")
-    # Plugin + bridge always install under the root Hermes dir (Desktop loads them once).
+    # Root keeps shared speak-stream / GPU lifecycle. Desktop loads plugins from each
+    # profile's HERMES_HOME, so --profile / --all-profiles also copy plugin+scripts there.
     install_root = root_hermes
     bridge_path = install_root / "scripts" / "voicebox_tts.py"
     snippet = build_snippet(python_cmd, bridge_path)
@@ -726,6 +818,15 @@ def main(argv: list[str] | None = None) -> int:
                 print("ERROR: Prerequisites failed; aborting.", file=sys.stderr)
                 return 1
 
+    if args.all_profiles:
+        config_homes = list_profile_hermes_dirs(install_root)
+    elif args.profile:
+        hermes_dir.mkdir(parents=True, exist_ok=True)
+        config_homes = [hermes_dir]
+    else:
+        config_homes = [install_root]
+
+    # Always refresh root first (shared bridge path in TTS snippet + speak-stream).
     plugin_dst, bridge_dst = install_files(src_root, install_root)
     verify_install(plugin_dst, bridge_dst)
     print(f"Installed plugin: {plugin_dst}")
@@ -736,6 +837,16 @@ def main(argv: list[str] | None = None) -> int:
     gpu_dst = install_root / "scripts" / "voicebox_gpu.py"
     if gpu_dst.is_file():
         print(f"Installed GPU helper: {gpu_dst}")
+
+    for home in config_homes:
+        if home == install_root:
+            continue
+        home.mkdir(parents=True, exist_ok=True)
+        p_dst, b_dst = install_files(src_root, home)
+        verify_install(p_dst, b_dst)
+        label = home.name
+        print(f"[{label}] Installed plugin: {p_dst}")
+        print(f"[{label}] Installed bridge: {b_dst}")
 
     if not args.skip_gpu_lifecycle:
         gpu_status = install_gpu_lifecycle(
@@ -772,14 +883,6 @@ def main(argv: list[str] | None = None) -> int:
     if persona_snippet.strip():
         persona_snippet_path.write_text(persona_snippet, encoding="utf-8")
         print(f"Wrote personas:   {persona_snippet_path}")
-
-    if args.all_profiles:
-        config_homes = list_profile_hermes_dirs(install_root)
-    elif args.profile:
-        hermes_dir.mkdir(parents=True, exist_ok=True)
-        config_homes = [hermes_dir]
-    else:
-        config_homes = [install_root]
 
     if args.no_config:
         print("Skipped config.yaml (--no-config).")
@@ -834,7 +937,10 @@ def main(argv: list[str] | None = None) -> int:
         f"  • Long read-aloud starts per sentence via speak-stream; "
         f"command timeout is {COMMAND_TTS_TIMEOUT_SECONDS}s"
     )
-    print("  • For other profiles: python install.py --skip-prereqs --profile <name>  (or --all-profiles)")
+    print(
+        "  • New Hermes profiles: python install.py --skip-prereqs --all-profiles "
+        "(copies plugin into each profile’s desktop-plugins/)"
+    )
     print("  • CLI bind: HERMES_HOME=~/.hermes/profiles/<name> python3 scripts/voicebox_bind.py --voice <uuid>")
     print(
         "  • After a Hermes Agent update, re-run: "

@@ -14,7 +14,8 @@ Bounded local execution engineer for this repository unless explicitly assigned 
 
 | Path | Purpose |
 |------|---------|
-| `desktop-plugin/plugin.js` | Hermes desktop plugin UI (voice select / clone / delete / personas; per-profile binding) |
+| `desktop-plugin/plugin.js` | Hermes desktop plugin UI (voice select / clone / delete / personas; per-profile binding; `defaultEnabled: false`) |
+| `desktop-plugin/plugin_storage.mjs` | Storage/migration helpers (unit-tested; mirrored inline in `plugin.js`) |
 | `scripts/voicebox_tts.py` | Hermes TTS command bridge (clone sentence chunking + WAV merge) |
 | `scripts/hermes_voicebox_streamer.py` | Hermes speak-stream adapter (sentence PCM + look-ahead; installed as `voicebox_command_streamer.py`) |
 | `scripts/voicebox_bind.py` | CLI helper to bind voice → `$HERMES_HOME` config + `voicebox_binding.json` |

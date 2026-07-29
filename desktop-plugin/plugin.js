@@ -1,15 +1,106 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, host } from '@hermes/plugin-sdk';
 
+const PLUGIN_ID = 'voice-switcher';
 const DEFAULT_BACKEND_URL = 'http://127.0.0.1:17493';
 const GPU_CONTROL_URL = 'http://127.0.0.1:17494';
 const PERSONA_DEBOUNCE_MS = 400;
 const MIN_SAMPLE_SECONDS = 2;
 const MAX_SAMPLE_SECONDS = 120;
-const LS_STOP_ON_EXIT = 'voicebox_stop_on_hermes_exit';
 
 // Sample voices are inlined (Hermes plugin loader may not resolve relative imports).
+// Storage helpers below are mirrored in plugin_storage.mjs for unit tests.
 const SAMPLE_SEED_MARKER = 'hermes-voicebox-sample';
+
+const LEGACY_LS = {
+  activeVoicePrefix: 'voicebox_active_voice_id',
+  activeVoiceUnscoped: 'voicebox_active_voice_id',
+  dismissedPrefix: 'voicebox_dismissed_sample_keys',
+  dismissedUnscoped: 'voicebox_dismissed_sample_keys',
+  backendUrl: 'voicebox_backend_url',
+  stopOnExit: 'voicebox_stop_on_hermes_exit',
+  personas: 'hermes_personas',
+};
+
+/** Same key layout as Hermes ctx.storage (hermes.plugin.<id>.<key>). */
+function makeLsPluginStorage() {
+  const scoped = (key) => `hermes.plugin.${PLUGIN_ID}.${key}`;
+  return {
+    get(key, fallback) {
+      try {
+        const raw = localStorage.getItem(scoped(key));
+        if (raw == null) return fallback;
+        return JSON.parse(raw);
+      } catch (_) {
+        return fallback;
+      }
+    },
+    set(key, value) {
+      try {
+        localStorage.setItem(scoped(key), JSON.stringify(value));
+      } catch (_) {}
+    },
+    remove(key) {
+      try {
+        localStorage.removeItem(scoped(key));
+      } catch (_) {}
+    },
+  };
+}
+
+// Prefer ctx.storage once register() runs; LS shim keeps the same keys before that.
+let pluginStore = makeLsPluginStorage();
+
+function lsGetRaw(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (_) {
+    return null;
+  }
+}
+
+function activeVoiceStoreKey(profile) {
+  return `active_voice:${normalizeHermesProfile(profile)}`;
+}
+
+function dismissedSamplesStoreKey(profile) {
+  return `dismissed_samples:${normalizeHermesProfile(profile)}`;
+}
+
+function migrateLegacyStorage(storage) {
+  const migrateString = (legacyKey, storeKey) => {
+    const cur = storage.get(storeKey, null);
+    if (cur != null && cur !== '') return;
+    const raw = lsGetRaw(legacyKey);
+    if (raw == null || raw === '') return;
+    storage.set(storeKey, raw);
+  };
+  const migrateJson = (legacyKey, storeKey, fallback) => {
+    const cur = storage.get(storeKey, null);
+    if (cur != null) return;
+    const raw = lsGetRaw(legacyKey);
+    if (raw == null || raw === '') return;
+    try {
+      storage.set(storeKey, JSON.parse(raw));
+    } catch (_) {
+      storage.set(storeKey, fallback);
+    }
+  };
+  migrateString(LEGACY_LS.activeVoiceUnscoped, activeVoiceStoreKey('default'));
+  migrateJson(LEGACY_LS.dismissedUnscoped, dismissedSamplesStoreKey('default'), []);
+  migrateString(LEGACY_LS.backendUrl, 'backend_url');
+  const stopRaw = lsGetRaw(LEGACY_LS.stopOnExit);
+  if (storage.get('stop_on_hermes_exit', null) == null && (stopRaw === '0' || stopRaw === '1')) {
+    storage.set('stop_on_hermes_exit', stopRaw === '1');
+  }
+  migrateJson(LEGACY_LS.personas, 'personas', {});
+}
+
+function normalizeHermesProfile(name) {
+  const value = String(name ?? '').trim();
+  return value || 'default';
+}
+
 const SAMPLE_VOICES = [
   {
     key: 'vincent_price',
@@ -85,16 +176,6 @@ function sameVoiceId(a, b) {
   return String(a ?? '') !== '' && String(a) === String(b);
 }
 
-const ACTIVE_VOICE_LS_PREFIX = 'voicebox_active_voice_id';
-const DISMISSED_SAMPLES_PREFIX = 'voicebox_dismissed_sample_keys';
-const LEGACY_ACTIVE_VOICE_LS_KEY = 'voicebox_active_voice_id';
-const LEGACY_DISMISSED_SAMPLES_KEY = 'voicebox_dismissed_sample_keys';
-
-function normalizeHermesProfile(name) {
-  const value = String(name ?? '').trim();
-  return value || 'default';
-}
-
 function currentHermesProfile() {
   try {
     const raw = host.state?.profile?.get?.();
@@ -104,68 +185,68 @@ function currentHermesProfile() {
   }
 }
 
-function activeVoiceLsKey(profile) {
-  return `${ACTIVE_VOICE_LS_PREFIX}:${normalizeHermesProfile(profile)}`;
-}
-
-function dismissedSamplesLsKey(profile) {
-  return `${DISMISSED_SAMPLES_PREFIX}:${normalizeHermesProfile(profile)}`;
-}
-
 function readLocalActiveVoice(profile) {
-  const key = activeVoiceLsKey(profile);
-  try {
-    const scoped = String(localStorage.getItem(key) || '');
-    if (scoped) return scoped;
-    // One-time migrate unscoped legacy key into the default profile.
-    if (normalizeHermesProfile(profile) === 'default') {
-      const legacy = String(localStorage.getItem(LEGACY_ACTIVE_VOICE_LS_KEY) || '');
-      if (legacy && !legacy.includes(':')) {
-        localStorage.setItem(key, legacy);
-        return legacy;
-      }
+  const key = activeVoiceStoreKey(profile);
+  const cur = pluginStore.get(key, '');
+  if (cur) return String(cur);
+
+  const legacyKey = `${LEGACY_LS.activeVoicePrefix}:${normalizeHermesProfile(profile)}`;
+  const scoped = lsGetRaw(legacyKey);
+  if (scoped) {
+    pluginStore.set(key, scoped);
+    return String(scoped);
+  }
+  if (normalizeHermesProfile(profile) === 'default') {
+    const unscoped = lsGetRaw(LEGACY_LS.activeVoiceUnscoped);
+    if (unscoped && !String(unscoped).includes(':')) {
+      pluginStore.set(key, unscoped);
+      return String(unscoped);
     }
-  } catch (_) {}
+  }
   return '';
 }
 
 function writeLocalActiveVoice(voiceId, profile) {
-  try {
-    const key = activeVoiceLsKey(profile);
-    const id = voiceId == null ? '' : String(voiceId);
-    if (id) localStorage.setItem(key, id);
-    else localStorage.removeItem(key);
-  } catch (_) {}
+  const key = activeVoiceStoreKey(profile);
+  const id = voiceId == null ? '' : String(voiceId);
+  if (id) pluginStore.set(key, id);
+  else pluginStore.remove(key);
 }
 
 function readDismissedSampleKeys(profile) {
-  try {
-    const raw = localStorage.getItem(dismissedSamplesLsKey(profile));
-    if (raw) {
-      const arr = JSON.parse(raw);
-      return new Set(Array.isArray(arr) ? arr.map(String) : []);
+  const key = dismissedSamplesStoreKey(profile);
+  const cur = pluginStore.get(key, null);
+  if (Array.isArray(cur)) return new Set(cur.map(String));
+
+  const legacyKey = `${LEGACY_LS.dismissedPrefix}:${normalizeHermesProfile(profile)}`;
+  const scoped = lsGetRaw(legacyKey);
+  if (scoped) {
+    try {
+      const arr = JSON.parse(scoped);
+      const list = Array.isArray(arr) ? arr.map(String) : [];
+      pluginStore.set(key, list);
+      return new Set(list);
+    } catch (_) {}
+  }
+  if (normalizeHermesProfile(profile) === 'default') {
+    const unscoped = lsGetRaw(LEGACY_LS.dismissedUnscoped);
+    if (unscoped) {
+      try {
+        const arr = JSON.parse(unscoped);
+        const list = Array.isArray(arr) ? arr.map(String) : [];
+        pluginStore.set(key, list);
+        return new Set(list);
+      } catch (_) {}
     }
-    if (normalizeHermesProfile(profile) === 'default') {
-      const legacy = localStorage.getItem(LEGACY_DISMISSED_SAMPLES_KEY);
-      if (legacy) {
-        const arr = JSON.parse(legacy);
-        return new Set(Array.isArray(arr) ? arr.map(String) : []);
-      }
-    }
-  } catch (_) {}
+  }
   return new Set();
 }
 
 function dismissSampleKey(key, profile) {
   if (!key) return;
-  try {
-    const next = readDismissedSampleKeys(profile);
-    next.add(String(key));
-    localStorage.setItem(
-      dismissedSamplesLsKey(profile),
-      JSON.stringify([...next])
-    );
-  } catch (_) {}
+  const next = readDismissedSampleKeys(profile);
+  next.add(String(key));
+  pluginStore.set(dismissedSamplesStoreKey(profile), [...next]);
 }
 
 function desktopApiAvailable() {
@@ -260,14 +341,18 @@ function buildSampleProfilePayload(sample) {
 }
 
 function resolveBackendUrl() {
-  try {
-    const stored = localStorage.getItem('voicebox_backend_url');
-    if (stored && /^https?:\/\//i.test(stored)) return stored.replace(/\/$/, '');
-  } catch (_) {}
+  const cur = pluginStore.get('backend_url', null);
+  if (cur && /^https?:\/\//i.test(String(cur))) return String(cur).replace(/\/$/, '');
+  const legacy = lsGetRaw(LEGACY_LS.backendUrl);
+  if (legacy && /^https?:\/\//i.test(legacy)) {
+    const cleaned = legacy.replace(/\/$/, '');
+    pluginStore.set('backend_url', cleaned);
+    return cleaned;
+  }
   return DEFAULT_BACKEND_URL;
 }
 
-const BACKEND_URL = resolveBackendUrl();
+let BACKEND_URL = resolveBackendUrl();
 
 // ─────────────────────────────────────────────
 // Engine metadata
@@ -496,7 +581,7 @@ async function saveActiveVoice(voiceId, profile, { personaKey = null } = {}) {
   }
 
   // Do NOT write Voicebox /settings/active-voice — it is process-global and
-  // bleeds across Hermes profiles. Per-profile config + localStorage is enough.
+  // bleeds across Hermes profiles. Per-profile config + ctx.storage is enough.
 
   if (hermesKey || id === '' || readLocalActiveVoice(hermesProfile) === id) {
     return {
@@ -732,10 +817,20 @@ function VoiceboxView() {
 
   // Persona state (cache; server personality is preferred when present)
   const [personaMapping, setPersonaMapping] = useState(() => {
-    try {
-      const stored = localStorage.getItem('hermes_personas');
-      if (stored) return JSON.parse(stored);
-    } catch (e) {}
+    const stored = pluginStore.get('personas', null);
+    if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+      return stored;
+    }
+    const legacy = lsGetRaw(LEGACY_LS.personas);
+    if (legacy) {
+      try {
+        const parsed = JSON.parse(legacy);
+        if (parsed && typeof parsed === 'object') {
+          pluginStore.set('personas', parsed);
+          return parsed;
+        }
+      } catch (_) {}
+    }
     const defaults = { Default: 'You are a helpful AI assistant.' };
     for (const sample of SAMPLE_VOICES) {
       defaults[sample.name] = samplePersonalityForHermes(sample);
@@ -761,10 +856,11 @@ function VoiceboxView() {
   const [isConnected, setIsConnected]     = useState(null);
   const [gpuStatus, setGpuStatus]         = useState(null);
   const [stopOnHermesExit, setStopOnHermesExit] = useState(() => {
-    try {
-      const v = localStorage.getItem(LS_STOP_ON_EXIT);
-      if (v === '0' || v === 'false') return false;
-    } catch (_) {}
+    const cur = pluginStore.get('stop_on_hermes_exit', null);
+    if (typeof cur === 'boolean') return cur;
+    const v = lsGetRaw(LEGACY_LS.stopOnExit);
+    if (v === '0' || v === 'false') return false;
+    if (v === '1' || v === 'true') return true;
     return true;
   });
   const [gpuBusy, setGpuBusy]             = useState(false);
@@ -1106,9 +1202,7 @@ function VoiceboxView() {
       setGpuStatus(st);
       if (st?.config && typeof st.config.stop_on_hermes_exit === 'boolean') {
         setStopOnHermesExit(st.config.stop_on_hermes_exit);
-        try {
-          localStorage.setItem(LS_STOP_ON_EXIT, st.config.stop_on_hermes_exit ? '1' : '0');
-        } catch (_) {}
+        pluginStore.set('stop_on_hermes_exit', st.config.stop_on_hermes_exit);
       }
       return;
     } catch (_) {}
@@ -1151,7 +1245,7 @@ function VoiceboxView() {
 
   const handleToggleStopOnExit = useCallback(async (enabled) => {
     setStopOnHermesExit(enabled);
-    try { localStorage.setItem(LS_STOP_ON_EXIT, enabled ? '1' : '0'); } catch (_) {}
+    pluginStore.set('stop_on_hermes_exit', Boolean(enabled));
     try {
       await gpuControl('/v1/config', {
         method: 'PUT',
@@ -1182,9 +1276,7 @@ function VoiceboxView() {
 
     setPersonaMapping(prev => {
       const next = { ...prev, [voice.id]: val, [voice.name]: val };
-      try {
-        localStorage.setItem('hermes_personas', JSON.stringify(next));
-      } catch (_) {}
+      pluginStore.set('personas', next);
       return next;
     });
 
@@ -1881,10 +1973,41 @@ function VoiceboxView() {
   );
 }
 
+function disposeGpuSoft() {
+  const url = `${GPU_CONTROL_URL}/v1/unload`;
+  try {
+    if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
+      navigator.sendBeacon(url);
+    }
+  } catch (_) {}
+  try {
+    fetch(url, { method: 'POST', keepalive: true }).catch(() => {});
+  } catch (_) {}
+  try {
+    fetch(`${DEFAULT_BACKEND_URL}/models/unload`, { method: 'POST', keepalive: true }).catch(() => {});
+  } catch (_) {}
+}
+
+/** Mounted while the plugin is enabled so pagehide is removed on deactivate. */
+function GpuPagehideHook() {
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    window.addEventListener('pagehide', disposeGpuSoft);
+    return () => window.removeEventListener('pagehide', disposeGpuSoft);
+  }, []);
+  return null;
+}
+
 export default {
-  id: 'voice-switcher',
+  id: PLUGIN_ID,
   name: 'Voicebox Integration',
+  // Opt-in: inventories in Settings → Plugins, off until the user enables it.
+  defaultEnabled: false,
   register(ctx) {
+    pluginStore = ctx.storage;
+    migrateLegacyStorage(pluginStore);
+    BACKEND_URL = resolveBackendUrl();
+
     ctx.register({ id: 'voicebox-route', area: 'routes', data: { path: '/voicebox' },
       render: () => React.createElement(VoiceboxView) });
     ctx.register({ id: 'voicebox-nav', area: 'sidebar.nav',
@@ -1893,22 +2016,13 @@ export default {
     // Soft free only on renderer teardown (reload / pagehide). Never hard-stop
     // here — pagehide also fires on reload while Hermes stays open. Hard stop
     // on Hermes exit is owned by voicebox-gpu-lifecycle's process watcher.
-    const disposeGpuSoft = () => {
-      const url = `${GPU_CONTROL_URL}/v1/unload`;
-      try {
-        if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
-          navigator.sendBeacon(url);
-        }
-      } catch (_) {}
-      try {
-        fetch(url, { method: 'POST', keepalive: true }).catch(() => {});
-      } catch (_) {}
-      try {
-        fetch(`${DEFAULT_BACKEND_URL}/models/unload`, { method: 'POST', keepalive: true }).catch(() => {});
-      } catch (_) {}
-    };
-    if (typeof window !== 'undefined') {
-      window.addEventListener('pagehide', disposeGpuSoft);
-    }
+    // Hook contribution is disposed on plugin disable/reload so the listener
+    // does not stack.
+    ctx.register({
+      id: 'gpu-pagehide-hook',
+      area: 'statusBar.right',
+      order: 9999,
+      render: () => React.createElement(GpuPagehideHook),
+    });
   }
 };

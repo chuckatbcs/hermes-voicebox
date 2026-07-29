@@ -97,12 +97,13 @@ python install.py -y
 
 - **`VOICEBOX_PORT`** / **`--base-url`**: TTS bridge backend URL (default `http://127.0.0.1:17493`)
 - **`HERMES_HOME`** / **`HERMES_DIR`**: Hermes profile home (default `~/.hermes`). Named Desktop profiles use `~/.hermes/profiles/<name>/`.
-- **`localStorage.voicebox_backend_url`**: optional plugin UI override
+- **Plugin prefs (`ctx.storage`)**: under `hermes.plugin.voice-switcher.*` (active voice per profile, dismissed samples, backend URL override, stop-on-exit). Legacy bare `localStorage` keys are migrated once on load.
 - **Active voice (per Hermes profile)**: selecting a voice in the plugin binds it to the **current** Hermes Desktop profile (`host.state.profile`):
   - writes `tts.providers.voicebox.voice` via Desktop `PUT /api/config` (profile-scoped)
   - applies persona via gateway `config.set personality` (already profile-scoped)
-  - caches UI selection in `localStorage` keyed by profile (`voicebox_active_voice_id:<profile>`)
+  - caches UI selection in plugin storage keyed by profile (`active_voice:<profile>`)
   - optional sidecar `$HERMES_HOME/voicebox_binding.json` for CLI/non-Desktop agents
+- **Enable / disable**: Settings → Plugins → **Voicebox Integration** (ships `defaultEnabled: false` — turn it on once after install/upgrade)
 - **Not used as source of truth**: Voicebox `/settings/active-voice` is process-global and would bleed across Hermes profiles — the plugin no longer prefers it.
 
 Bridge voice precedence: CLI `--voice` → `$HERMES_HOME/voicebox_binding.json` (or legacy `voicebox_active_voice.json`) → Voicebox active-voice (demoted) → first Voicebox profile.
@@ -114,13 +115,17 @@ HERMES_HOME=~/.hermes/profiles/work python3 ~/.hermes/scripts/voicebox_bind.py \
   --voice <voicebox-profile-uuid> --persona-key jarvis
 ```
 
-Installer can merge the TTS block into every profile home:
+Installer copies the desktop plugin + bridge into each profile home (Desktop loads
+plugins from that profile’s `HERMES_HOME/desktop-plugins/`) and merges the TTS block:
 
 ```bash
 ./install.sh --skip-prereqs --all-profiles
 # or one profile:
 ./install.sh --skip-prereqs --profile work
 ```
+
+After creating a new Hermes Desktop profile, re-run `--all-profiles` (or `--profile <name>`)
+and restart Desktop so the Voicebox sidebar appears on that profile.
 
 Windows:
 

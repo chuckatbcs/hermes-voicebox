@@ -203,6 +203,13 @@ class ProfileHomeTests(unittest.TestCase):
             self.assertIn("provider: voicebox", (root / "config.yaml").read_text(encoding="utf-8"))
             self.assertIn("provider: voicebox", (work / "config.yaml").read_text(encoding="utf-8"))
             self.assertTrue((root / "scripts" / "voicebox_bind.py").is_file())
+            self.assertTrue(
+                (root / "desktop-plugins" / "voice-switcher" / "plugin.js").is_file()
+            )
+            self.assertTrue(
+                (work / "desktop-plugins" / "voice-switcher" / "plugin.js").is_file()
+            )
+            self.assertTrue((work / "scripts" / "voicebox_tts.py").is_file())
             _ = src  # silence unused if flake8
 
 
@@ -499,6 +506,31 @@ class PersonalitiesMergeTests(unittest.TestCase):
             self.assertIn("vincent_price:", text)
             self.assertIn("glados:", text)
             self.assertEqual(len([ln for ln in text.splitlines() if ln.strip() == "agent:"]), 1)
+
+    def test_repairs_personas_nested_under_tts_providers(self):
+        samples = install.load_sample_voices(Path(__file__).resolve().parent)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.yaml"
+            cfg.write_text(
+                "tts:\n"
+                "  provider: voicebox\n"
+                "  providers:\n"
+                "    voicebox:\n"
+                "      type: command\n"
+                "      voice: default\n"
+                "    vincent_price: 'bad nesting'\n"
+                "    cartman: 'also bad'\n",
+                encoding="utf-8",
+            )
+            result = install.merge_personalities_config(cfg, samples)
+            self.assertEqual(result, "repaired_providers_nesting")
+            data = __import__("yaml").safe_load(cfg.read_text(encoding="utf-8"))
+            providers = data["tts"]["providers"]
+            self.assertEqual(list(providers.keys()), ["voicebox"])
+            personalities = data["agent"]["personalities"]
+            self.assertIn("vincent_price", personalities)
+            self.assertIn("cartman", personalities)
+            self.assertIn("glados", personalities)
 
 
 if __name__ == "__main__":
