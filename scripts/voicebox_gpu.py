@@ -266,6 +266,25 @@ def stop_voicebox() -> dict[str, Any]:
         except Exception as exc:
             actions.append({"method": f"docker compose down ({vendor})", "error": str(exc)})
 
+    # Windows native process kill (voicebox-server-cuda.exe or voicebox.exe).
+    # The HTTP unload called by stop() already frees VRAM via the Voicebox API,
+    # but if the process itself needs to be terminated (e.g. it holds CUDA context
+    # memory that unload doesn't fully release), taskkill ensures a clean exit.
+    if sys.platform == "win32":
+        try:
+            import psutil  # type: ignore
+
+            for proc in psutil.process_iter(["name", "pid"]):
+                try:
+                    name = (proc.info.get("name") or "").lower()
+                except Exception:
+                    continue
+                if name in {"voicebox-server-cuda.exe", "voicebox.exe", "voicebox-server.exe"}:
+                    proc.terminate()
+                    actions.append({"method": f"taskkill {name} (pid={proc.pid})", "code": 0, "out": ""})
+        except Exception as exc:
+            actions.append({"method": "win32 process kill", "error": str(exc)})
+
     return {"actions": actions}
 
 

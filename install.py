@@ -443,6 +443,68 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     return plugin_dst, bridge_dst
 
 
+def _launch_windows_daemon(gpu_py: Path, hermes_root: Path, base_url: str | None) -> str:
+    """Start the lifecycle daemon on Windows as a detached background process.
+
+    Uses CREATE_NO_WINDOW so no console pops up.  If a daemon is already
+    listening on the control port, this is a no-op.
+    """
+    import subprocess
+    import urllib.request
+
+    # The control port matches DEFAULT_CONTROL_PORT in voicebox_gpu.py.
+    DEFAULT_CTRL_PORT = 17494
+
+    # Check if a daemon is already running on the control port.
+    try:
+        ctrl_port = DEFAULT_CTRL_PORT
+        port_file = hermes_root / "voicebox_gpu_control.port"
+        if port_file.is_file():
+            ctrl_port = int(port_file.read_text().strip())
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{ctrl_port}/v1/status", timeout=2
+        ) as resp:
+            if resp.status == 200:
+                return "daemon_already_running"
+    except Exception:
+        pass  # not running — proceed to launch
+
+    cmd = [sys.executable, str(gpu_py), "--hermes-home", str(hermes_root)]
+    if base_url:
+        cmd += ["--base-url", base_url]
+    cmd.append("lifecycle-daemon")
+
+    try:
+        # Detached process, no console window.
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NO_WINDOW = 0x08000000
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
+            close_fds=True,
+        )
+    except Exception as exc:
+        return f"daemon_launch_failed: {exc}"
+
+    # Wait briefly for the control API to come up.
+    import time
+
+    for _ in range(10):
+        time.sleep(0.5)
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{DEFAULT_CTRL_PORT}/v1/status", timeout=2
+            ) as resp:
+                if resp.status == 200:
+                    return "daemon_started"
+        except Exception:
+            continue
+    return "daemon_started_no_confirm"
+
+
 def install_gpu_lifecycle(
     hermes_root: Path,
     *,
@@ -479,6 +541,11 @@ def install_gpu_lifecycle(
     subprocess.run(cmd, check=False, capture_output=True, text=True)
 
     if platform.system() != "Linux" or not enable:
+        # Windows: spawn the lifecycle daemon as a detached background process.
+        # On Linux non-systemd systems, the user can start it manually — but
+        # Windows has no systemd equivalent, so we launch it here.
+        if platform.system() == "Windows" and enable:
+            return _launch_windows_daemon(gpu_py, hermes_root, base_url)
         return "config_only" if not enable else "config_only_non_linux"
 
     # Never enable a user systemd unit that points at a throwaway --hermes-dir
