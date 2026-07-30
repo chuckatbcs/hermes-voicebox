@@ -222,6 +222,36 @@ async function desktopConfigPutVoice(voiceId, profile) {
   return 'tts.providers.voicebox.voice';
 }
 
+/**
+ * Write agent.system_prompt (and optionally display.personality) via the
+ * Desktop REST /api/config endpoint. This bypasses the TUI gateway's
+ * `config.set personality` RPC, which only accepts personality *names*
+ * registered in agent.personalities — not arbitrary prompt text.
+ *
+ * Deep-merge semantics: only the keys in the body are overwritten.
+ */
+async function desktopConfigPutPersona(systemPrompt, personalityName, profile) {
+  if (!desktopApiAvailable()) {
+    throw new Error('Hermes Desktop config API unavailable');
+  }
+  const p = normalizeHermesProfile(profile);
+  const config = { agent: { system_prompt: systemPrompt || '' } };
+  // display.personality is optional — only set it if the persona maps to
+  // a named key.  Custom clones leave this alone so the sidebar UI does
+  // not show a stale personality label next to an edited prompt.
+  if (personalityName) {
+    config.display = { personality: personalityName };
+  }
+  const opts = {
+    path: '/api/config',
+    method: 'PUT',
+    body: { config },
+  };
+  opts.profile = p;
+  await window.hermesDesktop.api(opts);
+  return 'agent.system_prompt';
+}
+
 function voiceIdFromConfigRecord(cfg) {
   if (!cfg || typeof cfg !== 'object') return '';
   const tts = cfg.tts || cfg.config?.tts || cfg;
@@ -542,12 +572,27 @@ async function loadActiveVoice(signal, profile) {
 }
 
 /**
- * Apply a voice persona the Hermes-native way:
- * 1) config.set personality=<named key>  (same as /personality <key>)
- * 2) fallback to full prompt text if the named key is not registered yet
- * 3) also set agent.system_prompt (Desktop has historically ignored display-only personality)
+ * Apply a voice persona to the active Hermes profile.
+ *
+ * The Desktop REST /api/config endpoint deep-merges config.yaml keys, so we
+ * write agent.system_prompt (and display.personality for named personas)
+ * directly — mirroring what the gateway `config.set personality` command
+ * does internally (server.py: _write_config_key × 2) without going through
+ * the TUI-gateway RPC.
+ *
+ * Why not `host.request('config.set', { key: 'personality', … })`?  That RPC
+ * validate--personality lookup in `config.set`, so it only accepts names
+ * already registered in agent.personalities. A user-edited persona prompt is
+ * full prose, not a name — the gateway raises ValueError ("Unknown
+ * personality: …") and the persona sync fails. Writing the config keys via
+ * REST works for both named and edited/custom personas.
+ *
+ * Side benefit: the REST call also updates the live session because the
+ * profile-scope swap / config reload flushes agent.ephemeral_system_prompt
+ * on the next turn boundary.
  */
 async function applyHermesPersona({ key, prompt, voiceName }) {
+  const hermesProfile = currentHermesProfile();
   const sessionId = host.state?.activeSessionId?.get();
   const modes = [];
   const cleanPrompt = displayPersonaPrompt(prompt) || prompt;
@@ -556,10 +601,11 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
     ? samplePersonalityForHermes({ ...sample, personality: cleanPrompt })
     : cleanPrompt;
 
-  // Named keys match /personality — but many Desktop sessions 404 until restart
-  // after installer merge. Prefer named, then fall back to full prompt text.
-  // Never set named *after* prompt-text (that overwrites a working prompt).
-  let personalitySet = false;
+  // Best effort: named-key path via the gateway RPC.  When the persona is a
+  // registered sample name and the text hasn't been touched by the user this
+  // also stamps display.personality in one trip.  If the RPC fails (no live
+  // session, registry miss for that key, gateway not reachable), the REST
+  // write below is the source of truth.
   if (key) {
     try {
       await host.request('config.set', {
@@ -568,39 +614,24 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
         session_id: sessionId || undefined,
       });
       modes.push(`named:${key}`);
-      personalitySet = true;
     } catch (err) {
-      console.warn('Named personality set skipped:', err);
+      console.warn('Named personality RPC skipped:', err);
     }
   }
 
-  if (!personalitySet) {
-    try {
-      await host.request('config.set', {
-        key: 'personality',
-        value: systemPrompt,
-        session_id: sessionId || undefined,
-      });
-      modes.push('prompt-text');
-      personalitySet = true;
-    } catch (err) {
-      console.warn('Prompt-text personality set failed:', err);
-    }
-  }
-
-  if (!personalitySet) {
-    throw new Error('Hermes rejected persona update (config.set personality)');
-  }
-
+  // Authoritative write: agent.system_prompt (and display.personality when we
+  // know the named key).  The REST endpoint is deep-merge so we overwrite
+  // only the keys we send.  For a custom clone with no key, only
+  // agent.system_prompt is written — the sidebar personality label is left
+  // untouched so it does not show a stale name next to the edited prompt.
   try {
-    await host.request('config.set', {
-      key: 'agent.system_prompt',
-      value: systemPrompt,
-      session_id: sessionId || undefined,
-    });
-    modes.push('agent.system_prompt');
+    await desktopConfigPutPersona(systemPrompt, sample?.key, hermesProfile);
+    modes.push(sample?.key ? `rest:${sample.key}` : 'rest:system_prompt');
   } catch (err) {
-    console.warn('agent.system_prompt update skipped:', err);
+    if (!modes.length) {
+      throw new Error(`Could not apply persona to Hermes (${err.message || err})`);
+    }
+    console.warn('REST persona write failed, RPC-only update applied:', err);
   }
 
   return { sessionId, modes, voiceName };
