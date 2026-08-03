@@ -604,6 +604,7 @@ SERVICE_BACKEND_BY_PLATFORM = {
 }
 
 WINDOWS_TASK_NAME = "Hermes_Voicebox_GPU_Lifecycle"
+UNIT_NAME = "voicebox-gpu-lifecycle.service"
 
 
 def service_backend(system: str | None = None) -> str | None:
@@ -646,11 +647,25 @@ def _install_gpu_lifecycle_systemd(
     steps = []
     for args in (
         ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "enable", "--now", "voicebox-gpu-lifecycle.service"],
+        ["systemctl", "--user", "enable", "--now", UNIT_NAME],
     ):
         try:
             proc = subprocess.run(args, capture_output=True, text=True, timeout=60, check=False)
             steps.append(f"{' '.join(args)}=>{proc.returncode}")
+            if proc.returncode != 0:
+                # Mirror the Windows backend: the unit is on disk and valid,
+                # but the supervisor refused to load it. Common in containers
+                # and WSL, where there is no user systemd bus.
+                output = ((proc.stdout or "") + (proc.stderr or "")).lower()
+                if any(
+                    s in output
+                    for s in ("failed to connect to bus", "no such file or directory")
+                ):
+                    return "needs_user_bus:" + ",".join(steps)
+                return "unit_written:" + ",".join(steps)
+        except FileNotFoundError:
+            # systemctl absent entirely (minimal container, non-systemd distro).
+            return "unit_written:systemctl_unavailable"
         except Exception as exc:
             steps.append(f"{' '.join(args)}: {exc}")
             return "unit_written:" + ",".join(steps)
@@ -1090,6 +1105,15 @@ def main(argv: list[str] | None = None) -> int:
                 "        automatic idle-unload, or start the daemon manually:\n"
                 f"          \"{sys.executable}\" "
                 f"\"{install_root / 'scripts' / 'voicebox_gpu.py'}\" lifecycle-daemon"
+            )
+        elif gpu_status.startswith("needs_user_bus"):
+            print(
+                "  NOTE: no systemd user bus (common in WSL/containers). The unit\n"
+                "        was written but not started. Enable lingering with\n"
+                "        'sudo loginctl enable-linger $USER' and re-run, or start\n"
+                "        the daemon manually:\n"
+                f"          {sys.executable} "
+                f"{install_root / 'scripts' / 'voicebox_gpu.py'} lifecycle-daemon"
             )
     else:
         print("GPU lifecycle: skipped (--skip-gpu-lifecycle)")

@@ -564,6 +564,80 @@ class SpeakStreamHookTests(unittest.TestCase):
         self.assertIn("ExecStart=", text)
         self.assertIn("lifecycle-daemon", text)
 
+    def test_systemd_failure_is_not_reported_as_enabled(self):
+        """
+        Regression: the systemd branch ignored returncode and claimed
+        "enabled:" even when systemctl failed (e.g. WSL / containers with no
+        user bus). Mirrors the Windows backend's honest reporting.
+        """
+        src = Path(__file__).resolve().parent
+        cases = [
+            ("Failed to connect to bus: No such file or directory", "needs_user_bus"),
+            ("Job for voicebox-gpu-lifecycle.service failed", "unit_written"),
+        ]
+        for stderr, expected in cases:
+            with self.subTest(stderr=stderr):
+                with tempfile.TemporaryDirectory() as tmp:
+                    fake_home = Path(tmp) / "home"
+                    fake_home.mkdir()
+                    root = fake_home / ".hermes"
+                    install.install_files(src, root)
+                    with mock.patch.object(install, "platform") as plat, \
+                         mock.patch.object(install.Path, "home", return_value=fake_home), \
+                         mock.patch(
+                             "subprocess.run",
+                             return_value=mock.Mock(returncode=1, stdout="", stderr=stderr),
+                         ):
+                        plat.system.return_value = "Linux"
+                        status = install.install_gpu_lifecycle(root, enable=True)
+                    self.assertTrue(
+                        status.startswith(expected), f"{status!r} should start with {expected!r}"
+                    )
+                    self.assertFalse(status.startswith("enabled:"), status)
+                    # The unit must still be on disk for manual activation.
+                    unit = fake_home / ".config" / "systemd" / "user" / install.UNIT_NAME
+                    self.assertTrue(unit.is_file(), unit)
+
+    def test_systemd_success_reports_enabled(self):
+        src = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            root = fake_home / ".hermes"
+            install.install_files(src, root)
+            with mock.patch.object(install, "platform") as plat, \
+                 mock.patch.object(install.Path, "home", return_value=fake_home), \
+                 mock.patch(
+                     "subprocess.run",
+                     return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+                 ):
+                plat.system.return_value = "Linux"
+                status = install.install_gpu_lifecycle(root, enable=True)
+            self.assertTrue(status.startswith("enabled:"), status)
+
+    def test_both_backends_report_failure_consistently(self):
+        """Neither backend may claim success when its supervisor refused."""
+        src = Path(__file__).resolve().parent
+        for system, stderr in (
+            ("Linux", "Failed to connect to bus: No such file or directory"),
+            ("Windows", "ERROR: Access is denied."),
+        ):
+            with self.subTest(system=system):
+                with tempfile.TemporaryDirectory() as tmp:
+                    fake_home = Path(tmp) / "home"
+                    fake_home.mkdir()
+                    root = fake_home / ".hermes"
+                    install.install_files(src, root)
+                    with mock.patch.object(install, "platform") as plat, \
+                         mock.patch.object(install.Path, "home", return_value=fake_home), \
+                         mock.patch(
+                             "subprocess.run",
+                             return_value=mock.Mock(returncode=1, stdout="", stderr=stderr),
+                         ):
+                        plat.system.return_value = system
+                        status = install.install_gpu_lifecycle(root, enable=True)
+                    self.assertFalse(status.startswith("enabled:"), f"{system}: {status}")
+
     def test_install_gpu_lifecycle_config_only_on_unsupported_platform(self):
         src = Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory() as tmp:

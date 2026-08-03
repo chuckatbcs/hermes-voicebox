@@ -106,9 +106,12 @@ gracefully.
 3. **Never assert on path separators.** Build expectations from `Path`/`str(Path)`
    so `\` vs `/` cannot fail a test.
 4. **Status strings are contracts.** `install_gpu_lifecycle()` returns
-   `enabled:` / `unit_written:` / `config_only_non_default_home` /
-   `config_only_unsupported_platform_<os>` / `missing_unit_template`. Tests and
-   installer output depend on these; extend rather than rename.
+   `enabled:` / `unit_written:` / `needs_elevation:` (Windows, non-elevated) /
+   `needs_user_bus:` (Linux, no systemd user bus) /
+   `config_only_non_default_home` / `config_only_unsupported_platform_<os>` /
+   `missing_unit_template`. **`enabled:` means the supervisor accepted the
+   unit** — never return it when the `systemctl`/`schtasks` call failed. Tests
+   and installer output depend on these; extend rather than rename.
 5. **Line endings are governed by `.gitattributes`.** `.sh`/`.py`/`.service` are
    LF; `.ps1`/`.bat` are CRLF; `installer/windows/*.xml` is binary (UTF-16LE).
    A diff touching every line means your editor rewrote endings — fix with
