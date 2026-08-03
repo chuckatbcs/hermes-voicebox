@@ -42,6 +42,32 @@ ACTIVITY_FILENAME = "voicebox_tts_activity"
 CONFIG_FILENAME = "voicebox_gpu.json"
 CONTROL_PORT_FILENAME = "voicebox_gpu_control.port"
 
+# Windows service-control parity with the Linux systemd path. Voicebox ships as
+# a desktop app on Windows (no service manager), so stop/start map to process
+# termination and a detached relaunch instead of systemctl.
+WINDOWS_VOICEBOX_IMAGES = ("Voicebox.exe", "voicebox.exe")
+WINDOWS_TASK_NAME = "Hermes_Voicebox_GPU_Lifecycle"
+
+
+def find_windows_voicebox_exe() -> Path | None:
+    """Locate the installed Voicebox desktop executable on Windows."""
+    candidates: list[Path] = []
+    for env in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+        base = os.environ.get(env)
+        if not base:
+            continue
+        candidates.extend(
+            [
+                Path(base) / "Voicebox" / "Voicebox.exe",
+                Path(base) / "Programs" / "Voicebox" / "Voicebox.exe",
+            ]
+        )
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
 _INVALID = {"", "default", "undefined", "null", "none"}
 
 
@@ -242,6 +268,14 @@ def stop_voicebox() -> dict[str, Any]:
             code2, out2 = _run(["systemctl", "--user", "stop", "voicebox"])
             actions.append({"method": "systemctl --user stop voicebox", "code": code2, "out": out2})
 
+    # Windows desktop app (systemd-unit analogue: no service, kill the process tree)
+    elif sys.platform.startswith("win"):
+        for image in WINDOWS_VOICEBOX_IMAGES:
+            code, out = _run(["taskkill", "/IM", image, "/T", "/F"])
+            # 128 == "process not found", which is a no-op rather than a failure.
+            if code == 0 or "not found" not in out.lower():
+                actions.append({"method": f"taskkill /IM {image}", "code": code, "out": out})
+
     # Docker compose in vendor path
     vendor = hermes_home() / "vendor" / "voicebox"
     if (vendor / "docker-compose.yml").is_file() or (vendor / "compose.yml").is_file():
@@ -277,6 +311,22 @@ def start_voicebox() -> dict[str, Any]:
         if code != 0:
             code2, out2 = _run(["systemctl", "--user", "start", "voicebox"])
             actions.append({"method": "systemctl --user start voicebox", "code": code2, "out": out2})
+    elif sys.platform.startswith("win"):
+        exe = find_windows_voicebox_exe()
+        if exe:
+            try:
+                subprocess.Popen(
+                    [str(exe)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+                )
+                actions.append({"method": f"launch {exe}", "code": 0, "out": "started"})
+            except Exception as exc:
+                actions.append({"method": f"launch {exe}", "error": str(exc)})
+        else:
+            actions.append({"method": "launch voicebox", "error": "Voicebox.exe not found"})
+
     vendor = hermes_home() / "vendor" / "voicebox"
     if vendor.is_dir():
         try:
@@ -344,11 +394,19 @@ def idle_check(base_url: str, minutes: float, home: Path | None = None) -> dict[
         "threshold_seconds": minutes * 60.0,
         "action": "none",
     }
+
+    # Check if Voicebox is actually alive before attempting anything.
+    health = get_health(base_url)
+    if not health:
+        # Voicebox is not reachable — skip unload to avoid a tight loop of
+        # failed HTTP calls that keep spinning the GPU process.
+        result["action"] = "skip_unreachable"
+        return result
+
     if age is None:
         # No TTS yet this boot — still unload if something is loaded and idle
         # never stamped (treat as idle forever once models are loaded).
-        health = get_health(base_url)
-        if not health or not health.get("model_loaded"):
+        if not health.get("model_loaded"):
             result["action"] = "skip_no_activity_stamp"
             return result
         age = float("inf")
@@ -478,6 +536,7 @@ class LifecycleDaemon:
         return {"unload": soft, "stop": hard}
 
     def _loop(self) -> None:
+        consecutive_failures = 0
         while not self._stop.wait(10.0):
             self.reload_config()
             cfg = self.cfg
@@ -486,22 +545,52 @@ class LifecycleDaemon:
             if cfg.get("idle_unload_enabled", True):
                 minutes = float(cfg.get("idle_unload_minutes") or DEFAULT_IDLE_MINUTES)
                 try:
-                    idle_check(self.base_url, minutes, self.home)
+                    idle_result = idle_check(self.base_url, minutes, self.home)
+                    if idle_result.get("action") == "skip_unreachable":
+                        consecutive_failures += 1
+                    else:
+                        consecutive_failures = 0
                 except Exception:
-                    pass
+                    consecutive_failures += 1
+            else:
+                # Still track health to know if Voicebox is up for backoff
+                if not get_health(self.base_url):
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
+
+            # If Voicebox is unreachable, back off exponentially (up to 5 min)
+            # to avoid a tight crash-loop of start/unload attempts.
+            if consecutive_failures >= 3:
+                backoff = min(300, 2 ** (consecutive_failures - 3))  # 1s, 2s, 4s... cap 300s
+                self._stop.wait(backoff)
 
             # Hermes exit → stop Voicebox; Hermes return → start it again
-            # (Docker compose down leaves no auto-restart otherwise).
+            # (Docker compose down leaves no auto-restart otherwise.)
             if cfg.get("stop_on_hermes_exit", True):
                 up = hermes_desktop_running()
                 if up:
                     if not self._hermes_was_up:
-                        try:
-                            start_voicebox()
-                        except Exception:
-                            pass
-                    self._hermes_was_up = True
-                    self._hermes_down_since = None
+                        # Only try to start Voicebox if it's not already up
+                        # (avoids crash-looping if Voicebox keeps failing to start).
+                        if get_health(self.base_url):
+                            self._hermes_was_up = True
+                            self._hermes_down_since = None
+                        else:
+                            try:
+                                start_voicebox()
+                            except Exception:
+                                pass
+                            # Wait and verify it actually started before marking as up
+                            self._stop.wait(5.0)
+                            if get_health(self.base_url):
+                                self._hermes_was_up = True
+                                self._hermes_down_since = None
+                            else:
+                                consecutive_failures += 1
+                    else:
+                        self._hermes_was_up = True
+                        self._hermes_down_since = None
                 elif self._hermes_was_up:
                     if self._hermes_down_since is None:
                         self._hermes_down_since = time.time()
@@ -521,6 +610,40 @@ class LifecycleDaemon:
         self.home.mkdir(parents=True, exist_ok=True)
         port_file.write_text(str(self.control_port) + "\n", encoding="utf-8")
 
+        # Handle SIGTERM (sent by systemd on shutdown) so we can gracefully
+        # stop the HTTP server and unlink Voicebox models before exiting.
+        # Without this, systemd sends SIGTERM, Python ignores it, and after
+        # TimeoutStopSec systemd sends SIGKILL — the daemon never gets to
+        # unload CUDA models, leaving them resident during the rest of shutdown.
+        #
+        # Windows parity: Task Scheduler / taskkill deliver CTRL_BREAK and
+        # SIGBREAK rather than SIGTERM, so register the same handler for every
+        # termination signal the host platform actually supports.
+        import signal
+
+        self._is_systemd_stop = False
+
+        def _handle_sigterm(signum: int, frame: Any) -> None:
+            self._is_systemd_stop = True
+            self._stop.set()
+            if self._httpd:
+                # shutdown() must be called from a different thread than
+                # serve_forever() is running in, so fire it from a side
+                # thread to avoid a deadlock.
+                threading.Thread(
+                    target=self._httpd.shutdown, name="httpd-shutdown", daemon=True
+                ).start()
+
+        for _signame in ("SIGTERM", "SIGBREAK", "SIGINT"):
+            _sig = getattr(signal, _signame, None)
+            if _sig is None:
+                continue
+            try:
+                signal.signal(_sig, _handle_sigterm)
+            except (ValueError, OSError):
+                # Not settable on this platform / not the main thread.
+                pass
+
         loop = threading.Thread(target=self._loop, name="voicebox-gpu-loop", daemon=True)
         loop.start()
         print(
@@ -530,12 +653,26 @@ class LifecycleDaemon:
         )
         try:
             self._httpd.serve_forever(poll_interval=0.5)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
             pass
         finally:
             self._stop.set()
             if self._httpd:
-                self._httpd.shutdown()
+                self._httpd.server_close()
+            # On systemd SIGTERM: do a lightweight HTTP unlink of loaded
+            # models (free GPU VRAM) but DO NOT call stop_voicebox(), which
+            # would invoke `systemctl --user stop voicebox.service` — that
+            # deadlocks during system shutdown because systemd is already
+            # tearing down the user manager.  Systemd itself will stop
+            # voicebox.service after this daemon exits.
+            #
+            # On Hermes-exit (non-systemd path): call self.stop() which does
+            # the full unload + service restart cycle.
+            if not self._is_systemd_stop:
+                try:
+                    self.stop()
+                except Exception:
+                    pass
         return 0
 
 

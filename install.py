@@ -16,6 +16,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,9 +24,12 @@ from installer.prereqs import (
     DEFAULT_BASE_URL,
     MODEL_PROFILES,
     find_python_command,
+    log,
     run_prerequisite_flow,
+    seed_sample_clones,
     voicebox_healthy,
 )
+from installer.prereqs import ProvisionReport
 
 
 MARKER_BEGIN = "# BEGIN hermes-voicebox"
@@ -183,8 +187,6 @@ def _streamer_import_block() -> str:
         "    pass\n"
         f"{STREAMER_IMPORT_END}\n"
     )
-
-
 def _prefetch_produce_block() -> str:
     """Indented body inside speak-stream ``_produce`` try-block (12 spaces)."""
     return f"""            {PRODUCE_PATCH_BEGIN}
@@ -204,39 +206,51 @@ def _prefetch_produce_block() -> str:
 
 
 def _patch_speak_stream_produce(web_server_py: Path) -> str:
-    """Replace serial synth loop with look-ahead prefetch (marked, idempotent)."""
+    """Replace serial synth loop with look-ahead prefetch (marked, idempotent).
+
+    Uses a *literal* exact-string replacement of the stable serial loop inside
+    ``_produce`` (the ``try:`` … ``for sentence in _sentences():`` … ``except``
+    block), not a regex/line-scan, so it neither backtracks on large files nor
+    silently drops the patch after a Hermes reformat. If the marked block is
+    already present, it is replaced in place (idempotent).
+    """
     original = web_server_py.read_text(encoding="utf-8")
     block = _prefetch_produce_block()
 
     if PRODUCE_PATCH_BEGIN in original and PRODUCE_PATCH_END in original:
         pre = original.split(PRODUCE_PATCH_BEGIN, 1)[0].rstrip()
         post = original.split(PRODUCE_PATCH_END, 1)[1].lstrip("\n")
-        # pre ends at the line before the marker content; restore try: indent
-        if not pre.endswith("try:"):
-            # Keep whatever preceded the marker (should be `        try:`)
-            pass
         merged = pre + "\n" + block + post
         if merged == original:
             return "produce_unchanged"
         action = "produce_replaced"
     else:
-        pattern = re.compile(
-            r"(?ms)"
-            r"(^        try:\n)"
-            r"(            for sentence in _sentences\(\):\n"
-            r"                cleaned = _strip_markdown_for_tts\(sentence\)\n"
-            r"                if not cleaned:\n"
-            r"                    continue\n"
-            r"                for piece in _split_text_for_speak_stream\(cleaned, cap\):\n"
-            r"                    for chunk in streamer\.stream\(piece\):\n"
-            r"                        if stop\.is_set\(\):\n"
-            r"                            return\n"
-            r"                        loop\.call_soon_threadsafe\(chunks\.put_nowait, chunk\)\n)"
+        # The serial loop is a stable, unique string in _produce. Match it
+        # exactly (including the leading 8-space indent of `try:` and the
+        # trailing `except Exception as exc:` at the same indent).
+        serial = (
+            "        try:\n"
+            "            for sentence in _sentences():\n"
+            "                cleaned = _strip_markdown_for_tts(sentence)\n"
+            "                if not cleaned:\n"
+            "                    continue\n"
+            "                for piece in _split_text_for_speak_stream(cleaned, cap):\n"
+            "                    for chunk in streamer.stream(piece):\n"
+            "                        if stop.is_set():\n"
+            "                            return\n"
+            "                        loop.call_soon_threadsafe(chunks.put_nowait, chunk)\n"
+            "        except Exception as exc:"
         )
-        match = pattern.search(original)
-        if not match:
+        if serial not in original:
             return "produce_pattern_miss"
-        merged = original[: match.start()] + match.group(1) + block + original[match.end() :]
+        # `block` is already indented to 12 spaces; wrap it so the `try:` and
+        # `except` lines line up with the replaced serial block (8 spaces).
+        prefetch = (
+            "        try:\n"
+            + block.rstrip("\n") + "\n"
+            + "        except Exception as exc:"
+        )
+        merged = original.replace(serial, prefetch, 1)
         action = "produce_patched"
 
     bak = web_server_py.with_suffix(web_server_py.suffix + ".voicebox.bak")
@@ -343,14 +357,75 @@ def build_personalities_snippet(samples: list[dict]) -> str:
     )
 
 
+def _strip_persona_keys_from_tts_providers(text: str, sample_keys: set[str]) -> tuple[str, bool]:
+    """
+    Remove sample-persona keys wrongly nested under tts.providers.* (a known
+    corruption from marker replace / Hermes config rewrite). Returns (text, changed).
+    """
+    if not sample_keys or "tts:" not in text:
+        return text, False
+    try:
+        import yaml  # local import: installer already depends on PyYAML via Hermes env or std path
+    except ImportError:
+        return text, False
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        return text, False
+    if not isinstance(data, dict):
+        return text, False
+    tts = data.get("tts")
+    if not isinstance(tts, dict):
+        return text, False
+    providers = tts.get("providers")
+    if not isinstance(providers, dict):
+        return text, False
+    removed = [k for k in list(providers) if k in sample_keys or (
+        k != "voicebox" and isinstance(providers.get(k), str)
+    )]
+    if not removed:
+        return text, False
+    stolen: dict[str, str] = {}
+    for k in removed:
+        val = providers.pop(k, None)
+        if isinstance(val, str) and val.strip():
+            stolen[k] = val
+    tts["providers"] = providers
+    data["tts"] = tts
+    if stolen:
+        agent = data.get("agent")
+        if not isinstance(agent, dict):
+            agent = {}
+            data["agent"] = agent
+        personalities = agent.get("personalities")
+        if not isinstance(personalities, dict):
+            personalities = {}
+            agent["personalities"] = personalities
+        for key, val in stolen.items():
+            personalities.setdefault(key, val)
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=1000), True
+
+
 def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
     """
     Upsert sample personalities under agent.personalities without clobbering
     other agent: settings (avoid appending a second top-level agent key).
     """
     if not samples:
+        # No personas to seed (demo voices are clones now). Still repair a bogus
+        # bare "-personalities" line if present so a corrupt config is cleaned up.
+        if config_path.exists():
+            original = config_path.read_text(encoding="utf-8")
+            if re.search(r"(?m)^-personalities\s*$", original):
+                repaired = re.sub(r"(?m)^-personalities\s*\n?", "", original)
+                config_path.write_text(
+                    repaired if repaired.endswith("\n") else repaired + "\n",
+                    encoding="utf-8",
+                )
+                return "replaced"
         return "skipped_empty"
 
+    sample_keys = {str(s.get("key") or "") for s in samples if s.get("key")}
     entries = build_personalities_entries(samples)
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -365,38 +440,113 @@ def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
     # marker block (invalid YAML; Hermes then wipes config on update).
     original = re.sub(r"(?m)^-personalities\s*\n", "", original)
 
+    # Repair personas wrongly nested under tts.providers (breaks profile updates).
+    repaired, changed = _strip_persona_keys_from_tts_providers(original, sample_keys)
+    if changed:
+        original = repaired
+
     if PERSONA_MARKER_BEGIN in original and PERSONA_MARKER_END in original:
+        # If markers sit under tts.providers (no agent.personalities parent),
+        # drop the marked block and append a proper agent.personalities snippet.
         pre = original.split(PERSONA_MARKER_BEGIN, 1)[0].rstrip()
+        between = original.split(PERSONA_MARKER_BEGIN, 1)[1].split(PERSONA_MARKER_END, 1)[0]
         post = original.split(PERSONA_MARKER_END, 1)[1].lstrip("\n")
-        # Keep surrounding structure; replace only marked entries block.
-        merged = (pre + "\n" if pre else "") + entries + ("\n" + post if post else "\n")
+        pre_tail = "\n".join(pre.splitlines()[-8:])
+        # Markers wrapping a top-level `agent:` snippet (common after `appended`)
+        # must NOT be treated as under providers — the TTS `providers:` key often
+        # appears in the preceding tail and caused false repairs on every re-install.
+        marked_is_agent_doc = bool(re.search(r"(?m)^agent:\s*$", between))
+        under_providers = (
+            not marked_is_agent_doc
+            and bool(re.search(r"(?m)^[ \t]+providers:\s*$", pre_tail))
+            and "agent:" not in pre_tail
+            and "personalities:" not in pre_tail
+        )
+        if under_providers:
+            cleaned = (pre + ("\n" + post if post else "\n")).rstrip() + "\n\n"
+            cleaned += build_personalities_snippet(samples)
+            config_path.write_text(
+                cleaned if cleaned.endswith("\n") else cleaned + "\n", encoding="utf-8"
+            )
+            return "repaired_providers_nesting"
+
+        # Replace marked body. If the old marked region was a full agent: doc
+        # (from build_personalities_snippet), keep that shape instead of the
+        # indented-entries-only form used under agent.personalities.
+        if marked_is_agent_doc:
+            replacement = build_personalities_snippet(samples).rstrip() + "\n"
+        else:
+            replacement = entries + "\n"
+        merged = (pre + "\n" if pre else "") + replacement + (post if post else "")
         merged = re.sub(r"(?m)^-personalities\s*\n", "", merged)
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
         return "replaced"
+
+    # After YAML rewrite stripped markers but left persona keys under providers.
+    if changed:
+        # Ensure agent.personalities exists via append path below if needed.
+        if re.search(r"(?m)^agent:\s*$", original) and re.search(
+            r"(?m)^[ \t]*personalities:\s*$", original
+        ):
+            pass
+        elif re.search(r"(?m)^agent:\s*$", original):
+            agent_hdr = re.search(r"(?m)^agent:\s*$", original)
+            assert agent_hdr is not None
+            insert_at = agent_hdr.end()
+            block = "\n  personalities:\n" + entries + "\n"
+            merged = original[:insert_at] + block + original[insert_at:]
+            config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
+            return "repaired_providers_nesting"
+        else:
+            appended = original.rstrip() + "\n\n" + build_personalities_snippet(samples)
+            config_path.write_text(
+                appended if appended.endswith("\n") else appended + "\n", encoding="utf-8"
+            )
+            return "repaired_providers_nesting"
 
     # Insert under existing agent.personalities: if present.
     personalities_hdr = re.search(r"(?m)^([ \t]*)personalities:\s*$", original)
     agent_hdr = re.search(r"(?m)^agent:\s*$", original)
 
+    def _sample_keys_present(text: str) -> set[str]:
+        """Keys already defined under a personalities mapping (markers may be gone)."""
+        found: set[str] = set()
+        for key in sample_keys:
+            if not key:
+                continue
+            # Match `    jarvis: |` / `    jarvis: "..."` / `    jarvis:` blocks.
+            if re.search(rf"(?m)^[ \t]+{re.escape(key)}:\s*(?:\||[\"'].*|[|>].*)?$", text):
+                found.add(key)
+        return found
+
     if personalities_hdr:
-        # entries use 4-space keys, matching typical `agent: / personalities:` nesting
-        block = entries
+        present = _sample_keys_present(original)
+        missing = {k for k in sample_keys if k and k not in present}
+        # Hermes Desktop often strips our # BEGIN/# END comment markers on rewrite.
+        # Re-inserting the full block every install duplicated keys and bloated
+        # config.yaml (seen at 2.7k+ lines) — skip when all samples already exist.
+        if not missing:
+            return "repaired_providers_nesting" if changed else "skipped_existing"
+
+        # Only append missing sample keys (keep markers so a later run can replace).
+        missing_samples = [s for s in samples if s.get("key") in missing]
+        block = build_personalities_entries(missing_samples)
         insert_at = personalities_hdr.end()
         merged = original[:insert_at] + "\n" + block + original[insert_at:]
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
-        return "inserted_personalities"
+        return "repaired_providers_nesting" if changed else "inserted_personalities"
 
     if agent_hdr:
         insert_at = agent_hdr.end()
         block = "\n  personalities:\n" + entries + "\n"
         merged = original[:insert_at] + block + original[insert_at:]
         config_path.write_text(merged if merged.endswith("\n") else merged + "\n", encoding="utf-8")
-        return "inserted_under_agent"
+        return "repaired_providers_nesting" if changed else "inserted_under_agent"
 
     # No agent section — append a complete one (safe: nothing to clobber).
     appended = original.rstrip() + "\n\n" + build_personalities_snippet(samples)
     config_path.write_text(appended if appended.endswith("\n") else appended + "\n", encoding="utf-8")
-    return "appended"
+    return "repaired_providers_nesting" if changed else "appended"
 
 
 def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
@@ -406,6 +556,7 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     bind_src = src_root / "scripts" / "voicebox_bind.py"
     streamer_src = src_root / "scripts" / "hermes_voicebox_streamer.py"
     gpu_src = src_root / "scripts" / "voicebox_gpu.py"
+    diagnose_src = src_root / "scripts" / "diagnose_tts.sh"
 
     if not plugin_src.is_file():
         raise FileNotFoundError(f"Missing plugin source: {plugin_src}")
@@ -417,6 +568,8 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
         raise FileNotFoundError(f"Missing speak-stream source: {streamer_src}")
     if not gpu_src.is_file():
         raise FileNotFoundError(f"Missing GPU lifecycle source: {gpu_src}")
+    if not diagnose_src.is_file():
+        raise FileNotFoundError(f"Missing diagnose script source: {diagnose_src}")
 
     plugin_dst_dir = hermes_dir / "desktop-plugins" / PLUGIN_ID
     scripts_dst_dir = hermes_dir / "scripts"
@@ -427,6 +580,7 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     bridge_dst = scripts_dst_dir / "voicebox_tts.py"
     bind_dst = scripts_dst_dir / "voicebox_bind.py"
     gpu_dst = scripts_dst_dir / "voicebox_gpu.py"
+    diagnose_dst = scripts_dst_dir / "diagnose_tts.sh"
 
     # Copy plugin entry + companion modules/assets
     for src in plugin_src_dir.iterdir():
@@ -436,58 +590,44 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     shutil.copy2(bridge_src, bridge_dst)
     shutil.copy2(bind_src, bind_dst)
     shutil.copy2(gpu_src, gpu_dst)
+    shutil.copy2(diagnose_src, diagnose_dst)
     if platform.system() != "Windows":
-        for path in (bridge_dst, bind_dst, gpu_dst):
+        for path in (bridge_dst, bind_dst, gpu_dst, diagnose_dst):
             path.chmod(path.stat().st_mode | 0o111)
 
     return plugin_dst, bridge_dst
 
 
-def install_gpu_lifecycle(
-    hermes_root: Path,
-    *,
-    stop_on_hermes_exit: bool = True,
-    idle_minutes: int = 15,
-    enable: bool = True,
-    base_url: str | None = None,
+SERVICE_BACKEND_BY_PLATFORM = {
+    "Linux": "systemd",
+    "Windows": "schtasks",
+}
+
+WINDOWS_TASK_NAME = "Hermes_Voicebox_GPU_Lifecycle"
+UNIT_NAME = "voicebox-gpu-lifecycle.service"
+
+
+def service_backend(system: str | None = None) -> str | None:
+    """
+    Name of the OS service manager used to run the GPU lifecycle daemon.
+
+    Returns ``"systemd"`` on Linux, ``"schtasks"`` on Windows, and ``None`` on
+    platforms with no supported supervisor (e.g. macOS), where the installer
+    falls back to config-only and the daemon may be run manually.
+    """
+    return SERVICE_BACKEND_BY_PLATFORM.get(system or platform.system())
+
+
+def _install_gpu_lifecycle_systemd(
+    hermes_root: Path, gpu_py: Path, base_url: str | None
 ) -> str:
-    """
-    Install GPU lifecycle config + Linux user systemd unit for the daemon.
-
-    Returns a short status string for the installer log.
-    """
-    # Seed config via the installed helper (or repo script during tests).
-    gpu_py = hermes_root / "scripts" / "voicebox_gpu.py"
-    if not gpu_py.is_file():
-        return "missing_gpu_script"
-
-    import subprocess
-
-    cmd = [
-        sys.executable,
-        str(gpu_py),
-        "--hermes-home",
-        str(hermes_root),
-        "config",
-        "--stop-on-hermes-exit",
-        "on" if stop_on_hermes_exit else "off",
-        "--idle-unload",
-        "on",
-        "--idle-minutes",
-        str(idle_minutes),
-    ]
-    subprocess.run(cmd, check=False, capture_output=True, text=True)
-
-    if platform.system() != "Linux" or not enable:
-        return "config_only" if not enable else "config_only_non_linux"
-
-    # Never enable a user systemd unit that points at a throwaway --hermes-dir
-    # (unit tests / smoke installs). Only wire the service for the real home.
-    real_home = (Path.home() / ".hermes").resolve()
-    if hermes_root.resolve() != real_home:
-        return "config_only_non_default_home"
-
-    unit_src = Path(__file__).resolve().parent / "installer" / "systemd" / "voicebox-gpu-lifecycle.service"
+    """Linux backend: user systemd unit under ~/.config/systemd/user."""
+    unit_src = (
+        Path(__file__).resolve().parent
+        / "installer"
+        / "systemd"
+        / "voicebox-gpu-lifecycle.service"
+    )
     if not unit_src.is_file():
         return "missing_unit_template"
 
@@ -507,16 +647,187 @@ def install_gpu_lifecycle(
     steps = []
     for args in (
         ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "enable", "--now", "voicebox-gpu-lifecycle.service"],
+        ["systemctl", "--user", "enable", "--now", UNIT_NAME],
     ):
         try:
             proc = subprocess.run(args, capture_output=True, text=True, timeout=60, check=False)
             steps.append(f"{' '.join(args)}=>{proc.returncode}")
+            if proc.returncode != 0:
+                # Mirror the Windows backend: the unit is on disk and valid,
+                # but the supervisor refused to load it. Common in containers
+                # and WSL, where there is no user systemd bus.
+                output = ((proc.stdout or "") + (proc.stderr or "")).lower()
+                if any(
+                    s in output
+                    for s in ("failed to connect to bus", "no such file or directory")
+                ):
+                    return "needs_user_bus:" + ",".join(steps)
+                return "unit_written:" + ",".join(steps)
+        except FileNotFoundError:
+            # systemctl absent entirely (minimal container, non-systemd distro).
+            return "unit_written:systemctl_unavailable"
         except Exception as exc:
             steps.append(f"{' '.join(args)}: {exc}")
             return "unit_written:" + ",".join(steps)
 
     return "enabled:" + ",".join(steps)
+
+
+def _install_gpu_lifecycle_schtasks(
+    hermes_root: Path, gpu_py: Path, base_url: str | None
+) -> str:
+    """
+    Windows backend: a per-user Scheduled Task (systemd-user analogue).
+
+    Registers ``Hermes_Voicebox_GPU_Lifecycle`` to run the lifecycle daemon at
+    logon. Mirrors the systemd path: write the definition, then hand it to the
+    OS supervisor and report each step.
+    """
+    task_src = (
+        Path(__file__).resolve().parent
+        / "installer"
+        / "windows"
+        / "voicebox-gpu-lifecycle.xml"
+    )
+    if not task_src.is_file():
+        return "missing_unit_template"
+
+    base_url_args = f" --base-url {base_url}" if base_url else ""
+    arguments = (
+        f'"{gpu_py}" --hermes-home "{hermes_root}"{base_url_args} lifecycle-daemon'
+    )
+
+    text = task_src.read_text(encoding="utf-8")
+    text = text.replace("__VOICEBOX_GPU_COMMAND__", _xml_escape(sys.executable))
+    text = text.replace("__VOICEBOX_GPU_ARGUMENTS__", _xml_escape(arguments))
+    text = text.replace("__VOICEBOX_GPU_USERID__", _xml_escape(_current_windows_user()))
+
+    # Task Scheduler requires UTF-16LE with BOM for XML definitions.
+    task_dir = hermes_root / "installer"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    task_dst = task_dir / "voicebox-gpu-lifecycle.xml"
+    task_dst.write_text(text, encoding="utf-16")
+
+    steps = []
+    for args in (
+        ["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"],
+        ["schtasks", "/Create", "/TN", WINDOWS_TASK_NAME, "/XML", str(task_dst), "/F"],
+        ["schtasks", "/Run", "/TN", WINDOWS_TASK_NAME],
+    ):
+        label = args[1].lstrip("/").lower()
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=60, check=False)
+            # A missing task on the pre-emptive /Delete is expected, not fatal.
+            if label == "delete":
+                continue
+            output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+            steps.append(f"schtasks {label}=>{proc.returncode}")
+            if proc.returncode != 0 and label == "create":
+                # Registering a task needs an elevated shell on most systems.
+                # Report that distinctly so the user gets an actionable hint
+                # instead of a bare failure; the daemon still runs manually.
+                if "access is denied" in output.lower():
+                    return "needs_elevation:" + ",".join(steps)
+                return "unit_written:" + ",".join(steps)
+        except FileNotFoundError:
+            # schtasks missing (e.g. Wine, stripped container).
+            return "unit_written:schtasks_unavailable"
+        except Exception as exc:
+            steps.append(f"schtasks {label}: {exc}")
+            return "unit_written:" + ",".join(steps)
+
+    return "enabled:" + ",".join(steps)
+
+
+def _current_windows_user() -> str:
+    """
+    DOMAIN\\user (or just user) for the Scheduled Task principal.
+
+    Without an explicit UserId, schtasks /Create against the root task folder
+    fails with "Access is denied" unless the shell is elevated.
+    """
+    domain = os.environ.get("USERDOMAIN", "")
+    user = os.environ.get("USERNAME", "")
+    if domain and user:
+        return f"{domain}\\{user}"
+    return user or "%USERNAME%"
+
+
+def _xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def install_gpu_lifecycle(
+    hermes_root: Path,
+    *,
+    stop_on_hermes_exit: bool = True,
+    idle_minutes: int = 10,
+    enable: bool = True,
+    base_url: str | None = None,
+) -> str:
+    """
+    Install GPU lifecycle config + an OS service unit for the daemon.
+
+    Service backends (see ``service_backend()``):
+      * Linux   -> user systemd unit (~/.config/systemd/user)
+      * Windows -> per-user Scheduled Task (Hermes_Voicebox_GPU_Lifecycle)
+      * other   -> config only; run ``lifecycle-daemon`` manually
+
+    Returns a short status string for the installer log.
+    """
+    # Seed config via the installed helper (or repo script during tests).
+    gpu_py = hermes_root / "scripts" / "voicebox_gpu.py"
+    if not gpu_py.is_file():
+        return "missing_gpu_script"
+
+    import json as _json
+
+    # Respect an existing user-tuned idle value: only seed the default when no
+    # voicebox_gpu.json is present yet. This stops a re-run of install.sh from
+    # silently clobbering a deliberate idle_unload_minutes change.
+    cfg_path = (hermes_root / "voicebox_gpu.json")
+    if cfg_path.is_file():
+        try:
+            existing = _json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and "idle_unload_minutes" in existing:
+                idle_minutes = int(existing["idle_unload_minutes"])
+        except Exception:
+            pass
+
+    cmd = [
+        sys.executable,
+        str(gpu_py),
+        "--hermes-home",
+        str(hermes_root),
+        "config",
+        "--stop-on-hermes-exit",
+        "on" if stop_on_hermes_exit else "off",
+        "--idle-unload",
+        "on",
+        "--idle-minutes",
+        str(idle_minutes),
+    ]
+    subprocess.run(cmd, check=False, capture_output=True, text=True)
+
+    backend = service_backend()
+    if backend is None or not enable:
+        return "config_only" if not enable else f"config_only_unsupported_platform_{platform.system().lower()}"
+
+    # Never enable an OS service unit that points at a throwaway --hermes-dir
+    # (unit tests / smoke installs). Only wire the service for the real home.
+    real_home = (Path.home() / ".hermes").resolve()
+    if hermes_root.resolve() != real_home:
+        return "config_only_non_default_home"
+
+    if backend == "systemd":
+        return _install_gpu_lifecycle_systemd(hermes_root, gpu_py, base_url)
+    if backend == "schtasks":
+        return _install_gpu_lifecycle_schtasks(hermes_root, gpu_py, base_url)
+    return "config_only_unknown_backend"
 
 
 def _tts_marker_is_under_personalities(text: str) -> bool:
@@ -594,13 +905,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--profile",
         default=None,
-        help="Merge TTS config into Hermes Desktop profile home "
+        help="Install plugin/scripts + merge TTS into one Hermes Desktop profile home "
         "(default → ~/.hermes; other names → ~/.hermes/profiles/<name>)",
     )
     parser.add_argument(
         "--all-profiles",
         action="store_true",
-        help="Merge Voicebox TTS into default + every ~/.hermes/profiles/* config.yaml",
+        help="Install plugin/scripts + merge TTS into default and every "
+        "~/.hermes/profiles/* home (Desktop loads plugins per profile HERMES_HOME)",
     )
     parser.add_argument(
         "--base-url",
@@ -636,6 +948,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-hermes", action="store_true", help="Do not install Hermes")
     parser.add_argument("--skip-voicebox", action="store_true", help="Do not provision Voicebox")
     parser.add_argument("--skip-models", action="store_true", help="Do not download TTS models")
+    parser.add_argument(
+        "--skip-samples",
+        action="store_true",
+        help="Do not seed the canonical demo CLONE voices (reference WAVs) into Voicebox",
+    )
     parser.add_argument(
         "--skip-gpu-lifecycle",
         action="store_true",
@@ -679,7 +996,8 @@ def main(argv: list[str] | None = None) -> int:
         resolve_profile_hermes_dir(args.profile, root_hermes) if args.profile else root_hermes
     )
     python_cmd = find_python_command() or ("python" if platform.system() == "Windows" else "python3")
-    # Plugin + bridge always install under the root Hermes dir (Desktop loads them once).
+    # Root keeps shared speak-stream / GPU lifecycle. Desktop loads plugins from each
+    # profile's HERMES_HOME, so --profile / --all-profiles also copy plugin+scripts there.
     install_root = root_hermes
     bridge_path = install_root / "scripts" / "voicebox_tts.py"
     snippet = build_snippet(python_cmd, bridge_path)
@@ -726,6 +1044,31 @@ def main(argv: list[str] | None = None) -> int:
                 print("ERROR: Prerequisites failed; aborting.", file=sys.stderr)
                 return 1
 
+        # Seed canonical demo CLONE voices so every install ships identical demos.
+        if (
+            not args.skip_samples
+            and not args.skip_voicebox
+            and voicebox_healthy(args.base_url)
+        ):
+            seed_report = ProvisionReport()
+            if seed_sample_clones(
+                args.base_url, repo_root() / "samples", seed_report
+            ):
+                for a in seed_report.actions:
+                    log(a)
+            else:
+                for e in seed_report.errors:
+                    print(f"WARNING: demo clone seeding: {e}", file=sys.stderr)
+
+    if args.all_profiles:
+        config_homes = list_profile_hermes_dirs(install_root)
+    elif args.profile:
+        hermes_dir.mkdir(parents=True, exist_ok=True)
+        config_homes = [hermes_dir]
+    else:
+        config_homes = [install_root]
+
+    # Always refresh root first (shared bridge path in TTS snippet + speak-stream).
     plugin_dst, bridge_dst = install_files(src_root, install_root)
     verify_install(plugin_dst, bridge_dst)
     print(f"Installed plugin: {plugin_dst}")
@@ -737,6 +1080,16 @@ def main(argv: list[str] | None = None) -> int:
     if gpu_dst.is_file():
         print(f"Installed GPU helper: {gpu_dst}")
 
+    for home in config_homes:
+        if home == install_root:
+            continue
+        home.mkdir(parents=True, exist_ok=True)
+        p_dst, b_dst = install_files(src_root, home)
+        verify_install(p_dst, b_dst)
+        label = home.name
+        print(f"[{label}] Installed plugin: {p_dst}")
+        print(f"[{label}] Installed bridge: {b_dst}")
+
     if not args.skip_gpu_lifecycle:
         gpu_status = install_gpu_lifecycle(
             install_root,
@@ -745,6 +1098,23 @@ def main(argv: list[str] | None = None) -> int:
             base_url=args.base_url,
         )
         print(f"GPU lifecycle: {gpu_status}")
+        if gpu_status.startswith("needs_elevation"):
+            print(
+                "  NOTE: registering the Scheduled Task requires an elevated shell.\n"
+                "        Re-run install from an Administrator PowerShell to enable\n"
+                "        automatic idle-unload, or start the daemon manually:\n"
+                f"          \"{sys.executable}\" "
+                f"\"{install_root / 'scripts' / 'voicebox_gpu.py'}\" lifecycle-daemon"
+            )
+        elif gpu_status.startswith("needs_user_bus"):
+            print(
+                "  NOTE: no systemd user bus (common in WSL/containers). The unit\n"
+                "        was written but not started. Enable lingering with\n"
+                "        'sudo loginctl enable-linger $USER' and re-run, or start\n"
+                "        the daemon manually:\n"
+                f"          {sys.executable} "
+                f"{install_root / 'scripts' / 'voicebox_gpu.py'} lifecycle-daemon"
+            )
     else:
         print("GPU lifecycle: skipped (--skip-gpu-lifecycle)")
 
@@ -772,14 +1142,6 @@ def main(argv: list[str] | None = None) -> int:
     if persona_snippet.strip():
         persona_snippet_path.write_text(persona_snippet, encoding="utf-8")
         print(f"Wrote personas:   {persona_snippet_path}")
-
-    if args.all_profiles:
-        config_homes = list_profile_hermes_dirs(install_root)
-    elif args.profile:
-        hermes_dir.mkdir(parents=True, exist_ok=True)
-        config_homes = [hermes_dir]
-    else:
-        config_homes = [install_root]
 
     if args.no_config:
         print("Skipped config.yaml (--no-config).")
@@ -834,7 +1196,10 @@ def main(argv: list[str] | None = None) -> int:
         f"  • Long read-aloud starts per sentence via speak-stream; "
         f"command timeout is {COMMAND_TTS_TIMEOUT_SECONDS}s"
     )
-    print("  • For other profiles: python install.py --skip-prereqs --profile <name>  (or --all-profiles)")
+    print(
+        "  • New Hermes profiles: python install.py --skip-prereqs --all-profiles "
+        "(copies plugin into each profile’s desktop-plugins/)"
+    )
     print("  • CLI bind: HERMES_HOME=~/.hermes/profiles/<name> python3 scripts/voicebox_bind.py --voice <uuid>")
     print(
         "  • After a Hermes Agent update, re-run: "

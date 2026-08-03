@@ -19,13 +19,134 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Iterator, Optional
 
+
+def _resolve_engine_and_model_size(base_url: str, profile_id: Optional[str], engine: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Fetch profile metadata to resolve engine + model_size, matching voicebox_tts.py logic.
+
+    Returns (engine, model_size). If profile fetch fails, returns (engine, None)
+    — the caller can still fire preload without model_size and Voicebox will
+    use the engine's default.
+    """
+    if engine:
+        # Engine was explicitly configured — just compute model_size
+        return engine, _compute_model_size(engine)
+
+    try:
+        import json
+        import urllib.request
+        with urllib.request.urlopen(f"{base_url.rstrip('/')}/profiles/{profile_id}", timeout=3) as resp:
+            profile = json.loads(resp.read())
+        raw_engine = profile.get("default_engine") or profile.get("preset_engine")
+        if raw_engine:
+            engine = _normalize_engine(raw_engine)
+            size = _compute_model_size(raw_engine)
+            return engine, size
+    except Exception:
+        pass
+
+    return None, None
+
+
+def _normalize_engine(raw: str | None) -> Optional[str]:
+    if not raw:
+        return None
+    return str(raw).strip().lower()
+
+
+def _compute_model_size(engine: str | None) -> Optional[str]:
+    """Mirror voicebox_tts.model_size_for_engine — prefer 0.6B on 8GB-class GPUs."""
+    if engine is None:
+        return None
+    raw = str(engine).strip().lower()
+    override = (os.environ.get("VOICEBOX_QWEN_MODEL_SIZE") or "").strip()
+    if raw in {"qwen", "qwen_fast", "qwen3"}:
+        if override in {"0.6B", "1.7B", "1B", "3B"}:
+            return override
+        if raw == "qwen_fast":
+            return "0.6B"
+        return "0.6B"
+    return None
+
+
+def preload_voicebox_model(
+    base_url: str = "http://127.0.0.1:17493",
+    profile_id: Optional[str] = None,
+    engine: Optional[str] = None,
+) -> None:
+    """Fire-and-forget async model warm-up.
+
+    Hits Voicebox' ``POST /models/preload`` so the ~10s cold model load
+    overlaps the assistant's text generation instead of blocking the first
+    spoken sentence. Non-blocking: returns immediately; the load runs on the
+    Voicebox server. ``touch_last_active`` is called server-side, which also
+    keeps the model resident through the session (idle unload is ~10 min).
+
+    When ``engine`` is None, fetches the profile from Voicebox to resolve the
+    engine + model_size (e.g. qwen → 0.6B for Cartman on 8GB GPU). This ensures
+    the preloader and the actual TTS use the **same** model, avoiding a wasteful
+    unload→reload cycle when Voicebox's default size differs from the OOM-safe
+    size voicebox_tts.py selects.
+    """
+    import json
+    import urllib.request
+
+    # Resolve engine + model_size from profile metadata if needed.
+    resolved_engine, resolved_size = _resolve_engine_and_model_size(base_url, profile_id, engine)
+    if resolved_engine:
+        engine = resolved_engine
+
+    payload: dict = {"profile_id": profile_id}
+    if engine:
+        payload["engine"] = engine
+    if resolved_size:
+        payload["model_size"] = resolved_size
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/models/preload",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except Exception as exc:  # never block speech on a preload hiccup
+        logger.debug("Voicebox preload skipped: %s", exc)
+
+
+def _resolve_voicebox_profile(base_url: str, profile_id: Optional[str]) -> tuple:
+    return profile_id, "chatterbox_turbo"
+
+
 from tools.tts_streaming import StreamingTTSProvider, register
 
 logger = logging.getLogger(__name__)
+
+# First emitted piece is kept small so audio starts almost immediately;
+# later pieces grow to full sentence size. The number of words in the
+# lead chunk is a latency/continuity trade-off: small = fast first sound,
+# large = fewer synthesis hand-offs. 10-14 words renders in ~1s on a
+# laptop GPU while keeping the gap before sentence 2 short.
+ADAPTIVE_FIRST_CHUNK_WORDS = 12
+
+
+def _adaptive_first_split(text: str) -> Iterator[str]:
+    """Yield a small lead chunk, then the remainder.
+
+    Used for the very first piece so playback can begin before the whole
+    first sentence is synthesized. Subsequent pieces are emitted whole.
+    """
+    toks = text.split()
+    if len(toks) <= ADAPTIVE_FIRST_CHUNK_WORDS:
+        yield text
+        return
+    yield " ".join(toks[:ADAPTIVE_FIRST_CHUNK_WORDS])
+    yield " ".join(toks[ADAPTIVE_FIRST_CHUNK_WORDS:])
 
 
 def _provider_section(tts_config: Dict, section: Dict) -> Dict:
@@ -48,6 +169,25 @@ class VoiceboxCommandStreamer(StreamingTTSProvider):
     def __init__(self, tts_config: Dict, section: Dict):
         resolved = _provider_section(tts_config, section)
         super().__init__(tts_config, resolved)
+        # Capture the bound Voicebox profile + base URL once, so a speak can
+        # trigger a model warm-up with zero network lookups on the hot path.
+        self._vb_voice = (resolved or {}).get("voice")
+        self._vb_base = (resolved or {}).get("base_url") or "http://127.0.0.1:17493"
+        self._vb_engine = (resolved or {}).get("engine")
+        self._vb_preloaded = False
+        # Fire preload immediately at construction time (WebSocket connect),
+        # not at first stream() call. This overlaps the ~10s cold model load
+        # with whatever the user is doing before the first text token arrives,
+        # shaving the perceived latency for first-audio to near-zero.
+        # Pass engine=None so Voicebox resolves the engine from the profile's
+        # default_engine (e.g. "qwen" → 0.6B for Cartman, not chatterbox_turbo).
+        threading.Thread(
+            target=preload_voicebox_model,
+            kwargs={"base_url": self._vb_base, "profile_id": self._vb_voice, "engine": self._vb_engine},
+            daemon=True,
+            name="vb-preload-init",
+        ).start()
+        self._vb_preloaded = True
 
     @staticmethod
     def available() -> bool:
@@ -59,6 +199,18 @@ class VoiceboxCommandStreamer(StreamingTTSProvider):
         cleaned = (text or "").strip()
         if not cleaned:
             return
+
+        # Preload already fired in __init__ (at WebSocket connect time, earlier
+        # than this first stream() call). The guard is kept for safety — if
+        # stream() is called directly (not via speak-stream), preload here.
+        if not self._vb_preloaded:
+            self._vb_preloaded = True
+            threading.Thread(
+                target=preload_voicebox_model,
+                kwargs={"base_url": self._vb_base, "profile_id": self._vb_voice, "engine": self._vb_engine},
+                daemon=True,
+                name="vb-preload",
+            ).start()
 
         from tools.tts_tool import text_to_speech_tool
 
@@ -105,11 +257,17 @@ def produce_speak_stream_pcm(
     """
 
     def pieces() -> Iterator[str]:
+        first = True
         for sentence in sentences_fn():
             if getattr(stop, "is_set", lambda: False)():
                 return
             cleaned = (strip_md(sentence) or "").strip()
             if not cleaned:
+                continue
+            if first:
+                # Fast first sound: emit a small lead chunk, then the rest.
+                yield from _adaptive_first_split(cleaned)
+                first = False
                 continue
             for piece in split_fn(cleaned, cap):
                 piece = (piece or "").strip()

@@ -1,0 +1,39 @@
+# Line-ending policy for a repo developed from both Windows and Linux.
+#
+# Without this, a Windows checkout rewrites LF -> CRLF, and the next Linux
+# commit shows every line of every file as changed. Normalising in the index
+# keeps cross-platform diffs limited to real edits.
+
+# Default: normalise text to LF in the repository, checkout native on Windows.
+* text=auto eol=lf
+
+# Must stay LF — executed by bash / python on Linux; CRLF breaks shebangs
+# ("bad interpreter: /usr/bin/env python3\r") and systemd unit parsing.
+*.sh            text eol=lf
+*.py            text eol=lf
+*.service       text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+*.js            text eol=lf
+*.mjs           text eol=lf
+*.css           text eol=lf
+
+# Must stay CRLF — Windows shells and Task Scheduler are CRLF-native.
+*.ps1           text eol=crlf
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+
+# Scheduled Task definitions are written as UTF-16LE by the installer; never
+# let Git touch their bytes.
+installer/windows/*.xml   -text
+
+# Binary assets — no normalisation, no diffing.
+*.wav           binary
+*.mp3           binary
+*.png           binary
+*.jpg           binary
+*.ico           binary
+*.db            binary
+*.pglite        binary

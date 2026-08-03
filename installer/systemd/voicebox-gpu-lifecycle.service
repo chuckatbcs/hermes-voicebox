@@ -7,6 +7,14 @@ Type=simple
 ExecStart=%h/.hermes/scripts/voicebox_gpu.py lifecycle-daemon
 Restart=on-failure
 RestartSec=5
+# On shutdown: SIGTERM to the daemon, allow 10s for the idle-unload loop
+# to finish, then SIGKILL.  The daemon's signal handler calls stop_voicebox()
+# to gracefully unload CUDA models before exiting.
+TimeoutStopSec=10
+KillMode=control-group
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
 
 # Localhost control API only (127.0.0.1:17494)
 # Does not expose Voicebox beyond its existing bind.

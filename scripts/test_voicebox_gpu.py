@@ -62,6 +62,10 @@ class UnloadTests(unittest.TestCase):
             gpu.touch_activity(home)
 
             def fake_http(method, url, body=None, timeout=30.0):
+                # Return health as "alive" so idle_check proceeds past the
+                # reachable check; then raise if unload is attempted.
+                if url.endswith("/health"):
+                    return {"ok": True, "model_loaded": True}
                 raise AssertionError("should not unload when fresh")
 
             with mock.patch.object(gpu, "_http_json", side_effect=fake_http):
@@ -94,16 +98,73 @@ class HermesReturnRestartTests(unittest.TestCase):
             daemon = gpu.LifecycleDaemon(base_url="http://127.0.0.1:17493", home=home, control_port=0)
             daemon._hermes_was_up = False  # simulate prior Hermes-exit stop
             daemon._stop = mock.Mock()
-            # One loop iteration then exit
-            daemon._stop.wait = mock.Mock(side_effect=[False, True])
+            # First wait: 0s (loop check), second wait: 5s (verify startup), third: True (exit)
+            daemon._stop.wait = mock.Mock(side_effect=[False, False, True])
 
-            with mock.patch.object(gpu, "hermes_desktop_running", return_value=True), mock.patch.object(
-                gpu, "start_voicebox", return_value={"actions": []}
-            ) as start, mock.patch.object(gpu, "idle_check"):
+            # get_health returns None first (Voicebox down → triggers start_voicebox),
+            # then returns a dict (Voicebox came up after start).
+            health_mock = mock.Mock(side_effect=[None, None, {"ok": True, "model_loaded": False}])
+
+            with mock.patch.object(gpu, "hermes_desktop_running", return_value=True), \
+                 mock.patch.object(gpu, "get_health", side_effect=health_mock), \
+                 mock.patch.object(gpu, "start_voicebox", return_value={"actions": []}) as start, \
+                 mock.patch.object(gpu, "idle_check", side_effect=lambda *a, **kw: {"action": "ok"}):
                 daemon._loop()
 
             start.assert_called_once()
             self.assertTrue(daemon._hermes_was_up)
+
+
+class PlatformServiceControlTests(unittest.TestCase):
+    """stop/start_voicebox must behave correctly on Linux and Windows alike."""
+
+    def test_stop_uses_systemctl_on_linux(self):
+        with mock.patch.object(gpu.sys, "platform", "linux"), mock.patch.object(
+            gpu, "_run", return_value=(0, "")
+        ) as run, mock.patch.object(gpu, "hermes_home", return_value=Path(tempfile.gettempdir()) / "nope"):
+            result = gpu.stop_voicebox()
+        methods = " ".join(a.get("method", "") for a in result["actions"])
+        self.assertIn("systemctl", methods)
+        self.assertTrue(any("systemctl" in c[0][0][0] for c in run.call_args_list))
+
+    def test_stop_uses_taskkill_on_windows(self):
+        with mock.patch.object(gpu.sys, "platform", "win32"), mock.patch.object(
+            gpu, "_run", return_value=(0, "")
+        ) as run, mock.patch.object(gpu, "hermes_home", return_value=Path(tempfile.gettempdir()) / "nope"):
+            result = gpu.stop_voicebox()
+        methods = " ".join(a.get("method", "") for a in result["actions"])
+        self.assertIn("taskkill", methods)
+        self.assertNotIn("systemctl", methods)
+        cmds = [c[0][0] for c in run.call_args_list]
+        self.assertTrue(any(c[0] == "taskkill" for c in cmds), cmds)
+
+    def test_start_launches_exe_on_windows(self):
+        fake_exe = Path("C:/Program Files/Voicebox/Voicebox.exe")
+        with mock.patch.object(gpu.sys, "platform", "win32"), mock.patch.object(
+            gpu, "find_windows_voicebox_exe", return_value=fake_exe
+        ), mock.patch.object(gpu.subprocess, "Popen") as popen, mock.patch.object(
+            gpu, "hermes_home", return_value=Path(tempfile.gettempdir()) / "nope"
+        ):
+            result = gpu.start_voicebox()
+        popen.assert_called_once()
+        self.assertIn("started", str(result["actions"]))
+
+    def test_start_reports_missing_exe_on_windows(self):
+        with mock.patch.object(gpu.sys, "platform", "win32"), mock.patch.object(
+            gpu, "find_windows_voicebox_exe", return_value=None
+        ), mock.patch.object(gpu, "hermes_home", return_value=Path(tempfile.gettempdir()) / "nope"):
+            result = gpu.start_voicebox()
+        self.assertIn("not found", str(result["actions"]))
+
+    def test_find_windows_voicebox_exe_prefers_existing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            target = base / "Voicebox" / "Voicebox.exe"
+            target.parent.mkdir(parents=True)
+            target.write_text("stub", encoding="utf-8")
+            with mock.patch.dict(gpu.os.environ, {"LOCALAPPDATA": str(base)}, clear=False):
+                found = gpu.find_windows_voicebox_exe()
+            self.assertEqual(found, target)
 
 
 if __name__ == "__main__":

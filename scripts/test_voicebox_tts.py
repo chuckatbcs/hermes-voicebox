@@ -241,5 +241,102 @@ class TestProfilePreflight(unittest.TestCase):
         }))
 
 
+class TestEngineNormalize(unittest.TestCase):
+    def test_qwen_fast_alias(self):
+        from voicebox_tts import normalize_engine, model_size_for_engine
+
+        self.assertEqual(normalize_engine("qwen_fast"), "qwen")
+        self.assertEqual(normalize_engine("Qwen_Fast"), "qwen")
+        self.assertEqual(normalize_engine("chatterbox_turbo"), "chatterbox_turbo")
+        self.assertIsNone(normalize_engine(None))
+        self.assertEqual(model_size_for_engine("qwen_fast"), "0.6B")
+        self.assertEqual(model_size_for_engine("qwen"), "0.6B")
+        self.assertIsNone(model_size_for_engine("chatterbox_turbo"))
+
+
+class TestSanitizeSpokenText(unittest.TestCase):
+    def test_strips_bracket_stage_directions_for_qwen(self):
+        from voicebox_tts import sanitize_spoken_text_for_voicebox
+
+        out = sanitize_spoken_text_for_voicebox(
+            "What do you want? [whiny voice] Respect my authoritah!",
+            "qwen",
+        )
+        self.assertNotIn("[", out)
+        self.assertNotIn("whiny", out.lower())
+        self.assertIn("Respect my authoritah", out)
+
+    def test_keeps_chatterbox_paralinguistic_tags(self):
+        from voicebox_tts import sanitize_spoken_text_for_voicebox
+
+        out = sanitize_spoken_text_for_voicebox(
+            "Hi there [chuckle], got a minute?",
+            "chatterbox_turbo",
+        )
+        self.assertIn("[chuckle]", out)
+
+    def test_strips_unknown_brackets_even_on_chatterbox(self):
+        from voicebox_tts import sanitize_spoken_text_for_voicebox
+
+        out = sanitize_spoken_text_for_voicebox(
+            "Hello [sarcastically] friend [laugh]",
+            "chatterbox_turbo",
+        )
+        self.assertNotIn("sarcastically", out)
+        self.assertIn("[laugh]", out)
+
+    def test_strips_markdown_emphasis(self):
+        from voicebox_tts import sanitize_spoken_text_for_voicebox
+
+        out = sanitize_spoken_text_for_voicebox(
+            "Something *extremely* important",
+            "qwen",
+        )
+        self.assertEqual(out, "Something extremely important")
+
+
+class TestCudaOomHelpers(unittest.TestCase):
+    def test_detects_cuda_oom(self):
+        from voicebox_tts import _is_cuda_oom_error
+
+        self.assertTrue(_is_cuda_oom_error("torch.cuda.OutOfMemoryError: CUDA out of memory"))
+        self.assertTrue(_is_cuda_oom_error("RuntimeError: CUDA OOM while allocating"))
+        self.assertFalse(_is_cuda_oom_error("HTTP 500: unspecified error"))
+        self.assertFalse(_is_cuda_oom_error("room temperature high"))
+
+    def test_unload_result_shape(self):
+        from voicebox_tts import unload_voicebox_models
+
+        calls = []
+
+        def fake_get(url):
+            calls.append(("GET", url))
+            return {
+                "models": [
+                    {"model_name": "qwen", "loaded": True, "downloaded": True},
+                    {"model_name": "kokoro", "loaded": False},
+                ]
+            }
+
+        # Patch module helpers used by unload
+        import voicebox_tts as vb
+
+        old_get = vb._get_json
+        old_post = vb._post_json_ok
+        old_vram = vb._nvidia_vram_mb
+        vb._get_json = fake_get
+        vb._post_json_ok = lambda url, body=None, timeout=60.0: (True, "ok")
+        vb._nvidia_vram_mb = lambda: (2048, 4096)
+        try:
+            result = unload_voicebox_models("http://127.0.0.1:17493")
+        finally:
+            vb._get_json = old_get
+            vb._post_json_ok = old_post
+            vb._nvidia_vram_mb = old_vram
+        self.assertIn("qwen", result["unloaded"])
+        self.assertTrue(result["default"]["ok"])
+        self.assertEqual(result["vram_before"]["used_mb"], 2048)
+
+
 if __name__ == "__main__":
     unittest.main()
