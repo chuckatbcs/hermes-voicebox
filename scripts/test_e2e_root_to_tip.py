@@ -200,18 +200,19 @@ def main() -> int:
                     "re-install idempotent",
                     f"jarvis: {before_jarvis_keys}→{after_jarvis_keys}, lines {before_lines}→{after_lines}",
                 )
+            out = r2.stdout or ""
             merge_ok = any(
-                s in (r2.stdout or "")
+                s in out
                 for s in ("skipped_existing", "replaced", "Sample personalities: replaced")
             )
-            merge_bad = "inserted_personalities" in (r2.stdout or "") or (
-                "repaired_providers_nesting" in (r2.stdout or "")
-                and "replaced" not in (r2.stdout or "")
-                and "skipped_existing" not in (r2.stdout or "")
+            merge_bad = "inserted_personalities" in out or (
+                "repaired_providers_nesting" in out
+                and "replaced" not in out
+                and "skipped_existing" not in out
             )
             if merge_ok and not merge_bad:
                 c.ok("personality merge status", "idempotent replace/skip")
-            elif "inserted_personalities" in r2.stdout:
+            elif "inserted_personalities" in out:
                 c.fail("personality merge status", "inserted_personalities on re-run")
             else:
                 # Accept repaired only when keys did not duplicate (checked above).
