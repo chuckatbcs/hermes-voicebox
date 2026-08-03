@@ -1,0 +1,96 @@
+name: cross-platform checks
+
+# Both Windows and Linux installs ship from this branch, so every push is
+# validated on both. A change that only compiles on one OS must fail here
+# rather than on a user's machine.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip PyYAML
+
+      - name: Syntax compile
+        run: |
+          python -m py_compile install.py installer/prereqs.py scripts/voicebox_tts.py scripts/voicebox_bind.py scripts/voicebox_gpu.py scripts/hermes_voicebox_streamer.py
+
+      - name: Installer unit tests
+        run: python -m unittest test_install.py -v
+
+      - name: Bridge + GPU unit tests
+        working-directory: scripts
+        run: python -m unittest test_voicebox_tts.py test_voicebox_gpu.py -v
+
+      - name: Plugin storage tests
+        run: node --test desktop-plugin/test_plugin_storage.mjs
+
+      - name: Root-to-tip E2E
+        run: python scripts/test_e2e_root_to_tip.py
+
+      - name: Verify both service templates are present
+        shell: python
+        run: |
+          import sys
+          from pathlib import Path
+
+          required = [
+              Path("installer/systemd/voicebox-gpu-lifecycle.service"),
+              Path("installer/windows/voicebox-gpu-lifecycle.xml"),
+          ]
+          missing = [str(p) for p in required if not p.is_file()]
+          if missing:
+              sys.exit("Missing service template(s): " + ", ".join(missing))
+          print("Both service templates present.")
+
+  line-endings:
+    name: line-ending hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail on CRLF in LF-only files
+        run: |
+          set -euo pipefail
+          bad=$(git grep -Il $'\r' -- '*.sh' '*.py' '*.service' '*.yml' '*.yaml' || true)
+          if [ -n "$bad" ]; then
+            echo "CRLF found in LF-only files:"
+            echo "$bad"
+            echo "Fix with: git add --renormalize ."
+            exit 1
+          fi
+          echo "Line endings OK."
+
+      - name: Fail if .gitattributes would renormalize the tree
+        run: |
+          set -euo pipefail
+          git add --renormalize .
+          if ! git diff --cached --quiet; then
+            echo "Files are not normalized per .gitattributes:"
+            git diff --cached --stat
+            exit 1
+          fi
+          echo "Tree matches .gitattributes."

@@ -13,12 +13,27 @@ from installer import prereqs
 
 class InstallerTests(unittest.TestCase):
     def test_build_snippet_quotes_spaces(self):
+        """Paths containing spaces must be quoted, using native separators."""
         bridge = Path("/home/some user/.hermes/scripts/voicebox_tts.py")
         snippet = install.build_snippet("python3", bridge)
-        self.assertIn('command: python3 "/home/some user/.hermes/scripts/voicebox_tts.py"', snippet)
+        # str(Path) yields native separators (\\ on Windows, / on POSIX); the
+        # contract under test is the quoting, not the separator flavour.
+        self.assertIn(f'command: python3 "{bridge}"', snippet)
         self.assertIn(install.MARKER_BEGIN, snippet)
         self.assertIn(install.MARKER_END, snippet)
         self.assertIn(f"timeout: {install.COMMAND_TTS_TIMEOUT_SECONDS}", snippet)
+
+    def test_build_snippet_leaves_spaceless_path_unquoted(self):
+        bridge = Path("/home/user/.hermes/scripts/voicebox_tts.py")
+        snippet = install.build_snippet("python3", bridge)
+        self.assertIn(f"command: python3 {bridge} ", snippet)
+        self.assertNotIn(f'"{bridge}"', snippet)
+
+    def test_build_snippet_quotes_windows_style_path(self):
+        """A Windows path with spaces is quoted the same way as a POSIX one."""
+        bridge = Path(r"C:\Program Files\Hermes\scripts\voicebox_tts.py")
+        snippet = install.build_snippet("py -3", bridge)
+        self.assertIn(f'command: py -3 "{bridge}"', snippet)
 
     def test_install_and_create_config(self):
         src = Path(__file__).resolve().parent
@@ -413,13 +428,21 @@ class SpeakStreamHookTests(unittest.TestCase):
             self.assertTrue((root / "scripts" / "voicebox_bind.py").is_file())
             self.assertTrue((root / "scripts" / "voicebox_gpu.py").is_file())
             self.assertTrue((root / "scripts" / "diagnose_tts.sh").is_file())
+            # A throwaway --hermes-dir must never get a real OS service unit,
+            # on any platform with a supported supervisor.
             self.assertEqual(
                 install.install_gpu_lifecycle(root, enable=True),
                 "config_only_non_default_home",
             )
             self.assertTrue((root / "voicebox_gpu.json").is_file())
 
+    def test_service_backend_maps_each_platform(self):
+        self.assertEqual(install.service_backend("Linux"), "systemd")
+        self.assertEqual(install.service_backend("Windows"), "schtasks")
+        self.assertIsNone(install.service_backend("Darwin"))
+
     def test_install_gpu_lifecycle_embeds_base_url_in_unit(self):
+        """systemd backend: ExecStart carries interpreter, home and base URL."""
         src = Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory() as tmp:
             fake_home = Path(tmp) / "home"
@@ -428,9 +451,12 @@ class SpeakStreamHookTests(unittest.TestCase):
             install.install_files(src, root)
             unit_dir = fake_home / ".config" / "systemd" / "user"
             custom = "http://127.0.0.1:18000"
-            with mock.patch.object(install.Path, "home", return_value=fake_home), mock.patch(
+            with mock.patch.object(install, "platform") as plat, mock.patch.object(
+                install.Path, "home", return_value=fake_home
+            ), mock.patch(
                 "subprocess.run", return_value=mock.Mock(returncode=0, stdout="", stderr="")
             ):
+                plat.system.return_value = "Linux"
                 status = install.install_gpu_lifecycle(
                     root, enable=True, base_url=custom
                 )
@@ -438,6 +464,121 @@ class SpeakStreamHookTests(unittest.TestCase):
             unit_text = (unit_dir / "voicebox-gpu-lifecycle.service").read_text(encoding="utf-8")
             self.assertIn(f"--base-url {custom}", unit_text)
             self.assertIn("lifecycle-daemon", unit_text)
+            self.assertIn(str(root), unit_text)
+
+    def test_install_gpu_lifecycle_embeds_base_url_in_scheduled_task(self):
+        """schtasks backend: the task XML mirrors the systemd ExecStart contract."""
+        src = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            root = fake_home / ".hermes"
+            install.install_files(src, root)
+            custom = "http://127.0.0.1:18000"
+            calls: list[list[str]] = []
+
+            def _record(args, *a, **kw):
+                calls.append(list(args))
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(install, "platform") as plat, mock.patch.object(
+                install.Path, "home", return_value=fake_home
+            ), mock.patch("subprocess.run", side_effect=_record):
+                plat.system.return_value = "Windows"
+                status = install.install_gpu_lifecycle(
+                    root, enable=True, base_url=custom
+                )
+
+            self.assertTrue(status.startswith("enabled:"), status)
+            task_xml = root / "installer" / "voicebox-gpu-lifecycle.xml"
+            self.assertTrue(task_xml.is_file())
+            text = task_xml.read_text(encoding="utf-16")
+            self.assertIn(f"--base-url {custom}", text)
+            self.assertIn("lifecycle-daemon", text)
+            self.assertIn(str(root), text)
+            # The task must actually be registered with the OS supervisor.
+            schtasks_calls = [c for c in calls if c and c[0] == "schtasks"]
+            self.assertTrue(
+                any("/Create" in c for c in schtasks_calls), schtasks_calls
+            )
+
+    def test_windows_task_template_is_well_formed_xml(self):
+        """
+        Guards a real failure mode: schtasks rejects malformed XML ("incorrect
+        comment syntax") while a mocked subprocess.run happily returns 0. Parse
+        the template on every platform so a bad edit fails CI on Linux too.
+        """
+        import xml.etree.ElementTree as ET
+
+        template = (
+            Path(__file__).resolve().parent
+            / "installer"
+            / "windows"
+            / "voicebox-gpu-lifecycle.xml"
+        )
+        self.assertTrue(template.is_file(), template)
+        raw = template.read_text(encoding="utf-8")
+        # Must parse; '--' inside an XML comment is illegal and raises here.
+        ET.fromstring(raw)
+        self.assertIn("__VOICEBOX_GPU_COMMAND__", raw)
+        self.assertIn("__VOICEBOX_GPU_ARGUMENTS__", raw)
+
+    def test_rendered_windows_task_is_well_formed_xml(self):
+        """The substituted task (real paths, real base URL) must still parse."""
+        import xml.etree.ElementTree as ET
+
+        src = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            root = fake_home / ".hermes"
+            install.install_files(src, root)
+            with mock.patch.object(install, "platform") as plat, mock.patch.object(
+                install.Path, "home", return_value=fake_home
+            ), mock.patch(
+                "subprocess.run", return_value=mock.Mock(returncode=0, stdout="", stderr="")
+            ):
+                plat.system.return_value = "Windows"
+                install.install_gpu_lifecycle(
+                    root, enable=True, base_url="http://127.0.0.1:18000"
+                )
+            rendered = (root / "installer" / "voicebox-gpu-lifecycle.xml").read_text(
+                encoding="utf-16"
+            )
+            tree = ET.fromstring(rendered)
+            ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+            args = tree.find(".//t:Exec/t:Arguments", ns)
+            self.assertIsNotNone(args)
+            self.assertIn("lifecycle-daemon", args.text or "")
+            self.assertNotIn("__VOICEBOX_GPU_", rendered)
+
+    def test_systemd_template_has_no_unresolved_placeholders(self):
+        template = (
+            Path(__file__).resolve().parent
+            / "installer"
+            / "systemd"
+            / "voicebox-gpu-lifecycle.service"
+        )
+        self.assertTrue(template.is_file(), template)
+        text = template.read_text(encoding="utf-8")
+        self.assertIn("ExecStart=", text)
+        self.assertIn("lifecycle-daemon", text)
+
+    def test_install_gpu_lifecycle_config_only_on_unsupported_platform(self):
+        src = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            root = fake_home / ".hermes"
+            install.install_files(src, root)
+            with mock.patch.object(install, "platform") as plat, mock.patch.object(
+                install.Path, "home", return_value=fake_home
+            ):
+                plat.system.return_value = "Darwin"
+                status = install.install_gpu_lifecycle(root, enable=True)
+            self.assertTrue(
+                status.startswith("config_only_unsupported_platform"), status
+            )
 
 
 class PrefetchPipelineTests(unittest.TestCase):

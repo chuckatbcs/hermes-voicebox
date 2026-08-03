@@ -16,6 +16,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -597,64 +598,35 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     return plugin_dst, bridge_dst
 
 
-def install_gpu_lifecycle(
-    hermes_root: Path,
-    *,
-    stop_on_hermes_exit: bool = True,
-    idle_minutes: int = 10,
-    enable: bool = True,
-    base_url: str | None = None,
+SERVICE_BACKEND_BY_PLATFORM = {
+    "Linux": "systemd",
+    "Windows": "schtasks",
+}
+
+WINDOWS_TASK_NAME = "Hermes_Voicebox_GPU_Lifecycle"
+
+
+def service_backend(system: str | None = None) -> str | None:
+    """
+    Name of the OS service manager used to run the GPU lifecycle daemon.
+
+    Returns ``"systemd"`` on Linux, ``"schtasks"`` on Windows, and ``None`` on
+    platforms with no supported supervisor (e.g. macOS), where the installer
+    falls back to config-only and the daemon may be run manually.
+    """
+    return SERVICE_BACKEND_BY_PLATFORM.get(system or platform.system())
+
+
+def _install_gpu_lifecycle_systemd(
+    hermes_root: Path, gpu_py: Path, base_url: str | None
 ) -> str:
-    """
-    Install GPU lifecycle config + Linux user systemd unit for the daemon.
-
-    Returns a short status string for the installer log.
-    """
-    # Seed config via the installed helper (or repo script during tests).
-    gpu_py = hermes_root / "scripts" / "voicebox_gpu.py"
-    if not gpu_py.is_file():
-        return "missing_gpu_script"
-
-    import json as _json
-    import subprocess
-
-    # Respect an existing user-tuned idle value: only seed the default when no
-    # voicebox_gpu.json is present yet. This stops a re-run of install.sh from
-    # silently clobbering a deliberate idle_unload_minutes change.
-    cfg_path = (hermes_root / "voicebox_gpu.json")
-    if cfg_path.is_file():
-        try:
-            existing = _json.loads(cfg_path.read_text(encoding="utf-8"))
-            if isinstance(existing, dict) and "idle_unload_minutes" in existing:
-                idle_minutes = int(existing["idle_unload_minutes"])
-        except Exception:
-            pass
-
-    cmd = [
-        sys.executable,
-        str(gpu_py),
-        "--hermes-home",
-        str(hermes_root),
-        "config",
-        "--stop-on-hermes-exit",
-        "on" if stop_on_hermes_exit else "off",
-        "--idle-unload",
-        "on",
-        "--idle-minutes",
-        str(idle_minutes),
-    ]
-    subprocess.run(cmd, check=False, capture_output=True, text=True)
-
-    if platform.system() != "Linux" or not enable:
-        return "config_only" if not enable else "config_only_non_linux"
-
-    # Never enable a user systemd unit that points at a throwaway --hermes-dir
-    # (unit tests / smoke installs). Only wire the service for the real home.
-    real_home = (Path.home() / ".hermes").resolve()
-    if hermes_root.resolve() != real_home:
-        return "config_only_non_default_home"
-
-    unit_src = Path(__file__).resolve().parent / "installer" / "systemd" / "voicebox-gpu-lifecycle.service"
+    """Linux backend: user systemd unit under ~/.config/systemd/user."""
+    unit_src = (
+        Path(__file__).resolve().parent
+        / "installer"
+        / "systemd"
+        / "voicebox-gpu-lifecycle.service"
+    )
     if not unit_src.is_file():
         return "missing_unit_template"
 
@@ -684,6 +656,163 @@ def install_gpu_lifecycle(
             return "unit_written:" + ",".join(steps)
 
     return "enabled:" + ",".join(steps)
+
+
+def _install_gpu_lifecycle_schtasks(
+    hermes_root: Path, gpu_py: Path, base_url: str | None
+) -> str:
+    """
+    Windows backend: a per-user Scheduled Task (systemd-user analogue).
+
+    Registers ``Hermes_Voicebox_GPU_Lifecycle`` to run the lifecycle daemon at
+    logon. Mirrors the systemd path: write the definition, then hand it to the
+    OS supervisor and report each step.
+    """
+    task_src = (
+        Path(__file__).resolve().parent
+        / "installer"
+        / "windows"
+        / "voicebox-gpu-lifecycle.xml"
+    )
+    if not task_src.is_file():
+        return "missing_unit_template"
+
+    base_url_args = f" --base-url {base_url}" if base_url else ""
+    arguments = (
+        f'"{gpu_py}" --hermes-home "{hermes_root}"{base_url_args} lifecycle-daemon'
+    )
+
+    text = task_src.read_text(encoding="utf-8")
+    text = text.replace("__VOICEBOX_GPU_COMMAND__", _xml_escape(sys.executable))
+    text = text.replace("__VOICEBOX_GPU_ARGUMENTS__", _xml_escape(arguments))
+    text = text.replace("__VOICEBOX_GPU_USERID__", _xml_escape(_current_windows_user()))
+
+    # Task Scheduler requires UTF-16LE with BOM for XML definitions.
+    task_dir = hermes_root / "installer"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    task_dst = task_dir / "voicebox-gpu-lifecycle.xml"
+    task_dst.write_text(text, encoding="utf-16")
+
+    steps = []
+    for args in (
+        ["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"],
+        ["schtasks", "/Create", "/TN", WINDOWS_TASK_NAME, "/XML", str(task_dst), "/F"],
+        ["schtasks", "/Run", "/TN", WINDOWS_TASK_NAME],
+    ):
+        label = args[1].lstrip("/").lower()
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=60, check=False)
+            # A missing task on the pre-emptive /Delete is expected, not fatal.
+            if label == "delete":
+                continue
+            output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+            steps.append(f"schtasks {label}=>{proc.returncode}")
+            if proc.returncode != 0 and label == "create":
+                # Registering a task needs an elevated shell on most systems.
+                # Report that distinctly so the user gets an actionable hint
+                # instead of a bare failure; the daemon still runs manually.
+                if "access is denied" in output.lower():
+                    return "needs_elevation:" + ",".join(steps)
+                return "unit_written:" + ",".join(steps)
+        except FileNotFoundError:
+            # schtasks missing (e.g. Wine, stripped container).
+            return "unit_written:schtasks_unavailable"
+        except Exception as exc:
+            steps.append(f"schtasks {label}: {exc}")
+            return "unit_written:" + ",".join(steps)
+
+    return "enabled:" + ",".join(steps)
+
+
+def _current_windows_user() -> str:
+    """
+    DOMAIN\\user (or just user) for the Scheduled Task principal.
+
+    Without an explicit UserId, schtasks /Create against the root task folder
+    fails with "Access is denied" unless the shell is elevated.
+    """
+    domain = os.environ.get("USERDOMAIN", "")
+    user = os.environ.get("USERNAME", "")
+    if domain and user:
+        return f"{domain}\\{user}"
+    return user or "%USERNAME%"
+
+
+def _xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def install_gpu_lifecycle(
+    hermes_root: Path,
+    *,
+    stop_on_hermes_exit: bool = True,
+    idle_minutes: int = 10,
+    enable: bool = True,
+    base_url: str | None = None,
+) -> str:
+    """
+    Install GPU lifecycle config + an OS service unit for the daemon.
+
+    Service backends (see ``service_backend()``):
+      * Linux   -> user systemd unit (~/.config/systemd/user)
+      * Windows -> per-user Scheduled Task (Hermes_Voicebox_GPU_Lifecycle)
+      * other   -> config only; run ``lifecycle-daemon`` manually
+
+    Returns a short status string for the installer log.
+    """
+    # Seed config via the installed helper (or repo script during tests).
+    gpu_py = hermes_root / "scripts" / "voicebox_gpu.py"
+    if not gpu_py.is_file():
+        return "missing_gpu_script"
+
+    import json as _json
+
+    # Respect an existing user-tuned idle value: only seed the default when no
+    # voicebox_gpu.json is present yet. This stops a re-run of install.sh from
+    # silently clobbering a deliberate idle_unload_minutes change.
+    cfg_path = (hermes_root / "voicebox_gpu.json")
+    if cfg_path.is_file():
+        try:
+            existing = _json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and "idle_unload_minutes" in existing:
+                idle_minutes = int(existing["idle_unload_minutes"])
+        except Exception:
+            pass
+
+    cmd = [
+        sys.executable,
+        str(gpu_py),
+        "--hermes-home",
+        str(hermes_root),
+        "config",
+        "--stop-on-hermes-exit",
+        "on" if stop_on_hermes_exit else "off",
+        "--idle-unload",
+        "on",
+        "--idle-minutes",
+        str(idle_minutes),
+    ]
+    subprocess.run(cmd, check=False, capture_output=True, text=True)
+
+    backend = service_backend()
+    if backend is None or not enable:
+        return "config_only" if not enable else f"config_only_unsupported_platform_{platform.system().lower()}"
+
+    # Never enable an OS service unit that points at a throwaway --hermes-dir
+    # (unit tests / smoke installs). Only wire the service for the real home.
+    real_home = (Path.home() / ".hermes").resolve()
+    if hermes_root.resolve() != real_home:
+        return "config_only_non_default_home"
+
+    if backend == "systemd":
+        return _install_gpu_lifecycle_systemd(hermes_root, gpu_py, base_url)
+    if backend == "schtasks":
+        return _install_gpu_lifecycle_schtasks(hermes_root, gpu_py, base_url)
+    return "config_only_unknown_backend"
 
 
 def _tts_marker_is_under_personalities(text: str) -> bool:
@@ -954,6 +1083,14 @@ def main(argv: list[str] | None = None) -> int:
             base_url=args.base_url,
         )
         print(f"GPU lifecycle: {gpu_status}")
+        if gpu_status.startswith("needs_elevation"):
+            print(
+                "  NOTE: registering the Scheduled Task requires an elevated shell.\n"
+                "        Re-run install from an Administrator PowerShell to enable\n"
+                "        automatic idle-unload, or start the daemon manually:\n"
+                f"          \"{sys.executable}\" "
+                f"\"{install_root / 'scripts' / 'voicebox_gpu.py'}\" lifecycle-daemon"
+            )
     else:
         print("GPU lifecycle: skipped (--skip-gpu-lifecycle)")
 

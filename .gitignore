@@ -2,3 +2,10 @@ __pycache__/
 *.py[cod]
 *.bak
 .DS_Store
+
+# Local runtime state — must never be committed from either OS.
+data/
+voicebox_gpu.json
+voicebox_gpu_control.port
+voicebox_tts_activity
+*.snippet.yaml

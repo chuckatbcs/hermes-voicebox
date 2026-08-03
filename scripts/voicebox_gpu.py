@@ -42,6 +42,32 @@ ACTIVITY_FILENAME = "voicebox_tts_activity"
 CONFIG_FILENAME = "voicebox_gpu.json"
 CONTROL_PORT_FILENAME = "voicebox_gpu_control.port"
 
+# Windows service-control parity with the Linux systemd path. Voicebox ships as
+# a desktop app on Windows (no service manager), so stop/start map to process
+# termination and a detached relaunch instead of systemctl.
+WINDOWS_VOICEBOX_IMAGES = ("Voicebox.exe", "voicebox.exe")
+WINDOWS_TASK_NAME = "Hermes_Voicebox_GPU_Lifecycle"
+
+
+def find_windows_voicebox_exe() -> Path | None:
+    """Locate the installed Voicebox desktop executable on Windows."""
+    candidates: list[Path] = []
+    for env in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+        base = os.environ.get(env)
+        if not base:
+            continue
+        candidates.extend(
+            [
+                Path(base) / "Voicebox" / "Voicebox.exe",
+                Path(base) / "Programs" / "Voicebox" / "Voicebox.exe",
+            ]
+        )
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
 _INVALID = {"", "default", "undefined", "null", "none"}
 
 
@@ -242,6 +268,14 @@ def stop_voicebox() -> dict[str, Any]:
             code2, out2 = _run(["systemctl", "--user", "stop", "voicebox"])
             actions.append({"method": "systemctl --user stop voicebox", "code": code2, "out": out2})
 
+    # Windows desktop app (systemd-unit analogue: no service, kill the process tree)
+    elif sys.platform.startswith("win"):
+        for image in WINDOWS_VOICEBOX_IMAGES:
+            code, out = _run(["taskkill", "/IM", image, "/T", "/F"])
+            # 128 == "process not found", which is a no-op rather than a failure.
+            if code == 0 or "not found" not in out.lower():
+                actions.append({"method": f"taskkill /IM {image}", "code": code, "out": out})
+
     # Docker compose in vendor path
     vendor = hermes_home() / "vendor" / "voicebox"
     if (vendor / "docker-compose.yml").is_file() or (vendor / "compose.yml").is_file():
@@ -277,6 +311,22 @@ def start_voicebox() -> dict[str, Any]:
         if code != 0:
             code2, out2 = _run(["systemctl", "--user", "start", "voicebox"])
             actions.append({"method": "systemctl --user start voicebox", "code": code2, "out": out2})
+    elif sys.platform.startswith("win"):
+        exe = find_windows_voicebox_exe()
+        if exe:
+            try:
+                subprocess.Popen(
+                    [str(exe)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+                )
+                actions.append({"method": f"launch {exe}", "code": 0, "out": "started"})
+            except Exception as exc:
+                actions.append({"method": f"launch {exe}", "error": str(exc)})
+        else:
+            actions.append({"method": "launch voicebox", "error": "Voicebox.exe not found"})
+
     vendor = hermes_home() / "vendor" / "voicebox"
     if vendor.is_dir():
         try:
@@ -565,6 +615,10 @@ class LifecycleDaemon:
         # Without this, systemd sends SIGTERM, Python ignores it, and after
         # TimeoutStopSec systemd sends SIGKILL — the daemon never gets to
         # unload CUDA models, leaving them resident during the rest of shutdown.
+        #
+        # Windows parity: Task Scheduler / taskkill deliver CTRL_BREAK and
+        # SIGBREAK rather than SIGTERM, so register the same handler for every
+        # termination signal the host platform actually supports.
         import signal
 
         self._is_systemd_stop = False
@@ -580,7 +634,15 @@ class LifecycleDaemon:
                     target=self._httpd.shutdown, name="httpd-shutdown", daemon=True
                 ).start()
 
-        signal.signal(signal.SIGTERM, _handle_sigterm)
+        for _signame in ("SIGTERM", "SIGBREAK", "SIGINT"):
+            _sig = getattr(signal, _signame, None)
+            if _sig is None:
+                continue
+            try:
+                signal.signal(_sig, _handle_sigterm)
+            except (ValueError, OSError):
+                # Not settable on this platform / not the main thread.
+                pass
 
         loop = threading.Thread(target=self._loop, name="voicebox-gpu-loop", daemon=True)
         loop.start()

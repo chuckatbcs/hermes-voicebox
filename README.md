@@ -217,16 +217,45 @@ Voicebox keeps TTS models in VRAM after first speak. This package adds three rel
 | **Idle** | `voicebox-gpu-lifecycle` user service unloads models ~15 minutes after last TTS (stamp file updated by the bridge) |
 | **Hermes exit** | Same service stops Voicebox after Hermes Desktop has been gone ~20s (toggle in plugin; default on) |
 
-Linux installer enables `~/.config/systemd/user/voicebox-gpu-lifecycle.service` (localhost control API on `127.0.0.1:17494`). Skip with `--skip-gpu-lifecycle`. Keep Voicebox running after Hermes quits with `--no-stop-voicebox-on-hermes-exit`.
+The installer wires the lifecycle daemon into the host's own service manager, so
+Windows and Linux get the same behaviour through different supervisors:
+
+| Platform | Service backend | Unit installed | Template in repo |
+|----------|-----------------|----------------|------------------|
+| **Linux** | user **systemd** | `~/.config/systemd/user/voicebox-gpu-lifecycle.service` | `installer/systemd/voicebox-gpu-lifecycle.service` |
+| **Windows** | **Task Scheduler** | Scheduled Task `Hermes_Voicebox_GPU_Lifecycle` (at logon) | `installer/windows/voicebox-gpu-lifecycle.xml` |
+| **macOS / other** | none | config only — run `lifecycle-daemon` manually | — |
+
+Both platforms expose the localhost control API on `127.0.0.1:17494`. Skip with
+`--skip-gpu-lifecycle` (`-SkipGpuLifecycle` on `install.ps1`). Keep Voicebox
+running after Hermes quits with `--no-stop-voicebox-on-hermes-exit`.
+
+Behavioural parity between the two unit templates — **change both together**:
+
+| Concern | systemd | Scheduled Task |
+|---------|---------|----------------|
+| Autostart | `WantedBy=default.target` | `<LogonTrigger>` |
+| Restart on crash | `Restart=on-failure`, `RestartSec=5` | `<RestartOnFailure>` `PT1M` × 3 |
+| Graceful stop | `KillSignal=SIGTERM`, `TimeoutStopSec=10` | terminate → `SIGBREAK`/`SIGTERM` handler |
+| Stop Voicebox | `systemctl --user stop voicebox.service` | `taskkill /IM Voicebox.exe /T` |
+| Start Voicebox | `systemctl --user start voicebox.service` | relaunch detached `Voicebox.exe` |
 
 ```bash
+# Linux
 python3 ~/.hermes/scripts/voicebox_gpu.py status
 python3 ~/.hermes/scripts/voicebox_gpu.py unload
 python3 ~/.hermes/scripts/voicebox_gpu.py stop    # unload + systemctl/docker stop
 python3 ~/.hermes/scripts/voicebox_gpu.py config --stop-on-hermes-exit off
 ```
 
-Windows: use the plugin button / CLI; the systemd unit is Linux-only (you can still run `lifecycle-daemon` manually if desired).
+```powershell
+# Windows (same subcommands)
+py -3 $env:USERPROFILE\.hermes\scripts\voicebox_gpu.py status
+py -3 $env:USERPROFILE\.hermes\scripts\voicebox_gpu.py unload
+py -3 $env:USERPROFILE\.hermes\scripts\voicebox_gpu.py stop    # unload + taskkill/docker stop
+schtasks /Query /TN Hermes_Voicebox_GPU_Lifecycle              # inspect the task
+```
+
 
 **OOM recovery:** the TTS bridge (`voicebox_tts.py`) detects CUDA out-of-memory, calls Voicebox `/models/unload`, forces Qwen `model_size=0.6B`, and retries once. If unload reports success but VRAM barely drops, restart Voicebox (`systemctl --user restart voicebox.service`) — the unload API can be a no-op while the process still holds memory.
 
@@ -257,14 +286,64 @@ Optional MCP (Hermes `mcp_servers.voicebox` → Voicebox `backend.mcp_shim`) is 
 
 ## Development / validation
 
+This project ships installers for **both Windows and Linux from one branch**.
+Every change must keep both paths working; the suites below run on either host
+and exercise *both* service backends regardless of which OS you are on.
+
+### Linux
+
 ```bash
 python3 -m py_compile install.py installer/prereqs.py \
   scripts/voicebox_tts.py scripts/voicebox_bind.py scripts/voicebox_gpu.py \
   scripts/hermes_voicebox_streamer.py
 python3 -m unittest test_install.py -v
 (cd scripts && python3 -m unittest test_voicebox_tts.py test_voicebox_gpu.py -v)
+python3 scripts/test_e2e_root_to_tip.py          # root-to-tip, exits non-zero on failure
 ./install.sh --hermes-dir /tmp/hermes-test --skip-prereqs
 ```
+
+### Windows (PowerShell)
+
+```powershell
+py -3 -m py_compile install.py installer/prereqs.py `
+  scripts/voicebox_tts.py scripts/voicebox_bind.py scripts/voicebox_gpu.py `
+  scripts/hermes_voicebox_streamer.py
+py -3 -m unittest test_install.py -v
+cd scripts; py -3 -m unittest test_voicebox_tts.py test_voicebox_gpu.py -v; cd ..
+py -3 scripts/test_e2e_root_to_tip.py
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -SkipPrereqs -HermesDir $env:TEMP\hermes-test
+```
+
+### Cross-platform test policy
+
+* **No platform-gated skips for logic that can be simulated.** Tests mock
+  `install.platform.system()` so the systemd *and* Scheduled Task backends are
+  both asserted on every host. A Windows-only or Linux-only `skipIf` is only
+  acceptable when the test genuinely needs the live OS supervisor.
+* **Never assert on path separators.** Compare against `str(Path(...))` or use
+  `pathlib`, so `\` vs `/` never fails a test.
+* **Both unit templates must exist in every checkout.** `test_e2e_root_to_tip.py`
+  asserts the presence of `installer/systemd/*.service` *and*
+  `installer/windows/*.xml`, so deleting one on the other OS fails the suite.
+* **Line endings are enforced by `.gitattributes`** — `.sh`/`.py` stay LF,
+  `.ps1`/`.bat` stay CRLF. Never commit a whole-file diff caused by a rewrite;
+  if `git diff` shows every line changed, your editor changed the endings.
+* **Run the E2E before pushing**, on whichever OS you are on. It exits non-zero
+  on any failure and prints a per-check table.
+
+### Cross-platform git workflow
+
+Both OSes commit to the same branch, so keep changes reviewable:
+
+1. Stage explicit paths only — never `git add -A` (it sweeps up
+   `data/`, `__pycache__/`, and local `voicebox_gpu.json`).
+2. When you touch lifecycle behaviour, update **both** templates
+   (`installer/systemd/` and `installer/windows/`) plus the parity table above
+   in the same commit.
+3. Before pushing from a second machine, `git pull --rebase` — do not merge the
+   same feature branch from two OSes in parallel.
+4. Verify no CRLF churn leaked in: `git diff --stat` should list only the lines
+   you meant to change.
 
 ### Windows from-scratch smoke test
 

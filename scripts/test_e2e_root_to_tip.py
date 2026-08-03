@@ -125,7 +125,16 @@ def main() -> int:
                 c.ok("jarvis TTS block")
             else:
                 c.fail("jarvis TTS block", "missing voicebox provider")
-            if "jarvis:" in text and "personalities:" in text:
+            # Personalities are seeded from desktop-plugin/sample-voices.json.
+            # Since demo voices became clone-based that file is intentionally
+            # empty, so the jarvis key must be present only when samples exist.
+            samples = install.load_sample_voices(ROOT)
+            if not samples:
+                c.ok(
+                    "jarvis personality key",
+                    "no sample voices to seed (clone-based demos)",
+                )
+            elif "jarvis:" in text and "personalities:" in text:
                 c.ok("jarvis personality key registered on jarvis profile")
             else:
                 c.fail("jarvis personality key", "agent.personalities.jarvis missing")
@@ -241,6 +250,41 @@ def main() -> int:
         else:
             c.fail("bridge binding precedence", f"got {resolved}")
         os.environ.pop("HERMES_HOME", None)
+
+    # 8b) Service backend parity for this platform
+    print("\n[8b] GPU lifecycle service backend")
+    import platform as _platform
+
+    system = _platform.system()
+    backend = install.service_backend()
+    expected = {"Linux": "systemd", "Windows": "schtasks"}.get(system)
+    if backend == expected:
+        c.ok("service backend", f"{system} -> {backend or 'config-only'}")
+    else:
+        c.fail("service backend", f"{system}: expected {expected}, got {backend}")
+
+    # The template the backend needs must actually ship in the repo.
+    template = {
+        "systemd": ROOT / "installer" / "systemd" / "voicebox-gpu-lifecycle.service",
+        "schtasks": ROOT / "installer" / "windows" / "voicebox-gpu-lifecycle.xml",
+    }.get(backend or "")
+    if template is None:
+        c.skip("service template", f"no supervisor backend for {system}")
+    elif template.is_file():
+        c.ok("service template", template.name)
+    else:
+        c.fail("service template", f"missing {template}")
+
+    # Both templates must be present regardless of host, so a change made on
+    # one OS cannot silently break installs on the other.
+    for name, path in (
+        ("systemd", ROOT / "installer" / "systemd" / "voicebox-gpu-lifecycle.service"),
+        ("schtasks", ROOT / "installer" / "windows" / "voicebox-gpu-lifecycle.xml"),
+    ):
+        if path.is_file():
+            c.ok(f"cross-platform template:{name}", path.name)
+        else:
+            c.fail(f"cross-platform template:{name}", f"missing {path}")
 
     # 9) Unit suites
     print("\n[9] Unit test suites")
