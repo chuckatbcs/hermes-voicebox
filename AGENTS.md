@@ -168,3 +168,11 @@ Stop and ask for authorization when work would:
 ## End-of-task report
 
 Every task must report: summary, files changed, checks run, risks, starting/ending SHAs, branch/PR state, working tree, merge status, stop-condition status, next authorized step, and one final timestamp line.
+
+## Cursor Cloud specific instructions
+
+- Pure Python, standard-library only (no `requirements.txt`, no `package.json`). The only runtime dependency is Python 3.10+ (the VM ships 3.12). There is nothing to `pip install`; the startup update script is a no-op interpreter check.
+- Standard checks live in `README.md` (Development / validation) and this file (Validation): `py_compile`, `python3 -m unittest test_install.py -v`, and `(cd scripts && python3 -m unittest test_voicebox_tts.py -v)`. `test_voicebox_tts.py` must be run from inside `scripts/` (it imports `voicebox_tts` directly).
+- Runnable pieces in this repo are the installer CLI (`install.py` / `install.sh`) and the TTS bridge (`scripts/voicebox_tts.py`). Use a throwaway `--hermes-dir` (e.g. `./install.sh --hermes-dir /tmp/hermes-test --skip-prereqs`) so you never touch a real `~/.hermes`.
+- The TTS bridge talks to a Voicebox backend on `http://127.0.0.1:17493`; neither Voicebox nor Hermes Desktop is installable in the cloud VM. To exercise the bridge end-to-end without real Voicebox, run it against a small stdlib mock HTTP server that answers `GET /health`, `GET /profiles`, `GET /profiles/{id}` (return a preset profile with `preset_voice_id` + `default_engine` so preflight passes), `GET /profiles/{id}/samples`, and `POST /generate/stream` (return a valid WAV per chunk). Feed >800 chars to force multi-chunk generation and verify the merged WAV.
+- `desktop-plugin/plugin.js` runs inside the Hermes Desktop GUI (not available here), so it cannot be manually exercised in the cloud VM; review its fetch/error paths statically instead.
