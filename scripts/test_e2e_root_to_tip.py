@@ -35,6 +35,17 @@ import install  # noqa: E402
 import voicebox_bind  # noqa: E402
 import voicebox_tts  # noqa: E402
 
+# Windows consoles (and GitHub's windows-latest runners) default to cp1252,
+# which cannot encode the arrows/em-dashes used in this report -- printing one
+# raises UnicodeEncodeError and fails the run for a cosmetic reason. Force
+# UTF-8 on the streams where supported, and fall back to replacing unmappable
+# characters rather than crashing.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError, OSError):
+        pass
+
 
 class Check:
     def __init__(self) -> None:
@@ -58,6 +69,13 @@ class Check:
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    # Decode child output as UTF-8 explicitly. With bare text=True Python uses
+    # the locale encoding (cp1252 on Windows/CI), which cannot decode the UTF-8
+    # these scripts emit -- stdout then comes back as None and callers doing
+    # `s in r.stdout` raise TypeError. errors="replace" keeps a mangled glyph
+    # from failing an otherwise passing check.
+    kw.setdefault("encoding", "utf-8")
+    kw.setdefault("errors", "replace")
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
@@ -183,13 +201,13 @@ def main() -> int:
                     f"jarvis: {before_jarvis_keys}→{after_jarvis_keys}, lines {before_lines}→{after_lines}",
                 )
             merge_ok = any(
-                s in r2.stdout
+                s in (r2.stdout or "")
                 for s in ("skipped_existing", "replaced", "Sample personalities: replaced")
             )
-            merge_bad = "inserted_personalities" in r2.stdout or (
-                "repaired_providers_nesting" in r2.stdout
-                and "replaced" not in r2.stdout
-                and "skipped_existing" not in r2.stdout
+            merge_bad = "inserted_personalities" in (r2.stdout or "") or (
+                "repaired_providers_nesting" in (r2.stdout or "")
+                and "replaced" not in (r2.stdout or "")
+                and "skipped_existing" not in (r2.stdout or "")
             )
             if merge_ok and not merge_bad:
                 c.ok("personality merge status", "idempotent replace/skip")
