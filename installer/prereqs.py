@@ -832,6 +832,117 @@ def ensure_models(
     return ok_all
 
 
+def _multipart_file_post(url: str, file_path: Path, fields: dict, timeout: int = 120):
+    """POST a single file + form fields as multipart/form-data. Returns (status, body)."""
+    boundary = "----hermesvoiceboxboundary"
+    parts: list[bytes] = []
+    for key, val in fields.items():
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+        parts.append(f"{val}\r\n".encode())
+    parts.append(f"--{boundary}\r\n".encode())
+    parts.append(
+        f'Content-Disposition: form-data; name="file"; filename="{file_path.name}"\r\n'.encode()
+    )
+    parts.append(b"Content-Type: application/octet-stream\r\n\r\n")
+    body = b"".join(parts) + file_path.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read().decode("utf-8", errors="replace")
+
+
+def seed_sample_clones(base_url: str, samples_dir: Path, report: ProvisionReport) -> bool:
+    """
+    Idempotently seed the canonical demo CLONE voices (reference WAVs) so every
+    install — Windows or Linux — ships identical demo voices.
+
+    Skips any voice whose name already exists in Voicebox /profiles. Requires the
+    clone engine (chatterbox_turbo / qwen) to be downloaded; this is normally run
+    right after ensure_models().
+
+    Returns True if all seeded (or already present), False on hard failure.
+    """
+    manifest = samples_dir / "manifest.json"
+    if not manifest.is_file():
+        log(f"seed_sample_clones: no manifest at {manifest} — skipping")
+        return True
+    try:
+        voices = json.loads(manifest.read_text(encoding="utf-8")).get("voices", [])
+    except Exception as exc:
+        report.errors.append(f"Could not read sample manifest: {exc}")
+        return False
+    if not voices:
+        return True
+
+    try:
+        existing = {
+            (p.get("name"), p.get("voice_type"))
+            for p in (http_json(f"{base_url.rstrip('/')}/profiles", timeout=15) or [])
+        }
+    except Exception as exc:
+        report.errors.append(f"Cannot read Voicebox profiles for seeding: {exc}")
+        return False
+
+    ok = True
+    for v in voices:
+        name = v.get("name")
+        wav = samples_dir / v.get("file", "")
+        if not wav.is_file():
+            report.errors.append(f"Sample WAV missing for {name}: {wav}")
+            ok = False
+            continue
+        if (name, "cloned") in existing:
+            log(f"seed_sample_clones: '{name}' clone already present — skipping")
+            continue
+        # 1) create the clone profile
+        try:
+            created = http_json(
+                f"{base_url.rstrip('/')}/profiles",
+                method="POST",
+                payload={
+                    "name": name,
+                    "language": "en",
+                    "voice_type": "cloned",
+                    "default_engine": v.get("engine", "chatterbox_turbo"),
+                    "personality": v.get("personality", ""),
+                },
+                timeout=30,
+            )
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore")
+            report.errors.append(f"Failed to create clone '{name}': HTTP {exc.code} {body[:160]}")
+            ok = False
+            continue
+        except Exception as exc:
+            report.errors.append(f"Failed to create clone '{name}': {exc}")
+            ok = False
+            continue
+        pid = (created or {}).get("id")
+        if not pid:
+            report.errors.append(f"Clone '{name}' created but no id returned: {created}")
+            ok = False
+            continue
+        # 2) attach the reference WAV sample
+        try:
+            _multipart_file_post(
+                f"{base_url.rstrip('/')}/profiles/{pid}/samples",
+                wav,
+                {"reference_text": f"This is a reference sample for {name}."},
+                timeout=120,
+            )
+            log(f"seed_sample_clones: seeded clone '{name}' ({v.get('engine')})")
+            report.actions.append(f"Seeded demo clone '{name}'")
+        except Exception as exc:
+            report.errors.append(f"Failed to attach reference sample for '{name}': {exc}")
+            ok = False
+    return ok
+
+
 def run_prerequisite_flow(
     *,
     hermes_dir: Path,

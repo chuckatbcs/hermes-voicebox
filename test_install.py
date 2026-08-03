@@ -515,9 +515,15 @@ class PrefetchPipelineTests(unittest.TestCase):
 
 
 class PersonalitiesMergeTests(unittest.TestCase):
-    def test_does_not_clobber_existing_agent_block(self):
+    """Demo voices are clones now (no Kokoro persona presets), so
+    load_sample_voices() returns [] and merge_personalities_config() skips
+    seeding — but still repairs a bogus bare '-personalities' line."""
+
+    def test_load_sample_voices_empty(self):
         samples = install.load_sample_voices(Path(__file__).resolve().parent)
-        self.assertGreaterEqual(len(samples), 5)
+        self.assertEqual(samples, [])
+
+    def test_skips_when_no_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Path(tmp) / "config.yaml"
             cfg.write_text(
@@ -526,101 +532,35 @@ class PersonalitiesMergeTests(unittest.TestCase):
                 "  max_tokens: 123\n",
                 encoding="utf-8",
             )
-            result = install.merge_personalities_config(cfg, samples)
-            self.assertEqual(result, "inserted_under_agent")
+            result = install.merge_personalities_config(cfg, [])
+            self.assertEqual(result, "skipped_empty")
             text = cfg.read_text(encoding="utf-8")
             self.assertIn("model: gpt-test", text)
             self.assertIn("max_tokens: 123", text)
-            self.assertIn("personalities:", text)
-            self.assertIn("vincent_price:", text)
-            self.assertIn("glados:", text)
+            self.assertNotIn("personalities:", text)
             self.assertEqual(len([ln for ln in text.splitlines() if ln.strip() == "agent:"]), 1)
 
-    def test_repairs_personas_nested_under_tts_providers(self):
-        samples = install.load_sample_voices(Path(__file__).resolve().parent)
+    def test_repairs_bogus_dash_line_even_when_empty(self):
+        """The '-personalities' stripper must still run with no personas to seed."""
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Path(tmp) / "config.yaml"
             cfg.write_text(
-                "tts:\n"
-                "  provider: voicebox\n"
-                "  providers:\n"
-                "    voicebox:\n"
-                "      type: command\n"
-                "      voice: default\n"
-                "    vincent_price: 'bad nesting'\n"
-                "    cartman: 'also bad'\n",
+                "agent:\n"
+                "  personalities:\n"
+                f"{install.PERSONA_MARKER_BEGIN}\n"
+                "    cartman: |\n"
+                "      hi\n"
+                f"{install.PERSONA_MARKER_END}\n"
+                "-personalities\n"
+                "    cartman: 'dup'\n"
+                "  max_turns: 1\n",
                 encoding="utf-8",
             )
-            result = install.merge_personalities_config(cfg, samples)
-            self.assertEqual(result, "repaired_providers_nesting")
-            data = __import__("yaml").safe_load(cfg.read_text(encoding="utf-8"))
-            providers = data["tts"]["providers"]
-            self.assertEqual(list(providers.keys()), ["voicebox"])
-            personalities = data["agent"]["personalities"]
-            self.assertIn("vincent_price", personalities)
-            self.assertIn("cartman", personalities)
-            self.assertIn("glados", personalities)
-
-    def test_skips_when_markers_stripped_but_keys_exist(self):
-        """Hermes often strips # BEGIN markers; re-install must not duplicate keys."""
-        samples = install.load_sample_voices(Path(__file__).resolve().parent)
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = Path(tmp) / "config.yaml"
-            # Simulate post-Hermes-rewrite: personalities present, markers gone.
-            body = ["agent:", "  personalities:"]
-            for s in samples:
-                body.append(f"    {s['key']}: |")
-                body.append(f"      {s['personality'][:40]}")
-            cfg.write_text("\n".join(body) + "\n", encoding="utf-8")
-            before = cfg.read_text(encoding="utf-8")
-            result = install.merge_personalities_config(cfg, samples)
-            self.assertEqual(result, "skipped_existing")
-            after = cfg.read_text(encoding="utf-8")
-            self.assertEqual(before, after)
-            for s in samples:
-                self.assertEqual(after.count(f"{s['key']}:"), 1)
-
-    def test_rerun_with_markers_replaces_not_duplicates(self):
-        samples = install.load_sample_voices(Path(__file__).resolve().parent)
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = Path(tmp) / "config.yaml"
-            cfg.write_text("agent:\n  model: keep-me\n", encoding="utf-8")
-            r1 = install.merge_personalities_config(cfg, samples)
-            self.assertEqual(r1, "inserted_under_agent")
-            r2 = install.merge_personalities_config(cfg, samples)
-            self.assertEqual(r2, "replaced")
-            text = cfg.read_text(encoding="utf-8")
-            self.assertEqual(text.count("vincent_price:"), 1)
-            self.assertEqual(text.count("jarvis:"), 1)
-            self.assertIn("keep-me", text)
-
-    def test_appended_agent_snippet_after_tts_replaces_cleanly(self):
-        """Markers after a TTS providers block must replace, not false-repair."""
-        samples = install.load_sample_voices(Path(__file__).resolve().parent)
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = Path(tmp) / "config.yaml"
-            cfg.write_text(
-                "# BEGIN hermes-voicebox\n"
-                "tts:\n"
-                "  provider: voicebox\n"
-                "  providers:\n"
-                "    voicebox:\n"
-                "      type: command\n"
-                "      voice: default\n"
-                "      timeout: 600\n"
-                "# END hermes-voicebox\n",
-                encoding="utf-8",
-            )
-            r1 = install.merge_personalities_config(cfg, samples)
-            self.assertEqual(r1, "appended")
-            r2 = install.merge_personalities_config(cfg, samples)
-            self.assertEqual(r2, "replaced")
-            text = cfg.read_text(encoding="utf-8")
-            data = __import__("yaml").safe_load(text)
-            self.assertEqual(text.count("vincent_price:"), 1)
-            self.assertEqual(text.count("jarvis:"), 1)
-            self.assertIn("voicebox", data["tts"]["providers"])
-            self.assertIn("jarvis", data["agent"]["personalities"])
+            result = install.merge_personalities_config(cfg, [])
+            self.assertEqual(result, "replaced")
+            lines = cfg.read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("-personalities", lines)
+            self.assertIn("max_turns: 1", [ln.strip() for ln in lines])
 
 
 if __name__ == "__main__":

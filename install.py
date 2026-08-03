@@ -23,9 +23,12 @@ from installer.prereqs import (
     DEFAULT_BASE_URL,
     MODEL_PROFILES,
     find_python_command,
+    log,
     run_prerequisite_flow,
+    seed_sample_clones,
     voicebox_healthy,
 )
+from installer.prereqs import ProvisionReport
 
 
 MARKER_BEGIN = "# BEGIN hermes-voicebox"
@@ -183,8 +186,6 @@ def _streamer_import_block() -> str:
         "    pass\n"
         f"{STREAMER_IMPORT_END}\n"
     )
-
-
 def _prefetch_produce_block() -> str:
     """Indented body inside speak-stream ``_produce`` try-block (12 spaces)."""
     return f"""            {PRODUCE_PATCH_BEGIN}
@@ -204,39 +205,51 @@ def _prefetch_produce_block() -> str:
 
 
 def _patch_speak_stream_produce(web_server_py: Path) -> str:
-    """Replace serial synth loop with look-ahead prefetch (marked, idempotent)."""
+    """Replace serial synth loop with look-ahead prefetch (marked, idempotent).
+
+    Uses a *literal* exact-string replacement of the stable serial loop inside
+    ``_produce`` (the ``try:`` … ``for sentence in _sentences():`` … ``except``
+    block), not a regex/line-scan, so it neither backtracks on large files nor
+    silently drops the patch after a Hermes reformat. If the marked block is
+    already present, it is replaced in place (idempotent).
+    """
     original = web_server_py.read_text(encoding="utf-8")
     block = _prefetch_produce_block()
 
     if PRODUCE_PATCH_BEGIN in original and PRODUCE_PATCH_END in original:
         pre = original.split(PRODUCE_PATCH_BEGIN, 1)[0].rstrip()
         post = original.split(PRODUCE_PATCH_END, 1)[1].lstrip("\n")
-        # pre ends at the line before the marker content; restore try: indent
-        if not pre.endswith("try:"):
-            # Keep whatever preceded the marker (should be `        try:`)
-            pass
         merged = pre + "\n" + block + post
         if merged == original:
             return "produce_unchanged"
         action = "produce_replaced"
     else:
-        pattern = re.compile(
-            r"(?ms)"
-            r"(^        try:\n)"
-            r"(            for sentence in _sentences\(\):\n"
-            r"                cleaned = _strip_markdown_for_tts\(sentence\)\n"
-            r"                if not cleaned:\n"
-            r"                    continue\n"
-            r"                for piece in _split_text_for_speak_stream\(cleaned, cap\):\n"
-            r"                    for chunk in streamer\.stream\(piece\):\n"
-            r"                        if stop\.is_set\(\):\n"
-            r"                            return\n"
-            r"                        loop\.call_soon_threadsafe\(chunks\.put_nowait, chunk\)\n)"
+        # The serial loop is a stable, unique string in _produce. Match it
+        # exactly (including the leading 8-space indent of `try:` and the
+        # trailing `except Exception as exc:` at the same indent).
+        serial = (
+            "        try:\n"
+            "            for sentence in _sentences():\n"
+            "                cleaned = _strip_markdown_for_tts(sentence)\n"
+            "                if not cleaned:\n"
+            "                    continue\n"
+            "                for piece in _split_text_for_speak_stream(cleaned, cap):\n"
+            "                    for chunk in streamer.stream(piece):\n"
+            "                        if stop.is_set():\n"
+            "                            return\n"
+            "                        loop.call_soon_threadsafe(chunks.put_nowait, chunk)\n"
+            "        except Exception as exc:"
         )
-        match = pattern.search(original)
-        if not match:
+        if serial not in original:
             return "produce_pattern_miss"
-        merged = original[: match.start()] + match.group(1) + block + original[match.end() :]
+        # `block` is already indented to 12 spaces; wrap it so the `try:` and
+        # `except` lines line up with the replaced serial block (8 spaces).
+        prefetch = (
+            "        try:\n"
+            + block.rstrip("\n") + "\n"
+            + "        except Exception as exc:"
+        )
+        merged = original.replace(serial, prefetch, 1)
         action = "produce_patched"
 
     bak = web_server_py.with_suffix(web_server_py.suffix + ".voicebox.bak")
@@ -398,6 +411,17 @@ def merge_personalities_config(config_path: Path, samples: list[dict]) -> str:
     other agent: settings (avoid appending a second top-level agent key).
     """
     if not samples:
+        # No personas to seed (demo voices are clones now). Still repair a bogus
+        # bare "-personalities" line if present so a corrupt config is cleaned up.
+        if config_path.exists():
+            original = config_path.read_text(encoding="utf-8")
+            if re.search(r"(?m)^-personalities\s*$", original):
+                repaired = re.sub(r"(?m)^-personalities\s*\n?", "", original)
+                config_path.write_text(
+                    repaired if repaired.endswith("\n") else repaired + "\n",
+                    encoding="utf-8",
+                )
+                return "replaced"
         return "skipped_empty"
 
     sample_keys = {str(s.get("key") or "") for s in samples if s.get("key")}
@@ -577,7 +601,7 @@ def install_gpu_lifecycle(
     hermes_root: Path,
     *,
     stop_on_hermes_exit: bool = True,
-    idle_minutes: int = 15,
+    idle_minutes: int = 10,
     enable: bool = True,
     base_url: str | None = None,
 ) -> str:
@@ -591,7 +615,20 @@ def install_gpu_lifecycle(
     if not gpu_py.is_file():
         return "missing_gpu_script"
 
+    import json as _json
     import subprocess
+
+    # Respect an existing user-tuned idle value: only seed the default when no
+    # voicebox_gpu.json is present yet. This stops a re-run of install.sh from
+    # silently clobbering a deliberate idle_unload_minutes change.
+    cfg_path = (hermes_root / "voicebox_gpu.json")
+    if cfg_path.is_file():
+        try:
+            existing = _json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and "idle_unload_minutes" in existing:
+                idle_minutes = int(existing["idle_unload_minutes"])
+        except Exception:
+            pass
 
     cmd = [
         sys.executable,
@@ -768,6 +805,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-voicebox", action="store_true", help="Do not provision Voicebox")
     parser.add_argument("--skip-models", action="store_true", help="Do not download TTS models")
     parser.add_argument(
+        "--skip-samples",
+        action="store_true",
+        help="Do not seed the canonical demo CLONE voices (reference WAVs) into Voicebox",
+    )
+    parser.add_argument(
         "--skip-gpu-lifecycle",
         action="store_true",
         help="Do not install/enable the Voicebox GPU lifecycle daemon (idle unload + Hermes-exit stop)",
@@ -857,6 +899,22 @@ def main(argv: list[str] | None = None) -> int:
             if not voicebox_healthy(args.base_url) and not args.skip_models:
                 print("ERROR: Prerequisites failed; aborting.", file=sys.stderr)
                 return 1
+
+        # Seed canonical demo CLONE voices so every install ships identical demos.
+        if (
+            not args.skip_samples
+            and not args.skip_voicebox
+            and voicebox_healthy(args.base_url)
+        ):
+            seed_report = ProvisionReport()
+            if seed_sample_clones(
+                args.base_url, repo_root() / "samples", seed_report
+            ):
+                for a in seed_report.actions:
+                    log(a)
+            else:
+                for e in seed_report.errors:
+                    print(f"WARNING: demo clone seeding: {e}", file=sys.stderr)
 
     if args.all_profiles:
         config_homes = list_profile_hermes_dirs(install_root)
