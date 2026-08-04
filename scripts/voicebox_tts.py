@@ -16,6 +16,14 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
+# Optional hosted provider (Fish Audio). Imported lazily-guarded so the bridge
+# keeps working when the module is absent (pure-local deployments).
+try:
+    from fish_tts import synthesize as _fish_synthesize, get_cached_voice as _fish_cached_voice
+    _HAVE_FISH = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAVE_FISH = False
+
 # ---------------------------------------------------------------------------
 # Tunables & Configuration
 # ---------------------------------------------------------------------------
@@ -753,11 +761,28 @@ def main():
     parser.add_argument("--out",       "-o", required=True, help="Path to write output audio file")
     parser.add_argument("--voice",     "-v", help="Voice profile ID")
     parser.add_argument("--base-url",  "-b", default=None, help="Base URL of Voicebox API (e.g. http://127.0.0.1:17493)")
+    parser.add_argument(
+        "--provider",
+        choices=["voicebox", "fish"],
+        default="voicebox",
+        help="TTS backend. 'fish' routes to hosted Fish Audio (needs FISH_KEY).",
+    )
+    parser.add_argument("--fish-key",   default=None, help="Fish Audio API key (else FISH_KEY env)")
+    parser.add_argument(
+        "--fish-voice",
+        default=None,
+        help="Fish Audio voice id. If omitted, uses cached clone for --fish-label or Fish default.",
+    )
+    parser.add_argument(
+        "--fish-label",
+        default="jarvis",
+        help="Cached-clone label to resolve a voice id from (~/.hermes/fish_voices.json).",
+    )
     args = parser.parse_args()
 
     base_url = get_base_url(args.base_url)
 
-    # 1. Read text
+    # 0. Read text
     try:
         with open(args.text_file, "r", encoding="utf-8") as f:
             text = f.read().strip()
@@ -777,7 +802,39 @@ def main():
             sys.exit(1)
         sys.exit(0)
 
-    # 2. Ensure Voicebox service is running (fail closed if still unreachable)
+    # 0b. Hosted Fish Audio provider — no local Voicebox service required.
+    if args.provider == "fish":
+        if not _HAVE_FISH:
+            print(
+                "Error: fish_tts.py not importable; install it alongside this bridge.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        voice_id = args.fish_voice or _fish_cached_voice(args.fish_label)
+        if not voice_id:
+            print("Warning: no cached Fish clone for "
+                  f"--fish-label {args.fish_label!r}; using Fish default voice.",
+                  file=sys.stderr)
+        else:
+            print(f"Fish: using cloned voice id {voice_id} "
+                  f"(label {args.fish_label!r}).", file=sys.stderr)
+        try:
+            _fish_synthesize(
+                text,
+                voice_id=voice_id,
+                api_key=args.fish_key,
+                out_path=args.out,
+                audio_format="wav",
+                sample_rate=44100,
+                timeout=120,
+            )
+        except Exception as e:
+            print(f"Error: Fish TTS failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Done — Fish Audio output written to {args.out}", file=sys.stderr)
+        sys.exit(0)
+
+    # 1. Ensure Voicebox service is running (fail closed if still unreachable)
     def _ensure_service_running():
         last_err = None
         for _ in range(15):

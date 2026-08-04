@@ -312,6 +312,102 @@ function voiceIdFromConfigRecord(cfg) {
   return String(vid || '').trim();
 }
 
+function ttsProviderFromConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') return 'voicebox';
+  const tts = cfg.tts || cfg.config?.tts || {};
+  const provider = tts?.provider || '';
+  return provider === 'fish' ? 'fish' : 'voicebox';
+}
+
+// Derive the Fish command from the *existing* voicebox command in config so the
+// script path always matches what Hermes actually invokes (no hardcoding).
+// Falls back to the conventional ~/.hermes/scripts path if none is present.
+function buildFishCommandFromConfig(cfg, label) {
+  const tts = (cfg && (cfg.tts || cfg.config?.tts)) || {};
+  const vbCmd = tts?.providers?.voicebox?.command || '';
+  let base = 'python3 ~/.hermes/scripts/voicebox_tts.py';
+  const m = vbCmd.match(/(python3?\s+[^\s]+\/voicebox_tts\.py)/);
+  if (m) base = m[1];
+  const safeLabel = (label || 'jarvis').trim() || 'jarvis';
+  return `${base} --provider fish --text-file {input_path} --out {output_path} --fish-label ${safeLabel}`;
+}
+
+function fishVoiceFromConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') return 'jarvis';
+  const tts = cfg.tts || cfg.config?.tts || {};
+  const fish = tts?.providers?.fish || {};
+  const v = fish.voice || 'jarvis';
+  return String(v || 'jarvis').trim();
+}
+
+function fishKeyFromConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') return '';
+  const tts = cfg.tts || cfg.config?.tts || {};
+  const fish = tts?.providers?.fish || {};
+  const k = fish.api_key || '';
+  return String(k || '').trim();
+}
+
+async function desktopConfigPutProvider(provider, fishVoice, fishKey, profile, clones) {
+  if (!desktopApiAvailable()) {
+    throw new Error('Hermes Desktop config API unavailable');
+  }
+  const p = normalizeHermesProfile(profile);
+  const next = provider === 'fish' ? 'fish' : 'voicebox';
+  // Never allow an empty/placeholder label — an empty label makes the bridge
+  // fall back to Fish's default (female) voice. Use the explicit label, then
+  // 'jarvis' as the last resort. 'default' is explicitly forbidden.
+  let fishVoiceLabel = (fishVoice || '').trim();
+  if (!fishVoiceLabel || fishVoiceLabel === 'default') fishVoiceLabel = 'jarvis';
+  // The plugin must establish the FULL fish command provider — not just
+  // provider/voice. Hermes's PUT replaces the fish object wholesale, so a
+  // partial write would drop `command` and fall back to Fish's default
+  // (female) voice. Derive the command from the live voicebox command so the
+  // script path matches what Hermes already runs.
+  let cfg = null;
+  try { cfg = await desktopConfigGet(p); } catch (_) {}
+  const fishCommand = buildFishCommandFromConfig(cfg, fishVoiceLabel);
+  // Merge any existing clones so a new clone doesn't wipe prior ones. The
+  // clones map ({label: voiceId}) is what the bridge reads to resolve a label
+  // to a hosted Fish voice id.
+  const existingClones = (cfg?.tts?.providers?.fish?.clones
+    || cfg?.config?.tts?.providers?.fish?.clones || {});
+  const mergedClones = { ...existingClones };
+  if (clones && typeof clones === 'object') {
+    for (const [k, v] of Object.entries(clones)) {
+      if (k && v) mergedClones[k] = v;
+    }
+  }
+  const fishBlock = {
+    type: 'command',
+    provider_label: 'Fish Audio (hosted)',
+    command: fishCommand,
+    voice: fishVoiceLabel,
+    clones: mergedClones,
+    output_format: 'wav',
+    timeout: 600,
+  };
+  // Persist the API key into config so the bridge can read it after restart
+  // (no manual env setup needed). Only include when non-empty.
+  if (fishKey) fishBlock.api_key = fishKey;
+  const opts = {
+    path: '/api/config',
+    method: 'PUT',
+    body: {
+      config: {
+        tts: {
+          provider: next,
+          providers: { fish: fishBlock },
+        },
+      },
+    },
+  };
+  // Always pass profile so Electron routes to the correct HERMES_HOME process.
+  opts.profile = p;
+  await window.hermesDesktop.api(opts);
+  return 'tts.provider';
+}
+
 function findSampleByVoice(voice) {
   if (!voice) return null;
   const personality = String(voice.personality || '');
@@ -967,6 +1063,8 @@ function VoiceboxView() {
   const [audioDuration, setAudioDuration] = useState(null);
   const [isSaving, setIsSaving]           = useState(false);
   const [isPlaying, setIsPlaying]         = useState(false);
+  const [fishCloneBusy, setFishCloneBusy] = useState(false);
+  const [fishCloningId, setFishCloningId] = useState(null);
   const [recordingState, setRecordingState] = useState('idle'); // idle | recording | recorded
   const [recordElapsed, setRecordElapsed] = useState(0);
 
@@ -982,6 +1080,13 @@ function VoiceboxView() {
     if (v === '1' || v === 'true') return true;
     return true;
   });
+  // Fish Audio hosted TTS provider toggle (per Hermes profile).
+  const [activeProvider, setActiveProvider] = useState('voicebox');
+  const [fishVoiceLabel, setFishVoiceLabel] = useState('jarvis');
+  const [fishApiKey, setFishApiKey] = useState('');
+  const [fishKeyBusy, setFishKeyBusy] = useState(false);
+  const [activeVoiceName, setActiveVoiceName] = useState('');
+  const [providerBusy, setProviderBusy] = useState(false);
   const [gpuBusy, setGpuBusy]             = useState(false);
 
   const playbackAudioRef = useRef(null);
@@ -1251,6 +1356,16 @@ function VoiceboxView() {
           setActiveVoiceId('');
         }
       }
+
+      // Load active TTS provider + Fish voice label (per Hermes profile).
+      try {
+        const cfg = await desktopConfigGet(profile);
+        if (!controller.signal.aborted && cfg) {
+          setActiveProvider(ttsProviderFromConfig(cfg));
+          setFishVoiceLabel(fishVoiceFromConfig(cfg));
+          setFishApiKey(fishKeyFromConfig(cfg) || (pluginStore.get('fish_api_key', '') || ''));
+        }
+      } catch (_) { /* keep defaults */ }
     } catch (err) {
       if (err?.name === 'AbortError') return;
       console.error(err);
@@ -1389,6 +1504,87 @@ function VoiceboxView() {
     await refreshGpuStatus();
   }, [refreshGpuStatus]);
 
+  const handleProviderChange = useCallback(async (next) => {
+    const provider = next === 'fish' ? 'fish' : 'voicebox';
+    setActiveProvider(provider);
+    setProviderBusy(true);
+    try {
+      const label = fishVoiceLabel || deriveFishLabel(activeVoiceName);
+      await desktopConfigPutProvider(provider, label, fishApiKey, hermesProfile);
+      host.notify({
+        kind: 'success',
+        title: provider === 'fish' ? 'Switched to Fish Audio' : 'Switched to Voicebox',
+        message: provider === 'fish'
+          ? 'Hosted TTS active — no local GPU used. Key is read from config/env/file.'
+          : 'Local Voicebox TTS active.',
+      });
+    } catch (err) {
+      setActiveProvider(provider === 'fish' ? 'voicebox' : 'fish');
+      host.notify({
+        kind: 'error',
+        title: 'Provider Switch Failed',
+        message: err?.message || String(err),
+      });
+    } finally {
+      setProviderBusy(false);
+    }
+  }, [fishVoiceLabel, fishApiKey, activeVoiceName, hermesProfile]);
+
+  // Derive the Fish clone label from the *active local voice* so each voice
+  // maps to its own hosted clone (once cloned via Fish). Falls back to manual
+  // override (fishVoiceLabel) or 'jarvis'.
+  const deriveFishLabel = (voiceName) => {
+    if (fishVoiceLabel && fishVoiceLabel !== 'jarvis') return fishVoiceLabel;
+    if (!voiceName) return fishVoiceLabel || 'jarvis';
+    const slug = String(voiceName).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+    return slug || fishVoiceLabel || 'jarvis';
+  };
+
+  const handleFishVoiceChange = useCallback(async (label) => {
+    const next = (label || '').trim();
+    setFishVoiceLabel(next);
+    if (activeProvider !== 'fish') return; // only persist while fish is active
+    setProviderBusy(true);
+    try {
+      await desktopConfigPutProvider('fish', next || 'jarvis', fishApiKey, hermesProfile);
+    } catch (err) {
+      host.notify({
+        kind: 'warning',
+        title: 'Fish voice label not saved',
+        message: err?.message || String(err),
+      });
+    } finally {
+      setProviderBusy(false);
+    }
+  }, [activeProvider, fishApiKey, hermesProfile]);
+
+  const handleFishKeyChange = useCallback(async (key) => {
+    const val = (key || '').trim();
+    setFishApiKey(val);
+    pluginStore.set('fish_api_key', val); // local backup
+    setFishKeyBusy(true);
+    try {
+      // Persist into the fish provider block so the bridge reads it after restart.
+      const label = fishVoiceLabel || deriveFishLabel(activeVoiceName);
+      await desktopConfigPutProvider(activeProvider, label, val || undefined, hermesProfile);
+      if (val) {
+        host.notify({
+          kind: 'success',
+          title: 'Fish API Key Saved',
+          message: 'Stored in config (and ~/.hermes/fish_key.txt on next TTS run). No env setup needed.',
+        });
+      }
+    } catch (err) {
+      host.notify({
+        kind: 'warning',
+        title: 'Fish key not persisted to config',
+        message: err?.message || String(err),
+      });
+    } finally {
+      setFishKeyBusy(false);
+    }
+  }, [activeProvider, fishVoiceLabel, activeVoiceName, hermesProfile]);
+
   const persistPersona = useCallback(async (voice, val) => {
     const sample = findSampleByVoice(voice) || SAMPLE_VOICES.find(s => s.name === voice.name);
     const storedVal = sample ? packSamplePersonality(sample, val) : val;
@@ -1465,6 +1661,7 @@ function VoiceboxView() {
     }
     const { engine, meta } = getEngineMeta(voice);
     setActiveVoiceId(id);
+    setActiveVoiceName(voice?.name || '');
     setVoices((prev) => {
       if (prev.some((v) => sameVoiceId(v.id, id))) return prev;
       return [voice, ...prev];
@@ -1490,6 +1687,28 @@ function VoiceboxView() {
         title: 'Voice Updated',
         message: `Hermes profile "${profile}" → ${voice.name}  •  ${meta.label || engine}  •  ${meta.vram || '?'} VRAM`,
       });
+    }
+
+    // Keep the hosted (Fish) voice in lockstep with the selected local voice.
+    // Selecting a voice must also change the Fish --fish-label, otherwise the
+    // spoken voice stays pinned to whatever label was set last (e.g. cartman)
+    // regardless of which local voice is active. Only re-point when Fish is the
+    // active provider; local Voicebox selection is unaffected.
+    if (activeProvider === 'fish') {
+      // Selection is authoritative: derive the Fish label directly from the
+      // selected voice name, IGNORING any manual override. Using deriveFishLabel
+      // here would return the stale override and pin the previous voice.
+      const slug = String(voice?.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+      const label = slug || 'jarvis';
+      if (label !== 'default') {
+        setFishVoiceLabel(label);
+        try {
+          await desktopConfigPutProvider('fish', label, fishApiKey, hermesProfile);
+        } catch (err) {
+          // Non-fatal: the label will still apply on next explicit Fish change.
+          console.warn('Fish label sync on voice change failed:', err);
+        }
+      }
     }
 
     const voiceName = voice.name || voiceId;
@@ -1592,6 +1811,74 @@ function VoiceboxView() {
       setIsDeleting(false);
     }
   };
+
+  // ── Clone a voice to Fish Audio (hosted) ──
+  // For ANY cloned/preset voice in the list: pull its sample audio from the
+  // local Voicebox backend, upload it to Fish, cache the id in config, and
+  // switch the active provider to Fish using that voice's label.
+  const handleCloneVoiceToFish = useCallback(async (voice) => {
+    if (!voice) return;
+    if (!fishApiKey) {
+      host.notify({ kind: 'warning', title: 'Fish API Key Missing',
+        message: 'Enter your Fish Audio API key in the TTS Provider card first.' });
+      return;
+    }
+    const label = deriveFishLabel(voice.name) || String(voice.id);
+    setFishCloningId(String(voice.id));
+    try {
+      // 1. Find a sample for this profile.
+      const samples = await apiFetch(`/profiles/${voice.id}/samples`).catch(() => []);
+      const list = Array.isArray(samples) ? samples : (samples.samples || samples.items || []);
+      const sample = list[0];
+      if (!sample || !sample.id) {
+        throw new Error('This voice has no reference sample to clone.');
+      }
+      // 2. Download the sample audio (same-origin to the backend).
+      const audioRes = await fetch(`${BACKEND_URL}/samples/${sample.id}`);
+      if (!audioRes.ok) throw new Error(`Sample download failed (${audioRes.status}).`);
+      const audioBlob = await audioRes.blob();
+
+      // 3. Upload to Fish.
+      const form = new FormData();
+      form.append('voices', audioBlob, `${label}.wav`);
+      form.append('type', 'tts');
+      form.append('title', `Hermes ${label}`);
+      form.append('visibility', 'private');
+      form.append('train_mode', 'fast');
+      form.append('enhance_audio_quality', 'true');
+      form.append('generate_sample', 'false');
+      const res = await fetch('https://api.fish.audio/model', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${fishApiKey}` },
+        body: form,
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`Fish clone returned ${res.status}: ${errText.slice(0, 160)}`);
+      }
+      const data = await res.json();
+      const voiceId = data._id || data.id;
+      if (!voiceId) throw new Error('Fish clone returned no voice id.');
+
+      // 4. Persist atomically. Write the FULL fish provider block in ONE config
+      //    PUT (command + voice + clones map + key) so a new session can never
+      //    read a half-written state (which previously fell back to Fish's
+      //    default female voice). No separate config.set — that split write
+      //    could land on a different profile home.
+      await desktopConfigPutProvider('fish', label, fishApiKey, hermesProfile, { [label]: voiceId });
+      setActiveProvider('fish');
+      setFishVoiceLabel(label);
+      host.notify({
+        kind: 'success', title: 'Cloned to Fish Audio',
+        message: `"${voice.name}" is now a hosted Fish clone and active as the TTS provider.`,
+      });
+      await fetchProfilesAndConfig();
+    } catch (err) {
+      host.notify({ kind: 'error', title: 'Fish Clone Failed', message: err?.message || String(err) });
+    } finally {
+      setFishCloningId(null);
+    }
+  }, [fishApiKey, hermesProfile]);
 
   // ── Native File Upload ───────────────────────
   const handleNativeUpload = async () => {
@@ -1801,6 +2088,65 @@ function VoiceboxView() {
         ])
       ]),
 
+      // ── TTS Provider (local vs hosted Fish Audio) ──
+      React.createElement('div', { key: 'provider-card', className: 'flex flex-col gap-3 bg-card border border-border rounded-lg p-6 shadow-sm' }, [
+        React.createElement('div', { key: 'ph', className: 'flex items-center justify-between' }, [
+          React.createElement('h2', { key: 'h', className: 'text-xl font-semibold' }, 'TTS Provider'),
+          React.createElement('span', {
+            key: 'badge',
+            className: `text-xs rounded-full px-2 py-0.5 ${activeProvider === 'fish' ? 'bg-blue-500/15 text-blue-300 border border-blue-500/30' : 'bg-green-500/10 text-green-400 border border-green-500/30'}`,
+          }, activeProvider === 'fish' ? 'Hosted (Fish Audio)' : 'Local (Voicebox)'),
+        ]),
+        React.createElement('p', { key: 'desc', className: 'text-xs text-muted-foreground' },
+          'Switch TTS engine per Hermes profile. Fish Audio is a free hosted API — frees your GPU entirely, but audio leaves the machine and needs FISH_KEY in the Hermes env.'),
+        React.createElement('label', { key: 'lbl', className: 'text-sm font-medium text-muted-foreground' }, 'Active Provider'),
+        React.createElement(Select, {
+          key: 'provider-sel',
+          value: activeProvider,
+          disabled: providerBusy,
+          onValueChange: handleProviderChange,
+        },
+          React.createElement(SelectTrigger, { className: 'w-full h-10' },
+            React.createElement(SelectValue, { placeholder: 'Select provider…' })
+          ),
+          React.createElement(SelectContent, {},
+            React.createElement(SelectItem, { key: 'voicebox', value: 'voicebox' }, '🟢 Voicebox (local, private, uses GPU)'),
+            React.createElement(SelectItem, { key: 'fish', value: 'fish' }, '🔵 Fish Audio (hosted, free, no GPU)'),
+          )
+        ),
+        // The API key is ALWAYS shown (independent of the selected provider)
+        // so it can be entered before switching to Fish — otherwise the per-voice
+        // "Clone to Fish" buttons stay greyed out on a Voicebox-default install.
+        React.createElement('div', { key: 'fish-key', className: 'flex flex-col gap-1 mt-1' }, [
+          React.createElement('label', { key: 'kl', className: 'text-xs text-muted-foreground' }, 'Fish Audio API Key'),
+          React.createElement(Input, {
+            key: 'fish-key-input',
+            className: 'h-9',
+            type: 'password',
+            defaultValue: fishApiKey,
+            placeholder: 'sk-fish-… (stored in config, no env needed)',
+            disabled: fishKeyBusy,
+            onChange: (e) => handleFishKeyChange(e?.target?.value),
+          }),
+          React.createElement('p', { key: 'kh', className: 'text-[11px] text-muted-foreground' },
+            'Saved to config.yaml (tts.providers.fish.api_key) and read by the bridge after restart. Get a free key at fish.audio.'),
+        ]),
+        activeProvider === 'fish' && React.createElement('div', { key: 'fish-voice', className: 'flex flex-col gap-1 mt-1' }, [
+          React.createElement('label', { key: 'fl', className: 'text-xs text-muted-foreground' },
+            `Fish voice label${activeVoiceName ? ` (auto from “${activeVoiceName}”)` : ''}`),
+          React.createElement(Input, {
+            key: 'fish-input',
+            className: 'h-9',
+            value: fishVoiceLabel,
+            placeholder: deriveFishLabel(activeVoiceName),
+            disabled: providerBusy,
+            onChange: (e) => handleFishVoiceChange(e?.target?.value),
+          }),
+          React.createElement('p', { key: 'fh', className: 'text-[11px] text-muted-foreground' },
+            'Resolves a cloned voice from ~/.hermes/fish_voices.json. Each local voice can map to its own Fish clone once cloned.'),
+        ]),
+      ]),
+
       // ── Engine legend ────────────────────────
       React.createElement('div', { key: 'legend', className: 'flex gap-3 flex-wrap' },
         Object.entries(ENGINE_META).map(([key, meta]) =>
@@ -1948,11 +2294,20 @@ function VoiceboxView() {
                               onClick: () => setDeleteConfirmId(null)
                             }, 'Cancel')
                           ]
-                        : React.createElement(Button, {
-                            key: 'del', variant: 'ghost', size: 'sm',
-                            className: 'text-muted-foreground hover:text-destructive hover:bg-destructive/10',
-                            onClick: () => setDeleteConfirmId(v.id)
-                          }, '🗑️ Delete')
+                        : [
+                            React.createElement(Button, {
+                              key: 'fish', variant: 'ghost', size: 'sm',
+                              className: 'text-muted-foreground hover:text-sky-400 hover:bg-sky-400/10',
+                              disabled: !fishApiKey || fishCloningId === String(v.id),
+                              title: fishApiKey ? `Clone “${v.name}” to Fish Audio (hosted, no GPU)` : 'Enter your Fish API key in the TTS Provider card first',
+                              onClick: () => handleCloneVoiceToFish(v)
+                            }, fishCloningId === String(v.id) ? '🐟 …' : '🐟 Clone to Fish'),
+                            React.createElement(Button, {
+                              key: 'del', variant: 'ghost', size: 'sm',
+                              className: 'text-muted-foreground hover:text-destructive hover:bg-destructive/10',
+                              onClick: () => setDeleteConfirmId(v.id)
+                            }, '🗑️ Delete')
+                          ]
                     )
                   ]),
                   React.createElement('div', { key: 'persona-row', className: 'flex flex-col gap-1 mt-1 pt-2 border-t border-border/50' }, [
