@@ -94,8 +94,21 @@ def build_tts_command(python_cmd: str, bridge_path: Path) -> str:
     )
 
 
+def build_fish_command(python_cmd: str, bridge_path: Path) -> str:
+    """Hosted Fish Audio command. Resolves the cloned voice at runtime via
+    --fish-label (cached in ~/.hermes/fish_voices.json) so no voice id is
+    hardcoded. FISH_KEY must be present in the environment when Hermes runs
+    the command (the user's shell env, or ~/.hermes/.env)."""
+    return (
+        f"{python_cmd} {quote_for_command(bridge_path)} "
+        "--provider fish --text-file {input_path} --out {output_path} "
+        "--fish-label jarvis"
+    )
+
+
 def build_snippet(python_cmd: str, bridge_path: Path) -> str:
     command = build_tts_command(python_cmd, bridge_path)
+    fish_command = build_fish_command(python_cmd, bridge_path)
     return (
         f"{MARKER_BEGIN}\n"
         "tts:\n"
@@ -104,6 +117,13 @@ def build_snippet(python_cmd: str, bridge_path: Path) -> str:
         "    voicebox:\n"
         "      type: command\n"
         f"      command: {command}\n"
+        "      voice: default\n"
+        "      output_format: wav\n"
+        f"      timeout: {COMMAND_TTS_TIMEOUT_SECONDS}\n"
+        "    fish:\n"
+        "      type: command\n"
+        "      provider_label: Fish Audio (hosted)\n"
+        f"      command: {fish_command}\n"
         "      voice: default\n"
         "      output_format: wav\n"
         f"      timeout: {COMMAND_TTS_TIMEOUT_SECONDS}\n"
@@ -557,6 +577,7 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     streamer_src = src_root / "scripts" / "hermes_voicebox_streamer.py"
     gpu_src = src_root / "scripts" / "voicebox_gpu.py"
     diagnose_src = src_root / "scripts" / "diagnose_tts.sh"
+    fish_src = src_root / "scripts" / "fish_tts.py"  # optional hosted provider
 
     if not plugin_src.is_file():
         raise FileNotFoundError(f"Missing plugin source: {plugin_src}")
@@ -581,6 +602,7 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     bind_dst = scripts_dst_dir / "voicebox_bind.py"
     gpu_dst = scripts_dst_dir / "voicebox_gpu.py"
     diagnose_dst = scripts_dst_dir / "diagnose_tts.sh"
+    fish_dst = scripts_dst_dir / "fish_tts.py"
 
     # Copy plugin entry + companion modules/assets
     for src in plugin_src_dir.iterdir():
@@ -591,6 +613,18 @@ def install_files(src_root: Path, hermes_dir: Path) -> tuple[Path, Path]:
     shutil.copy2(bind_src, bind_dst)
     shutil.copy2(gpu_src, gpu_dst)
     shutil.copy2(diagnose_src, diagnose_dst)
+    if fish_src.is_file():
+        shutil.copy2(fish_src, fish_dst)
+    # Place an (empty) Fish Audio key file so the bridge's file fallback path
+    # exists on a fresh install. The user enters the key in the plugin UI
+    # (persisted to config.yaml tts.providers.fish.api_key) or writes it here.
+    key_file = hermes_dir / "fish_key.txt"
+    if not key_file.exists():
+        try:
+            key_file.write_text("", encoding="utf-8")
+            key_file.chmod(0o600)
+        except Exception:
+            pass
     if platform.system() != "Windows":
         for path in (bridge_dst, bind_dst, gpu_dst, diagnose_dst):
             path.chmod(path.stat().st_mode | 0o111)

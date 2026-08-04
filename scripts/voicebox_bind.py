@@ -156,11 +156,12 @@ def set_tts_voice_in_config(config_path: Path, voice_id: str) -> str:
             config_path.write_text(text[:begin] + insert + text[end:], encoding="utf-8")
             return "appended_voice"
 
-    # Unmarked voicebox provider
-    # Use \g<n> so UUIDs that start with a digit (e.g. 5d06…) are not parsed as
-    # group references like \25 when concatenated after \2.
+    # Unmarked voicebox provider. Allow sibling providers (e.g. `fish: {}`)
+    # to precede `voicebox:` — do NOT require it to be the immediate child of
+    # `providers:`. Use \g<n> so UUIDs that start with a digit (e.g. 5d06…)
+    # are not parsed as group references like \25 when concatenated after \2.
     new_text, n = re.subn(
-        r"(providers:\s*\n\s*voicebox:(?:\n[ \t]+[^\n]*)*?)\n([ \t]+voice:[ \t]*).*$",
+        r"(providers:(?:\n[ \t]+[^\n]*)*?\n[ \t]+voicebox:(?:\n[ \t]+[^\n]*)*?)\n([ \t]+voice:[ \t]*).*$",
         rf"\g<1>\n\g<2>{voice_id}",
         text,
         count=1,
@@ -170,9 +171,10 @@ def set_tts_voice_in_config(config_path: Path, voice_id: str) -> str:
         config_path.write_text(new_text, encoding="utf-8")
         return "updated"
 
-    # Has voicebox provider but no voice key
+    # Has voicebox provider but no voice key. Allow sibling providers before
+    # `voicebox:`.
     new_text, n = re.subn(
-        r"(providers:\s*\n\s*voicebox:\s*\n)",
+        r"(providers:(?:\n[ \t]+[^\n]*)*?\n[ \t]+voicebox:\s*\n)",
         rf"\g<1>      voice: {voice_id}\n",
         text,
         count=1,
