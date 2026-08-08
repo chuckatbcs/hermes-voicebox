@@ -87,6 +87,66 @@ def quote_for_command(path: Path) -> str:
     return text
 
 
+_COMMAND_RE = re.compile(
+    r"^(?P<indent>[ \t]*)command:(?P<sep>[ \t]*)(?P<value>.*)$"
+)
+
+
+def normalize_tts_commands(
+    text: str, bridge_path: Path, python_cmd: str
+) -> tuple[str, list[str]]:
+    """Rewrite any TTS provider ``command:`` line that is broken on Windows.
+
+    Two defects have shipped in the wild:
+
+      * a literal ``~/.hermes`` path (Python / Windows never expand ``~``), and
+      * a ``python3`` launcher on Windows where ``py -3`` is the working form.
+
+    Both produce a provider that can never launch. This rewrites the launcher
+    and the bridge path to the absolute, OS-correct form while preserving every
+    trailing argument (``--provider fish``, ``--voice``, ``--fish-label`` …).
+
+    Safe cross-platform: lines that already use an absolute path and the correct
+    launcher are left untouched, so correct Linux installs are never disturbed.
+    Returns ``(new_text, list_of_rewritten_values_before)``.
+    """
+    abs_bridge = quote_for_command(bridge_path)
+    fixed_prefix = f"{python_cmd} {abs_bridge} "
+    # A command is "broken" only if it cannot already launch as-is on this host:
+    #   * it still carries a literal ``~`` (Python/Windows never expand it), or
+    #   * it does NOT already start with the canonical
+    #     ``<python_cmd> <absolute_bridge> `` prefix (wrong launcher such as
+    #     `python3` on Windows, a relative/``~``-prefixed path, or a path that
+    #     points somewhere other than the installed bridge).
+    # A *correct* command — ``python3 /abs/path`` on Linux or
+    # ``py -3 C:\abs\path`` on Windows — starts with its canonical prefix and is
+    # left completely untouched, so correct Linux installs are never disturbed.
+    needs_fix = lambda v: ("~/" in v) or (not v.lstrip().startswith(fixed_prefix))
+    out_lines: list[str] = []
+    rewritten: list[str] = []
+    changed = False
+    for line in text.splitlines(keepends=True):
+        m = _COMMAND_RE.match(line)
+        if not m or not needs_fix(m.group("value")):
+            out_lines.append(line)
+            continue
+        indent, sep, value = m.group("indent"), m.group("sep"), m.group("value")
+        rewritten.append(value.strip())
+        # Recover trailing args after the (possibly broken) bridge token.
+        # Split off the launcher + first path token, keep the rest verbatim.
+        rest = value
+        # Drop a leading launcher word (python3 / py / python / py -3 …).
+        rest = re.sub(r"^\s*(py\s+-3|python3|python)\b", "", rest).lstrip()
+        # Drop the next path token (the broken or absolute bridge path).
+        rest = re.sub(r"^\S+\.py\b", "", rest, count=1).lstrip()
+        new_value = fixed_prefix + rest
+        out_lines.append(f"{indent}command:{sep}{new_value}")
+        changed = True
+    if not changed:
+        return text, rewritten
+    return "".join(out_lines), rewritten
+
+
 def build_tts_command(python_cmd: str, bridge_path: Path) -> str:
     return (
         f"{python_cmd} {quote_for_command(bridge_path)} "
@@ -872,19 +932,108 @@ def _tts_marker_is_under_personalities(text: str) -> bool:
     return bool(re.search(r"(?m)^[ \t]*personalities:\s*$", pre.splitlines()[-1] if pre else ""))
 
 
-def merge_config(config_path: Path, snippet: str, *, force: bool = False) -> str:
+def ensure_plugin_enabled(config_path: Path) -> str:
+    """Enable the Voicebox plugin in a profile's config.yaml.
+
+    The plugin ships ``defaultEnabled: false`` so a fresh install still requires
+    the user to toggle it on. For a one-click install we set
+    ``plugins.voice-switcher.enabled: true`` so it loads on next Desktop start
+    without manual interaction. Idempotent: returns 'enabled' / 'already' /
+    'no_config'.
+
+    YAML nests the key (``plugins:`` / ``voice-switcher:`` / ``enabled:``), so we
+    scan for our plugin block and its ``enabled:`` value rather than matching a
+    single flat line.
+    """
+    if not config_path.exists():
+        return "no_config"
+    text = config_path.read_text(encoding="utf-8")
+    lines = text.split("\n")
+
+    plug_re = re.compile(rf"(?m)^(\s*)plugins\s*:\s*$")
+    # Find our plugin block start (plugins: ... voice-switcher:)
+    in_plugin_block = False
+    plugin_indent = None
+    vs_indent = None
+    enabled_line_idx = None
+    enabled_value = None
+    for i, line in enumerate(lines):
+        m = plug_re.match(line)
+        if m:
+            in_plugin_block = True
+            plugin_indent = len(m.group(1))
+            continue
+        if in_plugin_block:
+            indent = len(line) - len(line.lstrip(" "))
+            if line.strip().startswith(f"{PLUGIN_ID}:"):
+                vs_indent = indent
+                continue
+            if vs_indent is not None and indent > vs_indent and "enabled:" in line:
+                enabled_line_idx = i
+                enabled_value = line.split(":", 1)[1].strip().lower()
+                break
+            # Dedent past the plugin block → stop scanning.
+            if line.strip() and indent <= plugin_indent:
+                in_plugin_block = False
+
+    if enabled_value == "true":
+        return "already"
+    if enabled_line_idx is not None:
+        # Flip existing false → true, preserving indentation.
+        indent = len(lines[enabled_line_idx]) - len(lines[enabled_line_idx].lstrip(" "))
+        lines[enabled_line_idx] = f"{' ' * indent}enabled: true"
+        config_path.write_text("\n".join(lines), encoding="utf-8")
+        return "enabled"
+
+    # No enabled key yet — insert under an existing plugin block, else append one.
+    if plugin_indent is not None:
+        # Insert right after the plugin block opener.
+        for i, line in enumerate(lines):
+            if plug_re.match(line):
+                lines.insert(i + 1, f"  {PLUGIN_ID}:")
+                lines.insert(i + 2, f"    enabled: true")
+                break
+        config_path.write_text("\n".join(lines), encoding="utf-8")
+        return "enabled"
+    config_path.write_text(
+        text.rstrip() + f"\n\nplugins:\n  {PLUGIN_ID}:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    return "enabled"
+
+
+def merge_config(
+    config_path: Path,
+    snippet: str,
+    *,
+    force: bool = False,
+    bridge_path: Path | None = None,
+    python_cmd: str | None = None,
+) -> str:
     """
     Merge voicebox TTS block into config.yaml.
     Returns one of: created | replaced | appended | relocated | skipped_manual
+
+    When ``bridge_path`` and ``python_cmd`` are supplied, any provider
+    ``command:`` line that is broken on Windows (literal ``~/.hermes`` path or a
+    ``python3`` launcher) is normalized to the absolute, OS-correct form — both
+    in the snippet that gets written and in any existing block we would otherwise
+    have left untouched (``skipped_manual``). This makes a re-run self-healing.
     """
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
+        if bridge_path is not None and python_cmd is not None:
+            snippet, _ = normalize_tts_commands(snippet, bridge_path, python_cmd)
         config_path.write_text(snippet, encoding="utf-8")
         return "created"
 
     original = config_path.read_text(encoding="utf-8")
     backup = config_path.with_suffix(config_path.suffix + ".bak")
     backup.write_text(original, encoding="utf-8")
+
+    if bridge_path is not None and python_cmd is not None:
+        # Normalize the snippet so every write path produces a launchable command.
+        snippet, _ = normalize_tts_commands(snippet, bridge_path, python_cmd)
 
     if MARKER_BEGIN in original and MARKER_END in original:
         # If a prior bug parked the TTS block under personalities:, strip it and
@@ -910,9 +1059,25 @@ def merge_config(config_path: Path, snippet: str, *, force: bool = False) -> str
         return "appended"
 
     if "voicebox_tts.py" in original or "provider: voicebox" in original:
+        # Existing block present but unmarked — repair broken Windows commands in
+        # place rather than leaving a provider that can never launch.
+        if bridge_path is not None and python_cmd is not None:
+            fixed, rewritten = normalize_tts_commands(original, bridge_path, python_cmd)
+            if rewritten:
+                config_path.write_text(
+                    fixed if fixed.endswith("\n") else fixed + "\n", encoding="utf-8"
+                )
+                return "repaired"
         return "skipped_manual"
 
     if "\ntts:" in f"\n{original}" or original.lstrip().startswith("tts:"):
+        if bridge_path is not None and python_cmd is not None:
+            fixed, rewritten = normalize_tts_commands(original, bridge_path, python_cmd)
+            if rewritten:
+                config_path.write_text(
+                    fixed if fixed.endswith("\n") else fixed + "\n", encoding="utf-8"
+                )
+                return "repaired"
         return "skipped_manual"
 
     appended = original.rstrip() + "\n\n" + snippet
@@ -975,6 +1140,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Non-interactive: auto-approve prerequisite installs/downloads",
     )
     parser.add_argument(
+        "--one-click",
+        action="store_true",
+        help="Alias for -y with best-effort provisioning: installs the plugin + bridge "
+        "unconditionally and tolerates Voicebox/Docker/model failures instead of aborting.",
+    )
+    parser.add_argument(
         "--skip-prereqs",
         action="store_true",
         help="Skip prerequisite detection/provisioning (plugin files only)",
@@ -1020,6 +1191,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Prefer Voicebox desktop installer on Windows",
     )
     args = parser.parse_args(argv)
+    if args.one_click:
+        args.yes = True  # one-click is always non-interactive
 
     src_root = repo_root()
     root_hermes = Path(args.hermes_dir).expanduser().resolve() if args.hermes_dir else default_hermes_dir()
@@ -1049,6 +1222,11 @@ def main(argv: list[str] | None = None) -> int:
         print(snippet)
         return 0
 
+    # --- Prerequisite / provisioning phase (best-effort, NEVER aborts install) ---
+    # The plugin + bridge + config are installed unconditionally below, so a
+    # failed Docker build or missing model download must not block a usable
+    # install. We capture errors and surface them, but keep going.
+    prereq_report = None
     if not args.skip_prereqs:
         prefer_docker = True
         if platform.system() == "Windows":
@@ -1058,7 +1236,7 @@ def main(argv: list[str] | None = None) -> int:
             elif not args.prefer_docker:
                 prefer_docker = False  # Windows default: desktop installer first
 
-        report = run_prerequisite_flow(
+        prereq_report = run_prerequisite_flow(
             hermes_dir=install_root,
             base_url=args.base_url,
             assume_yes=args.yes,
@@ -1069,14 +1247,11 @@ def main(argv: list[str] | None = None) -> int:
             extra_models=args.model,
             prefer_docker=prefer_docker,
         )
-        if report.errors and not args.yes:
-            # In interactive mode, continue if plugin can still be installed, but warn.
-            print("WARNING: Some prerequisites reported errors. Continuing with plugin install...")
-        elif report.errors and args.yes and not args.skip_voicebox:
-            # Hard-fail in automation if Voicebox never became healthy.
-            if not voicebox_healthy(args.base_url) and not args.skip_models:
-                print("ERROR: Prerequisites failed; aborting.", file=sys.stderr)
-                return 1
+        if prereq_report.errors:
+            print(
+                "WARNING: Some prerequisites reported errors — continuing.\n"
+                "         The plugin + bridge are still installed; see notes below."
+            )
 
         # Seed canonical demo CLONE voices so every install ships identical demos.
         if (
@@ -1184,7 +1359,13 @@ def main(argv: list[str] | None = None) -> int:
             home.mkdir(parents=True, exist_ok=True)
             config_path = home / "config.yaml"
             label = "default" if home == install_root else home.name
-            result = merge_config(config_path, snippet, force=args.force_config)
+            result = merge_config(
+                config_path,
+                snippet,
+                force=args.force_config,
+                bridge_path=bridge_path,
+                python_cmd=python_cmd,
+            )
             if result == "created":
                 print(f"[{label}] Created {config_path} with Voicebox TTS provider.")
             elif result == "replaced":
@@ -1193,6 +1374,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[{label}] Appended Voicebox TTS provider to {config_path}.")
             elif result == "relocated":
                 print(f"[{label}] Relocated Voicebox TTS block in {config_path}.")
+            elif result == "repaired":
+                print(
+                    f"[{label}] Repaired broken provider command(s) in {config_path} "
+                    f"(literal ~ or python3 launcher → {python_cmd} + absolute path)."
+                )
             else:
                 print(f"[{label}] Left existing TTS block in {config_path} unchanged.")
 
@@ -1212,6 +1398,12 @@ def main(argv: list[str] | None = None) -> int:
                 presult = merge_personalities_config(config_path, samples)
                 print(f"[{label}] Sample personalities: {presult}")
 
+            enable_result = ensure_plugin_enabled(config_path)
+            if enable_result == "enabled":
+                print(f"[{label}] Enabled plugin '{PLUGIN_ID}' (no manual toggle needed).")
+            elif enable_result == "already":
+                print(f"[{label}] Plugin '{PLUGIN_ID}' already enabled.")
+
     print()
     print("=== Setup Complete ===")
     print("Config snippet (absolute paths for this machine):")
@@ -1220,35 +1412,18 @@ def main(argv: list[str] | None = None) -> int:
     healthy = voicebox_healthy(args.base_url)
     print("Status:")
     print(f"  Voicebox API: {'healthy' if healthy else 'NOT REACHABLE'} ({args.base_url})")
-    print("Next steps:")
+    print()
+    print("Next step: RESTART Hermes Desktop (fully quit, then reopen) so it")
+    print("loads the Voicebox plugin + config.")
     if not healthy:
-        print("  1. Start Voicebox (desktop app or `docker compose up -d` in ~/.hermes/vendor/voicebox)")
-        print("  2. Re-run with: python install.py -y --skip-hermes")
-    print("  • Restart Hermes Desktop so it reloads plugins + config (+ speak-stream hook)")
-    print("  • Open the Voicebox sidebar — voice + persona bind to the active Hermes profile")
-    print(
-        f"  • Long read-aloud starts per sentence via speak-stream; "
-        f"command timeout is {COMMAND_TTS_TIMEOUT_SECONDS}s"
-    )
-    print(
-        "  • New Hermes profiles: python install.py --skip-prereqs --all-profiles "
-        "(copies plugin into each profile’s desktop-plugins/)"
-    )
-    print("  • CLI bind: HERMES_HOME=~/.hermes/profiles/<name> python3 scripts/voicebox_bind.py --voice <uuid>")
-    print(
-        "  • After a Hermes Agent update, re-run: "
-        "python install.py -y --skip-prereqs --skip-hermes "
-        "(re-applies speak-stream patches under hermes-agent/)"
-    )
-    print(
-        "  • Free GPU: plugin button, or "
-        "`python3 ~/.hermes/scripts/voicebox_gpu.py unload` "
-        "(idle unload + stop-on-Hermes-exit via voicebox-gpu-lifecycle)"
-    )
-    if platform.system() == "Windows":
         print()
-        print("Windows tip: if script execution is blocked, run:")
-        print('  powershell -ExecutionPolicy Bypass -File .\\install.ps1 -Yes')
+        print("Voicebox backend is not running yet. To finish TTS setup, either:")
+        print("  • Start the Voicebox desktop app, or")
+        print("  • Run:  docker compose -f ~/.hermes/vendor/voicebox up -d")
+        print("  • Then re-run to auto-download models + demo voices:")
+        print("      python install.py -y --skip-hermes")
+    print()
+    print("Then open the Voicebox sidebar in Hermes Desktop — pick a voice/persona.")
     return 0
 
 

@@ -38,22 +38,58 @@ The installer does **not** invent a private Voicebox fork — it uses upstream [
 
 ## Quick install
 
-### Linux
+One command after cloning. The installer copies the **plugin + bridge** from
+this repo into your Hermes home, merges config, enables the plugin
+automatically, and (best-effort) provisions Hermes + Voicebox + models. If
+Docker or model downloads fail, the plugin is **still installed and usable** —
+the script reports what's missing instead of aborting.
+
+> **Prerequisites (already present on a normal Ubuntu desktop):** `git` and
+> `python3` (3.10+). A minimal/cloud VM may lack them — the installer can
+> install both via `apt`/`dnf`/`pacman` with sudo, or you can pre-install:
+> `sudo apt-get install -y git python3`.
+
+### Linux — copy-paste these three lines
 
 ```bash
-chmod +x install.sh
-./install.sh -y
+git clone https://github.com/chuckatbcs/hermes-voicebox.git
+cd hermes-voicebox
+python3 install.py --one-click
+```
+
+That's the whole install. No shell script needed. After it finishes,
+**restart Hermes Desktop** and open the **Voicebox** sidebar — the plugin is
+enabled automatically, no manual toggle.
+
+If you prefer the wrapper (it auto-runs `--one-click` when non-interactive):
+
+```bash
+chmod +x install.sh && ./install.sh
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
+git clone https://github.com/chuckatbcs/hermes-voicebox.git
+cd hermes-voicebox
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Yes
 ```
 
-`-y` / `-Yes` auto-approves downloads and package installs (model downloads can be multiple GB).
+`--one-click` / `-Yes` is fully non-interactive and fault-tolerant: it
+auto-approves downloads (models can be multiple GB) and keeps going if a
+backend can't be provisioned.
 
-Then **restart Hermes Desktop** and open the **Voicebox** sidebar entry.
+**Troubleshooting `./install.sh: No such file or directory`:** this almost
+always means you ran the command from a directory that isn't the cloned repo
+(you must `cd hermes-voicebox` first, or clone it first). Use the
+`python3 install.py --one-click` line above, which doesn't depend on the
+shell script. In the rare case the clone checked out with Windows line endings
+(a global `git config core.autocrlf` mismatch), re-clone after
+`git config --global core.autocrlf input`.
+
+If Voicebox isn't running yet, start it (desktop app or
+`docker compose -f ~/.hermes/vendor/voicebox up -d`) and re-run
+`python install.py -y --skip-hermes` to fetch models + demo voices.
 
 ---
 

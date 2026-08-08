@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 import install
@@ -101,6 +101,87 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("    helpful: You are helpful.", text)
             self.assertLess(text.index("personalities:"), text.index("helpful:"))
             self.assertLess(text.index("helpful:"), text.index(install.MARKER_BEGIN))
+
+    def test_normalize_tts_commands_fixes_tilde_and_python3(self):
+        """A literal ~/.hermes path and python3 launcher are rewritten to the
+        absolute path + correct launcher, preserving all trailing args."""
+        bridge = Path(r"C:\Users\cblac\.hermes\scripts\voicebox_tts.py")
+        text = (
+            "tts:\n"
+            "  providers:\n"
+            "    fish:\n"
+            "      command: python3 ~/.hermes/scripts/voicebox_tts.py --provider fish "
+            "--text-file {input_path} --out {output_path} --fish-label jarvis\n"
+        )
+        fixed, rewritten = install.normalize_tts_commands(text, bridge, "py -3")
+        self.assertEqual(len(rewritten), 1)
+        self.assertIn(
+            "command: py -3 C:\\Users\\cblac\\.hermes\\scripts\\voicebox_tts.py "
+            "--provider fish --text-file {input_path} --out {output_path} --fish-label jarvis",
+            fixed,
+        )
+        self.assertNotIn("~/.hermes", fixed)
+        self.assertNotIn("python3", fixed.split("command:")[1].split()[0])
+
+    def test_normalize_tts_commands_leaves_good_command_alone(self):
+        """A correct absolute-path command (any platform) is untouched."""
+        bridge = Path(r"C:\Users\cblac\.hermes\scripts\voicebox_tts.py")
+        text = (
+            "tts:\n"
+            "  providers:\n"
+            "    voicebox:\n"
+            "      command: py -3 C:\\Users\\cblac\\.hermes\\scripts\\voicebox_tts.py "
+            "--text-file {input_path} --out {output_path} --voice 3f05\n"
+        )
+        fixed, rewritten = install.normalize_tts_commands(text, bridge, "py -3")
+        self.assertEqual(rewritten, [])
+        self.assertEqual(fixed, text)
+
+    def test_normalize_tts_commands_leaves_good_posix_command_alone(self):
+        """A correct POSIX (Linux) command must be a NO-OP even when the test
+        host is Windows. Uses PurePosixPath so the bridge path keeps forward
+        slashes; a correct `python3 /abs/path` command must not be rewritten.
+        This guards the 'Linux version stays clean' contract."""
+        bridge = PurePosixPath("/home/cblac/.hermes/scripts/voicebox_tts.py")
+        text = (
+            "tts:\n"
+            "  providers:\n"
+            "    voicebox:\n"
+            "      command: python3 /home/cblac/.hermes/scripts/voicebox_tts.py "
+            "--text-file {input_path} --out {output_path} --voice 3f05\n"
+        )
+        fixed, rewritten = install.normalize_tts_commands(text, bridge, "python3")
+        self.assertEqual(rewritten, [])
+        self.assertEqual(fixed, text)
+
+    def test_merge_config_repairs_stale_unmarked_block(self):
+        """A pre-existing, unmarked config with a broken Windows command is
+        repaired in place (returns 'repaired') rather than skipped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.yaml"
+            cfg.write_text(
+                "tts:\n"
+                "  provider: fish\n"
+                "  providers:\n"
+                "    fish:\n"
+                "      type: command\n"
+                "      command: python3 ~/.hermes/scripts/voicebox_tts.py --provider fish "
+                "--text-file {input_path} --out {output_path} --fish-label jarvis\n",
+                encoding="utf-8",
+            )
+            bridge = Path(r"C:\Users\cblac\.hermes\scripts\voicebox_tts.py")
+            snippet = install.build_snippet("py -3", bridge)
+            result = install.merge_config(
+                cfg, snippet, bridge_path=bridge, python_cmd="py -3"
+            )
+            self.assertEqual(result, "repaired")
+            text = cfg.read_text(encoding="utf-8")
+            self.assertIn(
+                "command: py -3 C:\\Users\\cblac\\.hermes\\scripts\\voicebox_tts.py "
+                "--provider fish --text-file {input_path} --out {output_path} --fish-label jarvis",
+                text,
+            )
+            self.assertNotIn("~/.hermes", text)
 
 
 class ModelResolveTests(unittest.TestCase):
