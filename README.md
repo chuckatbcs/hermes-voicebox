@@ -38,18 +38,33 @@ The installer does **not** invent a private Voicebox fork — it uses upstream [
 
 ## Quick install
 
-One command after cloning. The installer copies the **plugin + bridge** from
-this repo into your Hermes home, merges config, enables the plugin
-automatically, and (best-effort) provisions Hermes + Voicebox + models. If
-Docker or model downloads fail, the plugin is **still installed and usable** —
-the script reports what's missing instead of aborting.
+One command. The installer copies the **plugin + bridge** from this repo into
+your Hermes home, merges config, enables the plugin automatically, and
+(best-effort) provisions Hermes + Voicebox + models. If Docker or model
+downloads fail, the plugin is **still installed and usable** — the script
+reports what's missing instead of aborting.
+
+> **The installer is self-healing and re-runnable.** Every step is idempotent.
+> If a `git clone` was interrupted or a previous install is broken, just run
+> the installer again — it repairs/updates instead of failing. (See
+> [Repair / update](#repair--update) below.)
 
 > **Prerequisites (already present on a normal Ubuntu desktop):** `git` and
 > `python3` (3.10+). A minimal/cloud VM may lack them — the installer can
 > install both via `apt`/`dnf`/`pacman` with sudo, or you can pre-install:
 > `sudo apt-get install -y git python3`.
 
-### Linux — copy-paste these three lines
+### Linux — one line (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chuckatbcs/hermes-voicebox/master/bootstrap.sh | bash
+```
+
+This fetches `install.sh`, which clones/updates the repo (self-healing a
+partial clone) and runs the install. **To re-run or update later, just run the
+same line again** — it repairs/updates in place.
+
+Manual equivalent (if you'd rather clone yourself):
 
 ```bash
 git clone https://github.com/chuckatbcs/hermes-voicebox.git
@@ -57,15 +72,8 @@ cd hermes-voicebox
 python3 install.py --one-click
 ```
 
-That's the whole install. No shell script needed. After it finishes,
-**restart Hermes Desktop** and open the **Voicebox** sidebar — the plugin is
-enabled automatically, no manual toggle.
-
-If you prefer the wrapper (it auto-runs `--one-click` when non-interactive):
-
-```bash
-chmod +x install.sh && ./install.sh
-```
+After it finishes, **restart Hermes Desktop** and open the **Voicebox**
+sidebar — the plugin is enabled automatically, no manual toggle.
 
 ### Windows (PowerShell)
 
@@ -79,13 +87,28 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Yes
 auto-approves downloads (models can be multiple GB) and keeps going if a
 backend can't be provisioned.
 
+**The installer is self-healing and re-runnable.** Every step
+(install plugin, bridge, config merge, plugin-enable, GPU lifecycle) is
+idempotent — running it again repairs a partial or broken previous install
+instead of failing. If a `git clone` was interrupted, just run the installer
+again: it updates an existing clone, or repairs a half-finished one
+(backing up the broken folder to `hermes-voicebox.bak.*`).
+
+**To repair / update an existing install:**
+```bash
+cd hermes-voicebox
+python3 install.py --self-heal     # prints what's broken, then fixes it
+# or simply re-run the normal install — it overwrites/repairs as needed:
+python3 install.py --one-click
+```
+
 **Troubleshooting `./install.sh: No such file or directory`:** this almost
 always means you ran the command from a directory that isn't the cloned repo
-(you must `cd hermes-voicebox` first, or clone it first). Use the
-`python3 install.py --one-click` line above, which doesn't depend on the
-shell script. In the rare case the clone checked out with Windows line endings
-(a global `git config core.autocrlf` mismatch), re-clone after
-`git config --global core.autocrlf input`.
+(you must `cd hermes-voicebox` first, or clone it first). Re-run
+`install.sh` from the repo, or use `python3 install.py --one-click`, which
+doesn't depend on the shell script. In the rare case the clone checked out
+with Windows line endings (a global `git config core.autocrlf` mismatch),
+re-clone after `git config --global core.autocrlf input`.
 
 If Voicebox isn't running yet, start it (desktop app or
 `docker compose -f ~/.hermes/vendor/voicebox up -d`) and re-run
