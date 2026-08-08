@@ -319,15 +319,52 @@ function ttsProviderFromConfig(cfg) {
   return provider === 'fish' ? 'fish' : 'voicebox';
 }
 
+// OS-correct Python launcher: `py -3` on Windows, `python3` elsewhere.
+function detectPythonCmd() {
+  // Electron renderer: process may be unavailable in some builds — guard it.
+  const platform = (typeof process !== 'undefined' && process.platform) || '';
+  return platform === 'win32' ? 'py -3' : 'python3';
+}
+
+// Conventional absolute bridge path (~/.hermes/scripts/voicebox_tts.py), used
+// only as a last-resort fallback when no voicebox command exists to copy from.
+// `~` is expanded to a real path because Windows/Python never expand it.
+function defaultBridgeBase() {
+  let home = '~';
+  try {
+    const os = (typeof require !== 'undefined') ? require('os') : null;
+    const h = os && typeof os.homedir === 'function' ? os.homedir() : null;
+    if (h) home = h;
+  } catch (_) { /* keep '~' */ }
+  const scripts = `${home}/.hermes/scripts/voicebox_tts.py`;
+  return `${detectPythonCmd()} ${scripts}`;
+}
+
+// Extract the launcher + script path (base) for voicebox_tts.py from an existing
+// command string. Handles BOTH POSIX (`python3 /abs/voicebox_tts.py`) and
+// Windows (`py -3 C:\Users\..\voicebox_tts.py` or `py -3 C:/abs/voicebox_tts.py`)
+// forms. Older code matched only POSIX and thereby re-broke the command on
+// Windows every time the plugin wrote the config. We tokenize and take every
+// token up to and including the one ending in `voicebox_tts.py`, so the launcher
+// (`py`, `-3`, …) is preserved intact.
+function extractBridgeBase(command) {
+  const tokens = (command || '').trim().split(/\s+/).filter(Boolean);
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    if (tokens[i].endsWith('voicebox_tts.py')) {
+      return tokens.slice(0, i + 1).join(' ');
+    }
+  }
+  return null;
+}
+
 // Derive the Fish command from the *existing* voicebox command in config so the
 // script path always matches what Hermes actually invokes (no hardcoding).
-// Falls back to the conventional ~/.hermes/scripts path if none is present.
+// Falls back to the OS-correct conventional path if none is present.
 function buildFishCommandFromConfig(cfg, label) {
   const tts = (cfg && (cfg.tts || cfg.config?.tts)) || {};
   const vbCmd = tts?.providers?.voicebox?.command || '';
-  let base = 'python3 ~/.hermes/scripts/voicebox_tts.py';
-  const m = vbCmd.match(/(python3?\s+[^\s]+\/voicebox_tts\.py)/);
-  if (m) base = m[1];
+  const derived = extractBridgeBase(vbCmd);
+  const base = derived || defaultBridgeBase();
   const safeLabel = (label || 'jarvis').trim() || 'jarvis';
   return `${base} --provider fish --text-file {input_path} --out {output_path} --fish-label ${safeLabel}`;
 }
