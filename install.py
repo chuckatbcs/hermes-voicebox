@@ -1092,6 +1092,49 @@ def verify_install(plugin_dst: Path, bridge_dst: Path) -> None:
         raise RuntimeError(f"Bridge install verification failed: {bridge_dst}")
 
 
+def diagnose_install(install_root: Path) -> list[str]:
+    """Report what a re-run would repair in a previous/partial install.
+
+    Returns a list of human-readable status lines (one per component). Used by
+    ``--self-heal`` so the user sees, before anything changes, exactly what is
+    missing/broken and will be fixed. Pure read — never mutates.
+    """
+    issues: list[str] = []
+    plugin = install_root / "desktop-plugins" / PLUGIN_ID / "plugin.js"
+    bridge = install_root / "scripts" / "voicebox_tts.py"
+    gpu = install_root / "scripts" / "voicebox_gpu.py"
+    cfg = install_root / "config.yaml"
+
+    issues.append(
+        ("OK   plugin            " if (plugin.is_file() and plugin.stat().st_size > 0)
+         else "FIX  plugin MISSING/EMPTY") + "  " + str(plugin)
+    )
+    issues.append(
+        ("OK   bridge            " if (bridge.is_file() and bridge.stat().st_size > 0)
+         else "FIX  bridge MISSING/EMPTY") + "  " + str(bridge)
+    )
+    issues.append(
+        ("OK   gpu-lifecycle     " if gpu.is_file() else "FIX  gpu-lifecycle MISSING")
+        + "  " + str(gpu)
+    )
+    if cfg.is_file():
+        text = cfg.read_text(encoding="utf-8", errors="replace")
+        has_provider = "provider: voicebox" in text or "voicebox_tts.py" in text
+        enabled = ("plugins:" in text and "voice-switcher:" in text
+                   and "enabled: true" in text)
+        issues.append(
+            ("OK   tts provider      " if has_provider else "FIX  tts provider block MISSING")
+            + "  " + str(cfg)
+        )
+        issues.append(
+            ("OK   plugin enabled    " if enabled else "FIX  plugin NOT auto-enabled")
+            + "  (plugins.voice-switcher.enabled: true)"
+        )
+    else:
+        issues.append("FIX  config.yaml MISSING  -> will create with Voicebox TTS provider")
+    return issues
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Install Hermes Voicebox integration (with prerequisite provisioning)"
@@ -1138,6 +1181,13 @@ def main(argv: list[str] | None = None) -> int:
         "--yes",
         action="store_true",
         help="Non-interactive: auto-approve prerequisite installs/downloads",
+    )
+    parser.add_argument(
+        "--self-heal",
+        action="store_true",
+        help="First diagnose a previous/partial install and report what will be "
+        "repaired (plugin, bridge, config block, plugin-enabled, GPU lifecycle), "
+        "then run the normal idempotent install. Safe to re-run any time.",
     )
     parser.add_argument(
         "--one-click",
@@ -1214,6 +1264,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Hermes root:  {install_root}")
     if hermes_dir != install_root:
         print(f"Profile home: {hermes_dir}")
+
+    if args.self_heal:
+        print()
+        print("--- Self-heal diagnosis (read-only; will repair any FIX line below) ---")
+        for line in diagnose_install(install_root):
+            print("  " + line)
+        print("--- Proceeding with install (idempotent; overwrites/repairs as needed) ---")
+        print()
     print(f"Python cmd:   {python_cmd}")
     print(f"Voicebox:     {args.base_url}")
 

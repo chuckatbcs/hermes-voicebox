@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Linux/macOS launcher for the cross-platform Hermes Voicebox installer.
-# Bootstraps missing Git/Python when possible, then runs install.py.
-set -euo pipefail
+# Bootstraps missing Git/Python when possible, clones/updates the repo
+# (self-healing a partial clone), then runs install.py.
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -13,19 +14,42 @@ if command -v cygpath >/dev/null 2>&1; then
   SCRIPT_DIR="$(cygpath -w "$SCRIPT_DIR" 2>/dev/null || echo "$SCRIPT_DIR")"
   SCRIPT_DIR="${SCRIPT_DIR//\\//}"   # Python accepts forward slashes on Windows
 fi
+
+# If this script is NOT sitting next to install.py, we're being run from some
+# other directory (e.g. the README's "git clone ... && cd hermes-voicebox &&
+# python3 install.py" was truncated, or the user just ran install.sh from ~).
+# Self-heal: clone/update the repo into ./hermes-voicebox and re-exec inside it.
+if [[ ! -f "$SCRIPT_DIR/install.py" ]]; then
+  # If there's a copy of install.sh already inside ./hermes-voicebox, prefer it.
+  if [[ -f "hermes-voicebox/install.sh" ]]; then
+    exec bash "hermes-voicebox/install.sh" "$@"
+  fi
+  echo "install.py not beside this script — cloning/updating the repo first..."
+  REPO_URL="https://github.com/chuckatbcs/hermes-voicebox.git"
+  REPO_DIR="hermes-voicebox"
+  if [[ -d "$REPO_DIR/.git" ]]; then
+    echo "Repo present at ./$REPO_DIR — updating (git pull)..."
+    git -C "$REPO_DIR" pull --ff-only 2>&1 | tail -3 || {
+      echo "WARNING: git pull failed; repairing clone..."
+      bak="${REPO_DIR}.bak.$$"; mv "$REPO_DIR" "$bak" 2>/dev/null
+      git clone "$REPO_URL" "$REPO_DIR" 2>&1 | tail -3
+    }
+  elif [[ -e "$REPO_DIR" ]]; then
+    echo "Found a non-git ./$REPO_DIR (partial clone) — repairing..."
+    bak="${REPO_DIR}.bak.$$"; mv "$REPO_DIR" "$bak" 2>/dev/null
+    git clone "$REPO_URL" "$REPO_DIR" 2>&1 | tail -3
+  else
+    git clone "$REPO_URL" "$REPO_DIR" 2>&1 | tail -3
+  fi
+  exec bash "hermes-voicebox/install.sh" "$@"
+fi
+
 cd "$SCRIPT_DIR"
 
-# Guard: this script must live next to install.py. If it doesn't, the user
-# almost certainly ran it from the wrong directory (the classic
-# "./install.sh: No such file or directory" confusion). Say so clearly.
+# Guard (defensive — we should now be inside the repo): install.py must exist.
 if [[ ! -f "$SCRIPT_DIR/install.py" ]]; then
-  echo "ERROR: install.py not found next to this script." >&2
-  echo "       This means you're not inside the cloned repo directory." >&2
-  echo "       Run these first:" >&2
-  echo "         git clone https://github.com/chuckatbcs/hermes-voicebox.git" >&2
-  echo "         cd hermes-voicebox" >&2
-  echo "       then:  python3 install.py --one-click" >&2
-  echo "       (or:  bash install.sh)" >&2
+  echo "ERROR: install.py still not found after clone." >&2
+  echo "       Remove ./hermes-voicebox and re-run." >&2
   exit 1
 fi
 
@@ -41,6 +65,12 @@ have_python() {
   fi
   return 1
 }
+
+# Clone the repo, or update it if it already exists, or repair it if a previous
+# clone was interrupted (the classic "destination path already exists and is not
+# an empty directory" / partial-clone trap). Idempotent and re-runnable.
+REPO_URL="https://github.com/chuckatbcs/hermes-voicebox.git"
+REPO_DIR="${REPO_DIR:-hermes-voicebox}"
 
 bootstrap_git() {
   echo "Git not found — attempting to install..."
