@@ -12,12 +12,11 @@ on:
 
 jobs:
   test:
-    name: ${{ matrix.os }} / py${{ matrix.python }}
-    runs-on: ${{ matrix.os }}
+    name: Windows / py${{ matrix.python }}
+    runs-on: [self-hosted, Windows, X64, local-windows]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
         python: ["3.10", "3.12"]
 
     steps:
