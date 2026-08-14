@@ -22,6 +22,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: CI preflight
+        shell: powershell
+        run: .\ci-preflight.ps1
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
