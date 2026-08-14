@@ -47,45 +47,42 @@ jobs:
         run: py -${{ matrix.python }} scripts/test_e2e_root_to_tip.py
 
       - name: Verify both service templates are present
-        shell: python
+        shell: pwsh
         run: |
-          import sys
-          from pathlib import Path
-
-          required = [
-              Path("installer/systemd/voicebox-gpu-lifecycle.service"),
-              Path("installer/windows/voicebox-gpu-lifecycle.xml"),
-          ]
-          missing = [str(p) for p in required if not p.is_file()]
-          if missing:
-              sys.exit("Missing service template(s): " + ", ".join(missing))
-          print("Both service templates present.")
+          $required = @(
+            'installer/systemd/voicebox-gpu-lifecycle.service',
+            'installer/windows/voicebox-gpu-lifecycle.xml'
+          )
+          $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_) })
+          if ($missing.Count -gt 0) { throw ('Missing service template(s): ' + ($missing -join ', ')) }
+          Write-Host 'Both service templates present.'
 
   line-endings:
     name: line-ending hygiene
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows, X64, local-windows]
     steps:
       - uses: actions/checkout@v4
 
       - name: Fail on CRLF in LF-only files
+        shell: pwsh
         run: |
-          set -euo pipefail
-          bad=$(git grep -Il $'\r' -- '*.sh' '*.py' '*.service' '*.yml' '*.yaml' || true)
-          if [ -n "$bad" ]; then
-            echo "CRLF found in LF-only files:"
-            echo "$bad"
-            echo "Fix with: git add --renormalize ."
-            exit 1
-          fi
-          echo "Line endings OK."
+          $bad = @(git grep -Il ([char]13) -- '*.sh' '*.py' '*.service' '*.yml' '*.yaml')
+          if ($LASTEXITCODE -eq 0 -and $bad.Count -gt 0) {
+            Write-Host 'CRLF found in LF-only files:'
+            $bad
+            throw 'Fix with: git add --renormalize .'
+          }
+          Write-Host 'Line endings OK.'
 
       - name: Fail if .gitattributes would renormalize the tree
+        shell: pwsh
         run: |
-          set -euo pipefail
           git add --renormalize .
-          if ! git diff --cached --quiet; then
-            echo "Files are not normalized per .gitattributes:"
+          if ($LASTEXITCODE -ne 0) { throw 'git add --renormalize failed' }
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'Files are not normalized per .gitattributes:'
             git diff --cached --stat
-            exit 1
-          fi
-          echo "Tree matches .gitattributes."
+            throw 'Tree does not match .gitattributes.'
+          }
+          Write-Host 'Tree matches .gitattributes.'
