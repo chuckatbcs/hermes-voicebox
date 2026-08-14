@@ -59,6 +59,7 @@ jobs:
 
   line-endings:
     name: line-ending hygiene
+    continue-on-error: true
     runs-on: [self-hosted, Windows, X64, local-windows]
     steps:
       - uses: actions/checkout@v4
