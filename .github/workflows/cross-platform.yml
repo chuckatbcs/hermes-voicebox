@@ -47,7 +47,7 @@ jobs:
         run: py -${{ matrix.python }} scripts/test_e2e_root_to_tip.py
 
       - name: Verify both service templates are present
-        shell: pwsh
+        shell: powershell
         run: |
           $required = @(
             'installer/systemd/voicebox-gpu-lifecycle.service',
@@ -64,7 +64,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Fail on CRLF in LF-only files
-        shell: pwsh
+        shell: powershell
         run: |
           $bad = @(git grep -Il ([char]13) -- '*.sh' '*.py' '*.service' '*.yml' '*.yaml')
           if ($LASTEXITCODE -eq 0 -and $bad.Count -gt 0) {
@@ -75,7 +75,7 @@ jobs:
           Write-Host 'Line endings OK.'
 
       - name: Fail if .gitattributes would renormalize the tree
-        shell: pwsh
+        shell: powershell
         run: |
           git add --renormalize .
           if ($LASTEXITCODE -ne 0) { throw 'git add --renormalize failed' }
