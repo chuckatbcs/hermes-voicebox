@@ -24,9 +24,26 @@ cd "$(dirname "$0")"
 PY=python3
 command -v "$PY" >/dev/null 2>&1 || PY=python
 if ! command -v "$PY" >/dev/null 2>&1; then
-    echo "ERROR: Python 3 not found. Install Python 3.10+ first:" >&2
-    echo "  Debian/Ubuntu/Pop!: sudo apt install python3 python3-pip" >&2
-    exit 1
+    echo "Python 3 not found — installing it for you..."
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update -qq && sudo apt-get install -y python3 python3-pip python3-venv
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y python3 python3-pip
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm python
+    elif command -v zypper >/dev/null 2>&1; then
+        sudo zypper install -y python3 python3-pip
+    else
+        echo "ERROR: no supported package manager found." >&2
+        echo "Install Python 3.10+ from https://python.org and re-run." >&2
+        exit 1
+    fi
+    command -v python3 >/dev/null 2>&1 || PY=python
+    if ! command -v "$PY" >/dev/null 2>&1; then
+        echo "ERROR: Python install finished but python3 is still not on PATH." >&2
+        echo "Open a new terminal and re-run this script." >&2
+        exit 1
+    fi
 fi
 
 echo "=== Installing Hermes Voicebox Integration & Backend ==="

@@ -35,7 +35,7 @@ pieces**:
 ### You must have / provide yourself
 | Requirement | Notes |
 |---|---|
-| **Python 3.10+** | Linux: `sudo apt install python3 python3-pip`. Windows: python.org installer ("Add to PATH"). The one-liner will tell you if it's missing. |
+| **Python 3.10+** | **Not required beforehand** — the Linux one-shot installs it via your package manager if missing (apt/dnf/pacman/zypper). Windows: python.org installer ("Add to PATH"), or `winget install Python.Python.3.12`. |
 | **~6–10 GB free disk** | Models are multi-GB downloads. |
 | **NVIDIA GPU (recommended)** | Any modern 8 GB+ card works great; CPU-only also works but synthesis is slow. No special CUDA setup needed — PyTorch inside the Voicebox environment handles it. |
 | **Docker** (Linux, optional but recommended) | Only if you want the containerized Voicebox route instead of a local checkout. Get it from docker.com. |
