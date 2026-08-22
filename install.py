@@ -25,6 +25,7 @@ from installer.prereqs import (
     MODEL_PROFILES,
     find_python_command,
     log,
+    run,
     run_prerequisite_flow,
     seed_sample_clones,
     voicebox_healthy,
@@ -1253,6 +1254,33 @@ def main(argv: list[str] | None = None) -> int:
         resolve_profile_hermes_dir(args.profile, root_hermes) if args.profile else root_hermes
     )
     python_cmd = find_python_command() or ("python" if platform.system() == "Windows" else "python3")
+
+    # Ensure backend Python dependencies (fastapi/uvicorn/numpy/requests/pyyaml).
+    # Idempotent: skipped when already importable. Uses the same interpreter
+    # that will run voicebox_server.py / the bridge.
+    if not args.skip_prereqs:
+        _deps_ok = True
+        for _mod in ("fastapi", "uvicorn", "numpy", "requests", "yaml"):
+            if subprocess.run(
+                [python_cmd, "-c", f"import {_mod}"], capture_output=True
+            ).returncode != 0:
+                _deps_ok = False
+                break
+        if not _deps_ok:
+            pip_args = [python_cmd, "-m", "pip", "install",
+                        "fastapi", "uvicorn", "numpy", "requests", "PyYAML"]
+            if platform.system() != "Windows":
+                # PEP 668: system Pythons on modern Debian/Fedora block bare pip.
+                pip_args.append("--break-system-packages")
+            log("Installing Python dependencies (fastapi, uvicorn, numpy, requests, PyYAML)...")
+            proc = run(pip_args, check=False, capture=False, timeout=600)
+            if proc.returncode != 0 and not args.one_click:
+                print(
+                    "WARNING: dependency install failed. Install manually:\n"
+                    f"  {python_cmd} -m pip install fastapi uvicorn numpy requests PyYAML",
+                    file=sys.stderr,
+                )
+
     # Root keeps shared speak-stream / GPU lifecycle. Desktop loads plugins from each
     # profile's HERMES_HOME, so --profile / --all-profiles also copy plugin+scripts there.
     install_root = root_hermes
