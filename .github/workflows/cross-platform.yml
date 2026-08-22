@@ -40,9 +40,9 @@ jobs:
       - name: Installer unit tests
         run: py -${{ matrix.python }} -m unittest test_install.py -v
 
-      - name: Bridge + GPU unit tests
+      - name: Bridge + GPU + streamer unit tests
         working-directory: scripts
-        run: py -${{ matrix.python }} -m unittest test_voicebox_tts.py test_voicebox_gpu.py -v
+        run: py -${{ matrix.python }} -m unittest test_voicebox_tts.py test_voicebox_gpu.py test_hermes_voicebox_streamer -v
 
       - name: Plugin storage tests
         run: node --test desktop-plugin/test_plugin_storage.mjs

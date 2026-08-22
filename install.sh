@@ -1,42 +1,50 @@
 #!/bin/bash
-# Linux installer for Hermes Voicebox integration & backend service
+# Linux/macOS launcher for the Hermes Voicebox integration installer.
+#
+# This is a thin wrapper around install.py, which performs the FULL install:
+#   1. Prerequisite check & provisioning (Python deps, Hermes, Voicebox,
+#      TTS models, demo voices)
+#   2. Desktop plugin + TTS bridge + Fish provider scripts -> $HERMES_DIR
+#   3. Marked TTS block merged into every profile's config.yaml
+#   4. Speak-stream hook patches into hermes-agent (chunked read-aloud)
+#   5. GPU lifecycle daemon (systemd user unit) + backend server on :17493
+#
+# All command-line flags are passed through to install.py:
+#   ./install.sh                          # interactive, provisions everything
+#   ./install.sh -y                       # non-interactive
+#   ./install.sh --one-click              # best-effort, tolerates partial failures
+#   ./install.sh --skip-prereqs           # plugin/bridge/config files only
+#   ./install.sh --all-profiles -y        # install into every Hermes profile
+#
+# See: python3 install.py --help
 set -e
 
-HERMES_DIR="$HOME/.hermes"
-echo "=== Installing Hermes Voicebox Integration & Backend (Linux) ==="
+cd "$(dirname "$0")"
 
-# 1. Ensure target directories exist
-mkdir -p "$HERMES_DIR/desktop-plugins/voice-switcher"
-mkdir -p "$HERMES_DIR/scripts"
-mkdir -p "$HERMES_DIR/voicebox_profiles"
-
-# 2. Copy plugin files
-echo "Copying plugin UI..."
-cp desktop-plugin/plugin.js "$HERMES_DIR/desktop-plugins/voice-switcher/plugin.js"
-
-# 3. Copy python bridge script and backend server
-echo "Copying python bridge & backend server scripts..."
-cp scripts/voicebox_tts.py "$HERMES_DIR/scripts/voicebox_tts.py"
-cp scripts/voicebox_server.py "$HERMES_DIR/scripts/voicebox_server.py"
-chmod +x "$HERMES_DIR/scripts/voicebox_tts.py"
-chmod +x "$HERMES_DIR/scripts/voicebox_server.py"
-
-# 4. Check dependencies
-echo "Checking Python dependencies (fastapi, uvicorn, numpy)..."
-if ! python3 -c "import fastapi, uvicorn, numpy" &>/dev/null; then
-    echo "Installing required backend packages via pip..."
-    pip3 install fastapi uvicorn numpy
+PY=python3
+command -v "$PY" >/dev/null 2>&1 || PY=python
+if ! command -v "$PY" >/dev/null 2>&1; then
+    echo "Python 3 not found — installing it for you..."
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update -qq && sudo apt-get install -y python3 python3-pip python3-venv
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y python3 python3-pip
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm python
+    elif command -v zypper >/dev/null 2>&1; then
+        sudo zypper install -y python3 python3-pip
+    else
+        echo "ERROR: no supported package manager found." >&2
+        echo "Install Python 3.10+ from https://python.org and re-run." >&2
+        exit 1
+    fi
+    command -v python3 >/dev/null 2>&1 || PY=python
+    if ! command -v "$PY" >/dev/null 2>&1; then
+        echo "ERROR: Python install finished but python3 is still not on PATH." >&2
+        echo "Open a new terminal and re-run this script." >&2
+        exit 1
+    fi
 fi
 
-# 5. Launch backend server if not running
-if curl -s http://127.0.0.1:17493/health &>/dev/null; then
-    echo "Voicebox API Backend Server is already active on http://127.0.0.1:17493"
-else
-    echo "Launching Voicebox API Backend Server..."
-    python3 "$HERMES_DIR/scripts/voicebox_server.py" &>/dev/null &
-fi
-
-echo ""
-echo "=== Setup Complete ==="
-echo "Voicebox API backend is running on http://127.0.0.1:17493"
-echo "Hermes Desktop plugin & TTS bridge are fully installed."
+echo "=== Installing Hermes Voicebox Integration & Backend ==="
+exec "$PY" install.py "$@"

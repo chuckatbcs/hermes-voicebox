@@ -105,7 +105,7 @@ class InstallerTests(unittest.TestCase):
     def test_normalize_tts_commands_fixes_tilde_and_python3(self):
         """A literal ~/.hermes path and python3 launcher are rewritten to the
         absolute path + correct launcher, preserving all trailing args."""
-        bridge = Path(r"C:\Users\cblac\.hermes\scripts\voicebox_tts.py")
+        bridge = Path(r"C:\Users\testuser\.hermes\scripts\voicebox_tts.py")
         text = (
             "tts:\n"
             "  providers:\n"
@@ -116,7 +116,7 @@ class InstallerTests(unittest.TestCase):
         fixed, rewritten = install.normalize_tts_commands(text, bridge, "py -3")
         self.assertEqual(len(rewritten), 1)
         self.assertIn(
-            "command: py -3 C:\\Users\\cblac\\.hermes\\scripts\\voicebox_tts.py "
+            "command: py -3 C:\\Users\\testuser\\.hermes\\scripts\\voicebox_tts.py "
             "--provider fish --text-file {input_path} --out {output_path} --fish-label jarvis",
             fixed,
         )
@@ -125,12 +125,12 @@ class InstallerTests(unittest.TestCase):
 
     def test_normalize_tts_commands_leaves_good_command_alone(self):
         """A correct absolute-path command (any platform) is untouched."""
-        bridge = Path(r"C:\Users\cblac\.hermes\scripts\voicebox_tts.py")
+        bridge = Path(r"C:\Users\testuser\.hermes\scripts\voicebox_tts.py")
         text = (
             "tts:\n"
             "  providers:\n"
             "    voicebox:\n"
-            "      command: py -3 C:\\Users\\cblac\\.hermes\\scripts\\voicebox_tts.py "
+            "      command: py -3 C:\\Users\\testuser\\.hermes\\scripts\\voicebox_tts.py "
             "--text-file {input_path} --out {output_path} --voice 3f05\n"
         )
         fixed, rewritten = install.normalize_tts_commands(text, bridge, "py -3")
@@ -142,12 +142,12 @@ class InstallerTests(unittest.TestCase):
         host is Windows. Uses PurePosixPath so the bridge path keeps forward
         slashes; a correct `python3 /abs/path` command must not be rewritten.
         This guards the 'Linux version stays clean' contract."""
-        bridge = PurePosixPath("/home/cblac/.hermes/scripts/voicebox_tts.py")
+        bridge = PurePosixPath("/home/testuser/.hermes/scripts/voicebox_tts.py")
         text = (
             "tts:\n"
             "  providers:\n"
             "    voicebox:\n"
-            "      command: python3 /home/cblac/.hermes/scripts/voicebox_tts.py "
+            "      command: python3 /home/testuser/.hermes/scripts/voicebox_tts.py "
             "--text-file {input_path} --out {output_path} --voice 3f05\n"
         )
         fixed, rewritten = install.normalize_tts_commands(text, bridge, "python3")
@@ -169,7 +169,7 @@ class InstallerTests(unittest.TestCase):
                 "--text-file {input_path} --out {output_path} --fish-label jarvis\n",
                 encoding="utf-8",
             )
-            bridge = Path(r"C:\Users\cblac\.hermes\scripts\voicebox_tts.py")
+            bridge = Path(r"C:\Users\testuser\.hermes\scripts\voicebox_tts.py")
             snippet = install.build_snippet("py -3", bridge)
             result = install.merge_config(
                 cfg, snippet, bridge_path=bridge, python_cmd="py -3"
@@ -177,7 +177,7 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(result, "repaired")
             text = cfg.read_text(encoding="utf-8")
             self.assertIn(
-                "command: py -3 C:\\Users\\cblac\\.hermes\\scripts\\voicebox_tts.py "
+                "command: py -3 C:\\Users\\testuser\\.hermes\\scripts\\voicebox_tts.py "
                 "--provider fish --text-file {input_path} --out {output_path} --fish-label jarvis",
                 text,
             )

@@ -32,7 +32,7 @@ PROFILES_DIR = HERMES_DIR / "voicebox_profiles"
 UPLOADS_DIR = PROFILES_DIR / "uploads"
 PROFILES_JSON = PROFILES_DIR / "profiles.json"
 SETTINGS_JSON = PROFILES_DIR / "settings.json"
-SAMPLES_DIR = Path(r"H:\Documents\AI Folder\Projects\Voice clone install scripts from Hermes\voice-samples")
+SAMPLES_DIR = HERMES_DIR / "voice-samples"
 
 PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,12 +47,12 @@ DEFAULT_PROFILES = [
         "description": "Fast 82M preset voice model"
     },
     {
-        "id": "chuck_voice",
-        "name": "Chuck's Voice (Cloned)",
+        "id": "demo_user_voice",
+        "name": "Demo User Voice (Cloned)",
         "voice_type": "custom",
         "preset_engine": "chatterbox",
         "default_engine": "chatterbox",
-        "audio_path": str(SAMPLES_DIR / "chuck-voice.wav")
+        "audio_path": str(SAMPLES_DIR / "demo-user-voice.wav")
     },
     {
         "id": "amanda_voice",
@@ -96,14 +96,14 @@ def save_profiles(profiles: list[dict]):
 
 def load_settings() -> dict:
     if not SETTINGS_JSON.exists():
-        default_settings = {"voice_id": "chuck_voice"}
+        default_settings = {"voice_id": "demo_user_voice"}
         save_settings(default_settings)
         return default_settings
     try:
         with open(SETTINGS_JSON, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"voice_id": "chuck_voice"}
+        return {"voice_id": "demo_user_voice"}
 
 
 def save_settings(settings: dict):
@@ -111,7 +111,7 @@ def save_settings(settings: dict):
         json.dump(settings, f, indent=2)
 
 
-async def generate_speech_wav(text: str, profile_id: str = "chuck_voice") -> bytes:
+async def generate_speech_wav(text: str, profile_id: str = "demo_user_voice") -> bytes:
     """Generate speech audio using Chatterbox voice cloning on GPU or Edge Neural fallback."""
     profiles = load_profiles()
     profile = next((p for p in profiles if p["id"] == profile_id), None)
@@ -150,7 +150,7 @@ async def generate_speech_wav(text: str, profile_id: str = "chuck_voice") -> byt
     # 2. Edge Neural TTS Fallback
     pid = (profile_id or "").lower()
     voice_name = "en-US-ChristopherNeural"
-    if "chuck" in pid:
+    if "demo_user" in pid:
         voice_name = "en-US-GuyNeural"
     elif "amanda" in pid:
         voice_name = "en-US-AriaNeural"
@@ -246,7 +246,7 @@ def get_profile(profile_id: str):
 @app.get("/settings/active-voice")
 def get_active_voice():
     settings = load_settings()
-    return {"voice_id": settings.get("voice_id", "chuck_voice")}
+    return {"voice_id": settings.get("voice_id", "demo_user_voice")}
 
 
 @app.put("/settings/active-voice")
@@ -323,7 +323,7 @@ def delete_profile(profile_id: str):
 
     settings = load_settings()
     if settings.get("voice_id") == profile_id:
-        settings["voice_id"] = "chuck_voice"
+        settings["voice_id"] = "demo_user_voice"
         save_settings(settings)
 
     return {"status": "deleted", "profile_id": profile_id}
@@ -337,7 +337,7 @@ async def generate_stream(request: Request):
         body = {}
 
     text = body.get("text", "Hello, welcome to Voicebox.")
-    profile_id = body.get("profile_id") or load_settings().get("voice_id", "chuck_voice")
+    profile_id = body.get("profile_id") or load_settings().get("voice_id", "demo_user_voice")
 
     wav_bytes = await generate_speech_wav(text, profile_id=profile_id)
     return Response(content=wav_bytes, media_type="audio/wav")
