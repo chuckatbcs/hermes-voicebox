@@ -62,34 +62,35 @@ Re-run the installer after Hermes Agent updates (those files get overwritten).
 
 ## 💻 Installation & Quick Start
 
-### Linux
+**Full step-by-step guide (what gets installed, prerequisites, keys, troubleshooting): [`docs/INSTALL.md`](docs/INSTALL.md)**
+
+### One-shot install (recommended)
+
+Linux / macOS:
 
 ```bash
-git clone https://github.com/chuckatbcs/hermes-voicebox.git
-cd hermes-voicebox
-chmod +x install.sh
-./install.sh            # add --skip-prereqs to skip model provisioning
+curl -fsSL https://raw.githubusercontent.com/chuckatbcs/hermes-voicebox/master/bootstrap.sh | bash -s -- --one-click
 ```
 
-Then restart Hermes Desktop so it loads the plugin and patched stream hooks.
-
-### Windows
+Windows (PowerShell):
 
 ```powershell
-git clone https://github.com/chuckatbcs/hermes-voicebox.git
-cd hermes-voicebox
-./install.ps1
+git clone https://github.com/chuckatbcs/hermes-voicebox.git; cd hermes-voicebox
+.\install.ps1 --one-click
 ```
 
-The installer copies plugin + bridge files into `%USERPROFILE%\.hermes\`, checks dependencies, patches `config.yaml`, and installs the GPU-lifecycle scheduled task.
+`install.sh` / `install.ps1` are launchers for the full cross-platform
+installer (`install.py`) and pass every flag through (`-y`, `--skip-prereqs`,
+`--all-profiles`, …). After installing, **restart Hermes Desktop**, open the
+**Voicebox Control** sidebar panel, and pick a voice. Optional hosted TTS:
+paste a free [fish.audio](https://fish.audio) API key in the plugin UI.
 
-### Multi-profile installs
+### Manual (from a cloned repo)
 
 ```bash
-./install.sh --skip-prereqs --all-profiles -y
+chmod +x install.sh
+./install.sh                # interactive — approve each provisioning step
 ```
-
-Installs into `$HERMES_HOME` and every `$HERMES_HOME/profiles/<name>/`.
 
 ---
 
