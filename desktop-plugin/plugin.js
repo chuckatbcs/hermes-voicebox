@@ -1099,6 +1099,8 @@ function VoiceboxView() {
   const [audioBlob, setAudioBlob]         = useState(null);
   const [audioDuration, setAudioDuration] = useState(null);
   const [isSaving, setIsSaving]           = useState(false);
+  const [samplePlayingId, setSamplePlayingId] = useState(null);
+  const samplePlaybackRef = useRef(null);
   const [isPlaying, setIsPlaying]         = useState(false);
   const [fishCloneBusy, setFishCloneBusy] = useState(false);
   const [fishCloningId, setFishCloningId] = useState(null);
@@ -1849,6 +1851,61 @@ function VoiceboxView() {
     }
   };
 
+  // ── Play voice sample audio ───────────────────
+  // Each voice card gets a play button that fetches the reference sample from
+  // Voicebox (/profiles/{id}/samples → /samples/{id}) and plays it. Tapping
+  // again stops it.
+  const stopSamplePlayback = useCallback(() => {
+    if (samplePlaybackRef.current) {
+      try {
+        samplePlaybackRef.current.pause();
+        samplePlaybackRef.current.src = '';
+      } catch (_) {}
+      samplePlaybackRef.current = null;
+    }
+    setSamplePlayingId(null);
+  }, []);
+
+  const handlePlaySample = useCallback(async (voice) => {
+    if (!voice) return;
+    // Toggle off if same voice is playing
+    if (samplePlayingId === String(voice.id)) {
+      stopSamplePlayback();
+      return;
+    }
+    stopSamplePlayback();
+    try {
+      const samples = await apiFetch(`/profiles/${voice.id}/samples`).catch(() => []);
+      const list = Array.isArray(samples) ? samples : (samples.samples || samples.items || []);
+      const sample = list[0];
+      if (!sample || !sample.id) {
+        throw new Error(`No reference sample for "${voice.name}".`);
+      }
+      const audioRes = await fetch(`${BACKEND_URL}/samples/${sample.id}`);
+      if (!audioRes.ok) throw new Error(`Sample fetch failed (${audioRes.status}).`);
+      const blob = await audioRes.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      samplePlaybackRef.current = audio;
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        setSamplePlayingId(null);
+        samplePlaybackRef.current = null;
+      };
+      audio.onerror = () => {
+        URL.revokeObjectURL(url);
+        setSamplePlayingId(null);
+        samplePlaybackRef.current = null;
+      };
+      setSamplePlayingId(String(voice.id));
+      await audio.play();
+    } catch (err) {
+      host.notify({ kind: 'warning', title: 'Play Sample Failed',
+        message: err?.message || 'Could not load sample audio.' });
+      stopSamplePlayback();
+    }
+  }, [samplePlayingId, stopSamplePlayback]);
+
   // ── Clone a voice to Fish Audio (hosted) ──
   // For ANY cloned/preset voice in the list: pull its sample audio from the
   // local Voicebox backend, upload it to Fish, cache the id in config, and
@@ -2332,6 +2389,12 @@ function VoiceboxView() {
                             }, 'Cancel')
                           ]
                         : [
+                            React.createElement(Button, {
+                              key: 'play', variant: 'ghost', size: 'sm',
+                              className: 'text-muted-foreground hover:text-green-400 hover:bg-green-400/10',
+                              title: samplePlayingId === String(v.id) ? 'Stop sample' : `Play reference sample for “${v.name}”`,
+                              onClick: () => handlePlaySample(v)
+                            }, samplePlayingId === String(v.id) ? '⏹️ Stop' : '▶️ Play'),
                             React.createElement(Button, {
                               key: 'fish', variant: 'ghost', size: 'sm',
                               className: 'text-muted-foreground hover:text-sky-400 hover:bg-sky-400/10',

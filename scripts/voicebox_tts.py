@@ -388,12 +388,36 @@ def _read_local_active_voice() -> str:
     return ""
 
 
+def _is_uuid(value: str) -> bool:
+    """True when value looks like a UUID (e.g. '438cdadd-...')."""
+    if not value:
+        return False
+    try:
+        import uuid as _uuid_mod
+        _uuid_mod.UUID(value)
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+def _resolve_profile_by_name(name: str, profiles: list[dict]) -> str | None:
+    """Find a Voicebox profile id by case-insensitive name match."""
+    needle = name.strip().lower()
+    for p in profiles:
+        pname = (p.get("name") or "").strip().lower()
+        if pname == needle:
+            return str(p["id"])
+    return None
+
+
 def resolve_profile_id(cli_voice: str, base_url: str, get_json=None) -> str:
     """
     Resolve which Voicebox profile to use.
 
     Precedence:
       1) CLI --voice (Hermes substitutes tts.providers.voicebox.voice here)
+         - If it's a UUID, use directly.
+         - Otherwise, treat as a profile NAME and resolve via /profiles.
       2) Per-profile binding / sidecar under HERMES_HOME
       3) Voicebox /settings/active-voice (demoted — process-global, cross-profile bleed)
       4) First Voicebox profile
@@ -401,7 +425,35 @@ def resolve_profile_id(cli_voice: str, base_url: str, get_json=None) -> str:
     fetcher = get_json or _get_json
     voice = (cli_voice or "").strip()
     if voice and voice.lower() not in _INVALID_VOICE_IDS:
-        return voice
+        # If not a UUID, try to resolve as a profile name
+        if not _is_uuid(voice):
+            try:
+                profiles = fetcher(f"{base_url}/profiles")
+                if profiles and isinstance(profiles, list):
+                    resolved = _resolve_profile_by_name(voice, profiles)
+                    if resolved:
+                        print(
+                            f"Resolved voice name '{voice}' → profile id {resolved}.",
+                            file=sys.stderr,
+                        )
+                        return resolved
+                    available = [
+                        f"{p.get('name')}" for p in profiles if p.get("name")
+                    ]
+                    print(
+                        f"Warning: no Voicebox profile named '{voice}'. "
+                        f"Available: {', '.join(available) or 'none'}. "
+                        f"Falling through to binding/active-voice/first profile.",
+                        file=sys.stderr,
+                    )
+            except Exception as e:
+                print(
+                    f"Note: could not resolve voice name '{voice}' via /profiles ({e}); "
+                    f"trying fallback sources.",
+                    file=sys.stderr,
+                )
+        else:
+            return voice
 
     local = _read_local_active_voice()
     if local:
