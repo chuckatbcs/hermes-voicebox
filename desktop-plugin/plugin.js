@@ -1101,6 +1101,7 @@ function VoiceboxView() {
   const [isSaving, setIsSaving]           = useState(false);
   const [samplePlayingId, setSamplePlayingId] = useState(null);
   const samplePlaybackRef = useRef(null);
+  const [replacingSampleId, setReplacingSampleId] = useState(null);
   const [isPlaying, setIsPlaying]         = useState(false);
   const [fishCloneBusy, setFishCloneBusy] = useState(false);
   const [fishCloningId, setFishCloningId] = useState(null);
@@ -1906,6 +1907,51 @@ function VoiceboxView() {
     }
   }, [samplePlayingId, stopSamplePlayback]);
 
+  // ── Replace voice sample ──────────────────────
+  // Voicebox only supports appending samples (no DELETE endpoint), so
+  // "replace" uploads a new sample that gets mixed with existing ones
+  // for TTS. The new sample becomes the primary reference.
+  const handleReplaceSample = useCallback(async (voice) => {
+    if (!voice) return;
+    if (!window.hermesDesktop?.selectPaths || !window.hermesDesktop?.readFileDataUrl) {
+      host.notify({ kind: 'error', title: 'Upload Unsupported',
+        message: 'Desktop file API is unavailable.' });
+      return;
+    }
+    setReplacingSampleId(String(voice.id));
+    try {
+      const paths = await window.hermesDesktop.selectPaths({
+        properties: ['openFile'],
+        filters: [{ name: 'Audio Files', extensions: ['wav', 'mp3', 'm4a', 'ogg', 'flac', 'aac', 'webm', 'opus'] }]
+      });
+      if (!paths || !paths.length) return;
+      const filePath = paths[0];
+      const dataUrl = await window.hermesDesktop.readFileDataUrl(filePath);
+      // Convert data URL to Blob
+      const res = await fetch(dataUrl);
+      const blob = await res.blob();
+      const form = new FormData();
+      form.append('file', blob, filePath.split(/[/\\]/).pop() || 'sample.wav');
+      form.append('reference_text', 'Reference sample for ' + voice.name);
+      const uploadRes = await fetch(`${BACKEND_URL}/profiles/${voice.id}/samples`, {
+        method: 'POST',
+        body: form
+      });
+      if (!uploadRes.ok) {
+        const errData = await uploadRes.json().catch(() => ({}));
+        throw new Error(errData.detail || `Sample upload returned ${uploadRes.status}`);
+      }
+      host.notify({ kind: 'success', title: 'Sample Replaced',
+        message: `New reference sample added to "${voice.name}".` });
+      await fetchProfilesAndConfig();
+    } catch (err) {
+      host.notify({ kind: 'error', title: 'Replace Sample Failed',
+        message: err?.message || 'Could not upload sample.' });
+    } finally {
+      setReplacingSampleId(null);
+    }
+  }, []);
+
   // ── Clone a voice to Fish Audio (hosted) ──
   // For ANY cloned/preset voice in the list: pull its sample audio from the
   // local Voicebox backend, upload it to Fish, cache the id in config, and
@@ -2395,6 +2441,13 @@ function VoiceboxView() {
                               title: samplePlayingId === String(v.id) ? 'Stop sample' : `Play reference sample for “${v.name}”`,
                               onClick: () => handlePlaySample(v)
                             }, samplePlayingId === String(v.id) ? '⏹️ Stop' : '▶️ Play'),
+                            React.createElement(Button, {
+                              key: 'replace', variant: 'ghost', size: 'sm',
+                              className: 'text-muted-foreground hover:text-amber-400 hover:bg-amber-400/10',
+                              disabled: replacingSampleId === String(v.id),
+                              title: replacingSampleId === String(v.id) ? 'Uploading…' : `Replace reference sample for "${v.name}"`,
+                              onClick: () => handleReplaceSample(v)
+                            }, replacingSampleId === String(v.id) ? '🔄 …' : '🔄 Replace Sample'),
                             React.createElement(Button, {
                               key: 'fish', variant: 'ghost', size: 'sm',
                               className: 'text-muted-foreground hover:text-sky-400 hover:bg-sky-400/10',
