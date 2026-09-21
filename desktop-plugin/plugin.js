@@ -829,115 +829,45 @@ async function desktopConfigPutPersonality(systemPrompt, profile, { personaKey =
 /**
  * Apply a voice persona the Hermes-native way.
  *
- * IMPORTANT: gateway `config.set personality` ONLY accepts named keys from
- * `agent.personalities` (or none/default/neutral). Sending the full prompt
- * text always fails with "Unknown personality".
+ * Session-scoped only: uses config.set personality=<key> which is
+ * per-session, NOT a permanent write to agent.personality in config.yaml.
+ * This way switching voices changes persona for the current session
+ * without leaving stale persona references after a voice profile is deleted.
  *
- * Order:
- * 1) Resolve sample key (explicit / seed marker / voice name)
- * 2) config.set personality=<key>
- * 3) Desktop PUT registers key + system_prompt, then retry named set
- * 4) Last resort: config.set prompt=<text> (custom_prompt)
+ * If the new voice has no persona, clears any previously applied
+ * personality so the agent reverts to its default system prompt.
  */
 async function applyHermesPersona({ key, prompt, voiceName }) {
   const sessionId =
     typeof host.state?.activeSessionId?.get === 'function'
       ? host.state.activeSessionId.get()
       : null;
-  const hermesProfile = readActiveHermesProfile();
   const modes = [];
   const errors = [];
   const personaKey = resolvePersonaKey({ key, prompt, voiceName });
-  const cleanPrompt = displayPersonaPrompt(prompt) || prompt;
-  const sample = personaKey ? SAMPLE_VOICES.find((s) => s.key === personaKey) : null;
-  const systemPrompt = sample
-    ? samplePersonalityForHermes({ ...sample, personality: cleanPrompt || sample.personality })
-    : cleanPrompt;
 
-  if (!systemPrompt && !personaKey) {
-    throw new Error('No persona prompt or named key to apply');
-  }
-
-  let personalitySet = false;
-
-  if (personaKey) {
+  if (!personaKey) {
+    // Voice has no persona → clear any previously applied persona
+    // so the agent reverts to its default system prompt.
     try {
-      await configSetPersonality(personaKey, sessionId);
-      modes.push(`named:${personaKey}`);
-      personalitySet = true;
+      await configSetPersonality('default', sessionId);
+      modes.push('cleared:default');
     } catch (err) {
-      errors.push(`named:${err?.message || err}`);
-      console.warn('Named personality set skipped:', err);
+      console.warn('Persona clear skipped:', err);
     }
+    return { modes, errors, personaKey: null, sessionId, voiceName };
   }
 
-  if (!personalitySet) {
-    try {
-      const via = await desktopConfigPutPersonality(systemPrompt, hermesProfile, {
-        personaKey,
-      });
-      modes.push(via);
-      personalitySet = true;
-      if (personaKey) {
-        try {
-          await configSetPersonality(personaKey, sessionId);
-          modes.push(`named-retry:${personaKey}`);
-        } catch (err) {
-          errors.push(`named-retry:${err?.message || err}`);
-        }
-      }
-    } catch (err) {
-      errors.push(`desktop-put:${err?.message || err}`);
-      console.warn('Desktop PUT personality failed:', err);
-    }
-  }
-
-  if (!personalitySet && systemPrompt) {
-    // custom_prompt path — not a named personality, but still overlays tone.
-    try {
-      const payload = { key: 'prompt', value: systemPrompt };
-      if (sessionId) {
-        try {
-          await host.request('config.set', { ...payload, session_id: sessionId });
-        } catch (_) {
-          await host.request('config.set', payload);
-        }
-      } else {
-        await host.request('config.set', payload);
-      }
-      modes.push('custom_prompt');
-      personalitySet = true;
-    } catch (err) {
-      errors.push(`prompt:${err?.message || err}`);
-      console.warn('custom_prompt set failed:', err);
-    }
-  }
-
-  if (!personalitySet) {
+  try {
+    await configSetPersonality(personaKey, sessionId);
+    modes.push(`named:${personaKey}`);
+  } catch (err) {
+    errors.push(`named:${err?.message || err}`);
+    console.warn('Named personality set skipped:', err);
     throw new Error(
       `Hermes rejected persona update (${errors.join(' | ') || 'config.set personality'})`
     );
   }
-
-  // Named path already writes agent.system_prompt; still try when we only got
-  // custom_prompt / PUT so session overlay stays consistent.
-  if (!modes.some((m) => m.startsWith('named'))) {
-    try {
-      const payload = { key: 'agent.system_prompt', value: systemPrompt };
-      // May be rejected as unknown key on some builds — ignore.
-      if (sessionId) {
-        try {
-          await host.request('config.set', { ...payload, session_id: sessionId });
-        } catch (_) {
-          await host.request('config.set', payload);
-        }
-      } else {
-        await host.request('config.set', payload);
-      }
-      modes.push('agent.system_prompt');
-    } catch (err) {
-      console.warn('agent.system_prompt update skipped:', err);
-    }
   }
 
   return { sessionId, modes, voiceName, personaKey };

@@ -373,8 +373,33 @@ def _read_voice_id_from_json(path: str) -> str:
 
 
 def _read_local_active_voice() -> str:
-    """Per-profile binding / legacy sidecar under the active Hermes home."""
+    """Per-profile binding / legacy sidecar under the active Hermes home.
+
+    Prefer Hermes config.yaml (tts.providers.voicebox.voice) — that's what
+    the desktop plugin updates when you pick a voice. Fall back to the
+    legacy binding file only when config has no value, so a voice change
+    in the UI is reflected on the next TTS run without re-binding.
+    """
+    # 1) Prefer Hermes config.yaml (what the desktop plugin writes)
     home = _hermes_home()
+    cfg_path = os.path.join(home, "config.yaml")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        # Minimal YAML parse for `tts.providers.voicebox.voice: <value>`
+        import re
+        m = re.search(
+            r"tts:\s*\n(?:[ \t]*\S.*\n)*?[ \t]*providers:\s*\n(?:[ \t]*\S.*\n)*?[ \t]*voicebox:\s*\n(?:[ \t]*\S.*\n)*?[ \t]*voice:\s*(\S+)",
+            content,
+        )
+        if m:
+            vid = m.group(1).strip().strip("'\"")
+            if vid and vid.lower() not in _INVALID_VOICE_IDS:
+                return vid
+    except Exception:
+        pass
+
+    # 2) Legacy binding / sidecar fallback
     candidates = [
         os.path.join(home, "voicebox_binding.json"),
         os.path.join(home, "voicebox_active_voice.json"),
