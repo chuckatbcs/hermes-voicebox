@@ -868,7 +868,6 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
       `Hermes rejected persona update (${errors.join(' | ') || 'config.set personality'})`
     );
   }
-  }
 
   return { sessionId, modes, voiceName, personaKey };
 }
