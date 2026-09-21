@@ -60,7 +60,41 @@ Re-run the installer after Hermes Agent updates (those files get overwritten).
 
 ---
 
-## 💻 Installation & Quick Start
+## 🎭 Voice Cloning with Chatterbox (MIT-Commercial)
+
+Voicebox already ships with a Chatterbox backend — you just need to switch a profile to use it:
+
+### Why Chatterbox over Qwen?
+- **License**: MIT — safe for commercial products. Qwen is non-commercial (CPML).
+- **VRAM**: ~3.3 GB (fits alongside other GPU tasks). Qwen 1.7B needs 7+ GB.
+- **Voice quality**: Zero-shot cloning from ~5s of reference audio. Comparable to Qwen.
+
+### How to switch a profile
+1. In Voicebox → Profiles, edit a voice profile.
+2. Change the default engine from `qwen` to `chatterbox`.
+3. Upload reference audio if not already done.
+4. Test TTS — audio plays through Chatterbox.
+
+Or via API:
+```bash
+# Get profile
+curl -s http://127.0.0.1:17493/profiles/{profile-id} | python3 -c "
+import json,sys
+p = json.load(sys.stdin)
+print(f'Current engine: {p.get(\"default_engine\")}')
+p['default_engine'] = 'chatterbox'
+# PUT back
+"
+```
+
+### VRAM budget (RTX PRO 2000 8GB)
+| Engine | VRAM | Notes |
+|--------|------|-------|
+| Chatterbox | ~3.3 GB | MIT license, voice cloning ✅ |
+| Qwen 0.6B | ~2.5 GB | Non-commercial |
+| Qwen 1.7B | ~7.5 GB | Non-commercial, may OOM |
+| Kokoro | ~400 MB | Presets only, no cloning |
+| Fish Audio | 0 GB | Hosted, needs API key |
 
 **Full step-by-step guide (what gets installed, prerequisites, keys, troubleshooting): [`docs/INSTALL.md`](docs/INSTALL.md)**
 
