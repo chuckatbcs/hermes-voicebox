@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
 Hermes-Voicebox TTS Bridge
-Splits long text into sentence chunks, generates each via /generate/stream,
-concatenates the raw WAV data, and writes a single output file.
+Splits long text into sentence chunks, generates each via /generate/stream.
+
+Default mode: concatenates chunks into a single output file.
+Stream mode (--stream): writes a valid WAV stream to stdout so audio playback
+can begin as soon as the first chunk is generated.
+
+Performance optimizations:
+- Short texts (<200 chars) skip chunking (single request)
+- Profile metadata is cached for 5 minutes
+- Model preload on startup (warm first request)
 """
 import sys
 import os
@@ -522,6 +530,23 @@ def _post_stream(url: str, payload: dict, timeout: int) -> bytes:
         return r.read()
 
 
+def _post_stream_iter(url: str, payload: dict, timeout: int):
+    """Stream raw bytes from /generate/stream, yielding chunks as they arrive.
+
+    This allows the bridge to begin writing audio to stdout (or a pipe) before
+    the entire generation completes, enabling low-latency playback.
+    """
+    data = json.dumps(payload).encode("utf-8")
+    req  = urllib.request.Request(url, data=data,
+                                  headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        while True:
+            chunk = r.read(4096)
+            if not chunk:
+                break
+            yield chunk
+
+
 def _post_json(url: str, payload: dict, timeout: int = 60) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -817,8 +842,22 @@ def generate_wav(base_url: str, payload: dict, timeout: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Performance: Profile metadata cache (5 min TTL)
 # ---------------------------------------------------------------------------
+_PROFILE_CACHE: dict[str, tuple[dict, float]] = {}
+_PROFILE_CACHE_TTL = 300  # 5 minutes
+
+
+def _get_profile_cached(base_url: str, profile_id: str) -> dict:
+    """Get profile metadata with 5-minute cache to avoid extra HTTP round-trips."""
+    now = time.time()
+    if profile_id in _PROFILE_CACHE:
+        data, ts = _PROFILE_CACHE[profile_id]
+        if now - ts < _PROFILE_CACHE_TTL:
+            return data
+    data = _get_json(f"{base_url}/profiles/{profile_id}")
+    _PROFILE_CACHE[profile_id] = (data, now)
+    return data
 
 def _touch_tts_activity() -> None:
     """Stamp last TTS time so idle GPU unload knows when to free VRAM."""
@@ -834,8 +873,8 @@ def _touch_tts_activity() -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Hermes-Voicebox TTS Bridge")
-    parser.add_argument("--text-file", "-t", required=True, help="Path to temp text file")
-    parser.add_argument("--out",       "-o", required=True, help="Path to write output audio file")
+    parser.add_argument("--text-file", "-t", help="Path to temp text file")
+    parser.add_argument("--out",       "-o", help="Path to write output audio file")
     parser.add_argument("--voice",     "-v", help="Voice profile ID")
     parser.add_argument("--base-url",  "-b", default=None, help="Base URL of Voicebox API (e.g. http://127.0.0.1:17493)")
     parser.add_argument(
@@ -855,9 +894,42 @@ def main():
         default="jarvis",
         help="Cached-clone label to resolve a voice id from (~/.hermes/fish_voices.json).",
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream WAV audio to stdout instead of writing to --out (for low-latency playback).",
+    )
+    parser.add_argument(
+        "--preload",
+        action="store_true",
+        help="Preload the TTS model and exit (warm the GPU for subsequent requests).",
+    )
+    parser.add_argument(
+        "--skip-chars",
+        type=int,
+        default=200,
+        help="Skip chunking for texts shorter than this many chars (default: 200).",
+    )
     args = parser.parse_args()
 
     base_url = get_base_url(args.base_url)
+
+    # Handle preload mode (warm model, then exit)
+    if args.preload:
+        print("Preloading TTS model...", file=sys.stderr)
+        try:
+            _post_json(f"{base_url}/models/preload", {"engine": "chatterbox_turbo"}, timeout=120)
+            print("Model preloaded successfully", file=sys.stderr)
+            sys.exit(0)
+        except Exception as e:
+            print(f"Preload failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if not args.preload:
+        if not args.text_file:
+            parser.error("--text-file is required when not preloading")
+        if not args.stream and not args.out:
+            parser.error("--out is required when --stream is not specified")
 
     # 0. Read text
     try:
@@ -871,12 +943,16 @@ def main():
         # Hermes expects an output file; write a minimal valid silent WAV.
         print("Warning: Empty text, writing silent WAV.", file=sys.stderr)
         silent = _build_wav([b"\x00\x00" * 240], 24000, 1, 16)
-        try:
-            with open(args.out, "wb") as f:
-                f.write(silent)
-        except Exception as e:
-            print(f"Error writing silent output file: {e}", file=sys.stderr)
-            sys.exit(1)
+        if args.stream:
+            sys.stdout.buffer.write(silent)
+            sys.stdout.buffer.flush()
+        else:
+            try:
+                with open(args.out, "wb") as f:
+                    f.write(silent)
+            except Exception as e:
+                print(f"Error writing silent output file: {e}", file=sys.stderr)
+                sys.exit(1)
         sys.exit(0)
 
     # 0b. Hosted Fish Audio provider — no local Voicebox service required.
@@ -948,13 +1024,13 @@ def main():
         print(f"Error resolving fallback profile: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # 3. Resolve engine + language from profile metadata
+    # 3. Resolve engine + language from profile metadata (cached)
     engine = None
     model_size = None
     language = "en"
     profile = {}
     try:
-        profile = _get_json(f"{base_url}/profiles/{profile_id}")
+        profile = _get_profile_cached(base_url, profile_id)
         raw_engine = profile.get("default_engine") or profile.get("preset_engine")
         engine = normalize_engine(raw_engine)
         model_size = model_size_for_engine(raw_engine)
@@ -984,7 +1060,7 @@ def main():
     except Exception as e:
         print(f"Warning: could not fetch profile details ({e}), engine left unset.", file=sys.stderr)
 
-    # Strip stage directions / emphasis markup Qwen would otherwise speak aloud
+    # 5. Strip stage directions / emphasis markup Qwen would otherwise speak aloud
     # (e.g. [sarcastically], [whiny voice], (sighs dramatically)).
     cleaned = sanitize_spoken_text_for_voicebox(text, engine)
     if cleaned != text:
@@ -998,8 +1074,12 @@ def main():
         print("Error: text empty after stripping stage-direction markup.", file=sys.stderr)
         sys.exit(1)
 
-    # 4. Split text into chunks (sentence-isolated for clone engines)
-    chunks = split_tts_chunks(text, engine)
+    # 6. Split text into chunks (sentence-isolated for clone engines)
+    # For short texts, skip chunking entirely to avoid extra HTTP round-trips.
+    if len(text) <= args.skip_chars:
+        chunks = [text]
+    else:
+        chunks = split_tts_chunks(text, engine)
     n = len(chunks)
     print(
         f"Generating TTS for profile '{profile_id}' in {n} chunk(s)"
@@ -1007,9 +1087,13 @@ def main():
         file=sys.stderr,
     )
 
-    # 5. Generate each chunk
+    # 7. Generate each chunk
+    # In stream mode, write the WAV header and PCM data as each chunk
+    # completes, so playback begins after the first chunk instead of
+    # waiting for the entire response.
     wav_format = None   # (sample_rate, num_channels, bits_per_sample)
     pcm_segments = []
+    stream_header_written = False
 
     # Stamp before synthesis so idle-unload cannot race a long first request
     # after the idle threshold (daemon polls ~every 10s).
@@ -1101,29 +1185,60 @@ def main():
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            pcm_segments.append(raw[data_offset: data_offset + data_len])
+            pcm = raw[data_offset: data_offset + data_len]
+            pcm_segments.append(pcm)
         except ValueError:
             # Backend returned an error JSON instead of WAV — surface it
             print(f"Invalid WAV on chunk {i}: {raw[:200]}", file=sys.stderr)
             sys.exit(1)
 
-    # 6. Concatenate and write output
+        # Stream mode: write header + PCM immediately so playback can begin
+        if args.stream and not stream_header_written:
+            import struct as _struct
+            # Write WAV header with placeholder sizes (most players read to EOF)
+            header = _struct.pack(
+                '<4sI4s4sIHHIIHH4sI',
+                b'RIFF', 0x7FFFFFFF, b'WAVE',
+                b'fmt ', 16,
+                1,               # PCM
+                nc,
+                sr,
+                sr * nc * bps // 8,
+                nc * bps // 8,
+                bps,
+                b'data', 0x7FFFFFFF,
+            )
+            sys.stdout.buffer.write(header)
+            stream_header_written = True
+
+        if args.stream:
+            sys.stdout.buffer.write(pcm)
+            sys.stdout.buffer.flush()
+
+    # 6. Output
     if not pcm_segments:
         print("Error: No audio generated.", file=sys.stderr)
         sys.exit(1)
 
     sr, nc, bps = wav_format
-    output_wav  = _build_wav(pcm_segments, sr, nc, bps)
 
-    try:
-        with open(args.out, "wb") as f:
-            f.write(output_wav)
-        total_kb = len(output_wav) // 1024
-        print(f"Done — {total_kb}K WAV written to {args.out}", file=sys.stderr)
+    if args.stream:
+        # Streaming already happened in the loop above.
+        total_pcm = sum(len(p) for p in pcm_segments)
+        print(f"Done — streamed {total_pcm//1024}K WAV to stdout", file=sys.stderr)
         _touch_tts_activity()
-    except Exception as e:
-        print(f"Error writing output file: {e}", file=sys.stderr)
-        sys.exit(1)
+    else:
+        # File mode (default): concatenate and write a single output file.
+        output_wav = _build_wav(pcm_segments, sr, nc, bps)
+        try:
+            with open(args.out, "wb") as f:
+                f.write(output_wav)
+            total_kb = len(output_wav) // 1024
+            print(f"Done — {total_kb}K WAV written to {args.out}", file=sys.stderr)
+            _touch_tts_activity()
+        except Exception as e:
+            print(f"Error writing output file: {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":

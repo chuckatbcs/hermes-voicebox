@@ -792,9 +792,15 @@ function resolvePersonaKey({ key, prompt, voiceName }) {
   );
   if (fromPrompt) return fromPrompt[1].toLowerCase();
   const name = String(voiceName || '').trim().toLowerCase();
-  if (!name) return null;
+  // Check known sample voices first so defined sample keys (e.g. 'cartman' for 'Eric Cartman') take precedence
   const byName = SAMPLE_VOICES.find((s) => s.name.toLowerCase() === name);
-  return byName ? byName.key : null;
+  if (byName) return byName.key;
+  // For custom personas (e.g. Voldemort), generate a fallback key from the voice name
+  if (name) {
+    const slug = name.replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+    if (slug) return slug;
+  }
+  return null;
 }
 
 async function desktopConfigPutPersonality(systemPrompt, profile, { personaKey = null } = {}) {
@@ -856,6 +862,24 @@ async function applyHermesPersona({ key, prompt, voiceName }) {
       console.warn('Persona clear skipped:', err);
     }
     return { modes, errors, personaKey: null, sessionId, voiceName };
+  }
+
+  // For custom personas (not from SAMPLE_VOICES), write the persona text
+  // to agent.personalities so the gateway can resolve the key.
+  if (prompt && !key) {
+    try {
+      // Only write the personalities entry (not system_prompt)
+      const p = normalizeHermesProfile(readActiveHermesProfile());
+      await window.hermesDesktop.api({
+        path: '/api/config',
+        method: 'PUT',
+        body: { config: { agent: { personalities: { [personaKey]: prompt } } } },
+        profile: p,
+      });
+      modes.push('stored:custom');
+    } catch (err) {
+      console.warn('Persona storage failed:', err);
+    }
   }
 
   try {
@@ -1478,7 +1502,11 @@ function VoiceboxView() {
     setActiveProvider(provider);
     setProviderBusy(true);
     try {
-      const label = fishVoiceLabel || deriveFishLabel(activeVoiceName);
+      // Always derive the Fish label from the currently selected voice,
+      // not from a stale label. This prevents pinning to a previous voice
+      // (e.g. 'kitt') when switching providers after selecting a new voice.
+      const label = deriveFishLabel(activeVoiceName) || fishVoiceLabel || 'jarvis';
+      setFishVoiceLabel(label);
       await desktopConfigPutProvider(provider, label, fishApiKey, hermesProfile);
       host.notify({
         kind: 'success',
@@ -1534,7 +1562,7 @@ function VoiceboxView() {
     setFishKeyBusy(true);
     try {
       // Persist into the fish provider block so the bridge reads it after restart.
-      const label = fishVoiceLabel || deriveFishLabel(activeVoiceName);
+      const label = deriveFishLabel(activeVoiceName) || fishVoiceLabel || 'jarvis';
       await desktopConfigPutProvider(activeProvider, label, val || undefined, hermesProfile);
       if (val) {
         host.notify({

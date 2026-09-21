@@ -93,13 +93,34 @@ class TestResolveProfileId(unittest.TestCase):
 
         def get_json(url):
             calls.append(url)
-            raise AssertionError("should not fetch when CLI voice is set")
+            raise AssertionError("should not fetch when CLI voice is a valid UUID")
 
+        # UUID profile ID wins without any network calls
+        valid_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
         self.assertEqual(
-            resolve_profile_id("profile-123", "http://127.0.0.1:17493", get_json=get_json),
-            "profile-123",
+            resolve_profile_id(valid_uuid, "http://127.0.0.1:17493", get_json=get_json),
+            valid_uuid,
         )
         self.assertEqual(calls, [])
+
+    def test_cli_voice_name_resolves_via_profiles(self):
+        calls = []
+
+        def get_json(url):
+            calls.append(url)
+            if url.endswith("/profiles"):
+                return [
+                    {"id": "uuid-jarvis", "name": "Jarvis"},
+                    {"id": "uuid-cartman", "name": "Eric Cartman"},
+                ]
+            raise AssertionError(url)
+
+        # Name resolves to matching profile's UUID
+        self.assertEqual(
+            resolve_profile_id("Jarvis", "http://127.0.0.1:17493", get_json=get_json),
+            "uuid-jarvis",
+        )
+        self.assertEqual(calls, ["http://127.0.0.1:17493/profiles"])
 
     def test_binding_json_beats_active_voice(self):
         import os

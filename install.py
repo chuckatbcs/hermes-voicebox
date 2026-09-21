@@ -126,21 +126,29 @@ def normalize_tts_commands(
     out_lines: list[str] = []
     rewritten: list[str] = []
     changed = False
+    in_tts = ("tts:" not in text and MARKER_BEGIN not in text)
     for line in text.splitlines(keepends=True):
+        if line.startswith(MARKER_BEGIN):
+            in_tts = True
+        elif line.startswith(MARKER_END):
+            in_tts = False
+        elif line and not line[0].isspace() and not line.startswith("#"):
+            in_tts = line.startswith("tts:")
+
         m = _COMMAND_RE.match(line)
-        if not m or not needs_fix(m.group("value")):
+        if not in_tts or not m or not needs_fix(m.group("value")):
             out_lines.append(line)
             continue
         indent, sep, value = m.group("indent"), m.group("sep"), m.group("value")
         rewritten.append(value.strip())
         # Recover trailing args after the (possibly broken) bridge token.
         # Split off the launcher + first path token, keep the rest verbatim.
-        rest = value
+        rest = value.strip()
         # Drop a leading launcher word (python3 / py / python / py -3 …).
         rest = re.sub(r"^\s*(py\s+-3|python3|python)\b", "", rest).lstrip()
         # Drop the next path token (the broken or absolute bridge path).
         rest = re.sub(r"^\S+\.py\b", "", rest, count=1).lstrip()
-        new_value = fixed_prefix + rest
+        new_value = (fixed_prefix + rest).strip() + "\n"
         out_lines.append(f"{indent}command:{sep}{new_value}")
         changed = True
     if not changed:
@@ -355,6 +363,7 @@ def install_speak_stream_hook(hermes_root: Path) -> str:
     agent_tools = agent_dir / "tools"
     streaming_py = agent_tools / "tts_streaming.py"
     web_server_py = agent_dir / "hermes_cli" / "web_server.py"
+    audio_router_py = agent_dir / "hermes_cli" / "web_routers" / "audio.py"
     src = Path(__file__).resolve().parent / "scripts" / "hermes_voicebox_streamer.py"
     if not src.is_file():
         return "missing_src"
@@ -384,8 +393,9 @@ def install_speak_stream_hook(hermes_root: Path) -> str:
         )
 
     produce_action = "produce_skipped"
-    if web_server_py.is_file():
-        produce_action = _patch_speak_stream_produce(web_server_py)
+    target_router = audio_router_py if audio_router_py.is_file() else web_server_py
+    if target_router.is_file():
+        produce_action = _patch_speak_stream_produce(target_router)
 
     return f"{import_action}+{produce_action}"
 
