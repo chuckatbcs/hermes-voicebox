@@ -12,6 +12,60 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+def _prepare_hermes_tools_path() -> None:
+    """Import ``tools.tts_streaming`` from a local hermes-agent checkout when present.
+
+    GitHub-hosted runners do not have Hermes installed. The speak-stream module
+    only needs the base class and ``@register`` decorator at import time; the
+    assertions below exercise this repo's streamer, not the Hermes app. A
+    stand-in is installed only when no real checkout can be imported, so a
+    machine that has hermes-agent still runs against that class.
+    """
+    try:
+        import tools.tts_streaming  # noqa: F401
+        return
+    except ImportError:
+        pass
+    roots = []
+    for key in ("HERMES_HOME", "HERMES_DIR"):
+        value = os.environ.get(key)
+        if value:
+            roots.append(value)
+    roots.append(os.path.join(os.path.expanduser("~"), ".hermes"))
+    for root in roots:
+        agent = os.path.join(root, "hermes-agent")
+        if os.path.isfile(os.path.join(agent, "tools", "tts_streaming.py")) and agent not in sys.path:
+            sys.path.insert(0, agent)
+            try:
+                import tools.tts_streaming  # noqa: F401
+                return
+            except ImportError:
+                sys.path.remove(agent)
+    import types
+
+    tools_pkg = types.ModuleType("tools")
+    streaming = types.ModuleType("tools.tts_streaming")
+
+    class StreamingTTSProvider:
+        def __init__(self, config, section):
+            self.config = config
+            self.section = section or {}
+
+    def register(_name):
+        def deco(cls):
+            return cls
+
+        return deco
+
+    streaming.StreamingTTSProvider = StreamingTTSProvider
+    streaming.register = register
+    tools_pkg.tts_streaming = streaming
+    sys.modules["tools"] = tools_pkg
+    sys.modules["tools.tts_streaming"] = streaming
+
+
+_prepare_hermes_tools_path()
 import hermes_voicebox_streamer as s  # noqa: E402
 
 

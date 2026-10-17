@@ -161,7 +161,7 @@ python3 scripts/test_e2e_root_to_tip.py        # multi-profile E2E
 node --test desktop-plugin/test_plugin_storage.mjs
 ```
 
-CI runs the same suites on Windows (self-hosted runner) via `.github/workflows/cross-platform.yml`. Service-backend behavior (systemd / schtasks) is exercised on every host through mocked backends, per the repo's parity rules.
+CI runs the same suites on GitHub-hosted `windows-latest` (Python 3.10 and 3.12) via `.github/workflows/cross-platform.yml`. Service-backend behavior (systemd / schtasks) is exercised on every host through mocked backends, per the repo's parity rules.
 
 Live smoke test after install:
 
