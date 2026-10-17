@@ -77,7 +77,11 @@ jobs:
             $bad
             throw 'Fix with: git add --renormalize .'
           }
+          # git grep exits 1 when nothing matches. On GitHub-hosted
+          # powershell that leftover code fails the step after a clean tree.
+          if ($LASTEXITCODE -gt 1) { throw "git grep failed with exit $LASTEXITCODE" }
           Write-Host 'Line endings OK.'
+          exit 0
 
       - name: Fail if .gitattributes would renormalize the tree
         shell: powershell
@@ -91,3 +95,4 @@ jobs:
             throw 'Tree does not match .gitattributes.'
           }
           Write-Host 'Tree matches .gitattributes.'
+          exit 0
