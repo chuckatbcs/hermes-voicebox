@@ -150,13 +150,28 @@ def _adaptive_first_split(text: str) -> Iterator[str]:
 
 
 def _provider_section(tts_config: Dict, section: Dict) -> Dict:
-    """Prefer ``tts.providers.voicebox`` (command provider) over ``tts.voicebox``."""
+    """Prefer ``tts.providers.<name>`` (command provider) over ``tts.<name>``."""
     providers = tts_config.get("providers") if isinstance(tts_config, dict) else None
     if isinstance(providers, dict):
-        named = providers.get("voicebox")
+        named = providers.get("fish") if "fish" in (providers or {}) else None
         if isinstance(named, dict) and named:
             return named
     return section if isinstance(section, dict) else {}
+
+
+def _fish_tts_module():
+    """Import the deployed fish_tts helper (all-homes cache/key scanning)."""
+    import sys
+
+    for cand in (
+        os.path.join(os.path.expanduser("~"), ".hermes", "scripts"),
+        os.path.join(os.environ.get("HERMES_HOME", ""), "scripts"),
+    ):
+        if cand and cand not in sys.path and os.path.isdir(cand):
+            sys.path.insert(0, cand)
+    import fish_tts
+
+    return fish_tts
 
 
 @register("voicebox")
@@ -230,6 +245,100 @@ class VoiceboxCommandStreamer(StreamingTTSProvider):
                 os.unlink(path)
             except OSError:
                 pass
+
+
+@register("fish")
+class FishStreamer(StreamingTTSProvider):
+    """Fish Audio (hosted) → sentence-chunked int16 mono PCM.
+
+    Fish has no chunked streaming API, but the speak-stream producer calls
+    ``stream()`` per sentence with one-sentence look-ahead, so each sentence
+    is synthesized while the previous one plays — the same latency win as
+    the local Voicebox path, without waiting for the whole reply.
+    """
+
+    sample_rate = 24000
+    channels = 1
+
+    # Fish returns mp3/wav; we request wav at a rate we can feed directly.
+    _FISH_SAMPLE_RATE = 44100
+
+    def __init__(self, tts_config: Dict, section: Dict):
+        resolved = _provider_section(tts_config, section)
+        super().__init__(tts_config, resolved)
+        self._voice_id = (resolved or {}).get("voice")
+        self._label = (resolved or {}).get("provider_label") or "fish"
+        clones = (resolved or {}).get("clones") or {}
+        # voice may be a label ("jarvis") that maps to an id via clones,
+        # or already a 32-hex Fish model id.
+        v = self._voice_id
+        if v and clones.get(str(v)) and not (len(str(v)) == 32 and all(c in "0123456789abcdef" for c in str(v).lower())):
+            self._voice_id = str(clones[str(v)])
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            return bool(_fish_tts_module().load_fish_key())
+        except Exception:
+            return False
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return
+        ft = _fish_tts_module()
+        key = ft.load_fish_key()
+        if not key:
+            raise RuntimeError("Fish Audio key missing")
+        audio = ft.synthesize(
+            text=cleaned,
+            voice_id=self._voice_id,
+            api_key=key,
+            audio_format="wav",
+            sample_rate=self._FISH_SAMPLE_RATE,
+        )
+        import io
+
+        import wave as _wave
+
+        with _wave.open(io.BytesIO(audio), "rb") as wf:
+            rate = wf.getframerate()
+            width = wf.getsampwidth()
+            channels = wf.getnchannels()
+            raw = wf.readframes(wf.getnframes())
+        if width != 2:
+            raise RuntimeError(f"Unsupported Fish WAV sample width: {width}")
+        pcm = raw
+        if channels == 2:
+            pcm = _stereo_int16_to_mono(raw)
+        elif channels != 1:
+            raise RuntimeError(f"Unsupported Fish WAV channels: {channels}")
+        if rate != self.sample_rate:
+            pcm = _resample_int16(pcm, rate, self.sample_rate)
+        # One blob per sentence — the producer starts the next request
+        # immediately instead of pacing on tiny frames.
+        yield pcm
+
+
+def _resample_int16(data: bytes, src_rate: int, dst_rate: int) -> bytes:
+    """Linear-interpolation resampler for int16 mono PCM (stdlib only)."""
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(data)
+    n = len(samples)
+    if n == 0 or src_rate == dst_rate:
+        return data
+    out_len = round(n * dst_rate / src_rate)
+    out = array.array("h", bytes(2 * out_len))
+    step = (n - 1) / max(out_len - 1, 1)
+    for i in range(out_len):
+        pos = i * step
+        i0 = int(pos)
+        frac = pos - i0
+        i1 = min(i0 + 1, n - 1)
+        out[i] = int(samples[i0] * (1 - frac) + samples[i1] * frac)
+    return out.tobytes()
 
 
 def synthesize_pcm_bytes(streamer: StreamingTTSProvider, text: str) -> bytes:

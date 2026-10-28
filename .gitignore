@@ -9,3 +9,21 @@ voicebox_gpu.json
 voicebox_gpu_control.port
 voicebox_tts_activity
 *.snippet.yaml
+
+# Accidental local HERMES_HOME snapshots / stray literal "$HOME" dirs
+# (contain config.yaml, .env, fish_key.txt, state.db, logs — never commit).
+$HOME/
+.hermes/
+
+# Secrets and credentials
+fish_key.txt
+fish_voices.json
+.env
+.env.*
+!.env.example
+auth.lock
+state.db
+
+# Local logs / caches
+logs/
+cache/

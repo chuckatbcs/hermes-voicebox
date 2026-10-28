@@ -346,7 +346,17 @@ def main() -> int:
         if r.returncode == 0:
             c.ok("faster-whisper", r.stdout.strip())
         else:
-            c.fail("faster-whisper", "not installed in Hermes venv (STT will fail)")
+            # Optional dependency: only a hard failure if STT is enabled in config.
+            stt_enabled = False
+            for cfg in (Path.home() / ".hermes" / "config.yaml",):
+                try:
+                    stt_enabled = "stt:" in cfg.read_text(encoding="utf-8") and "enabled: true" in cfg.read_text(encoding="utf-8")
+                except OSError:
+                    pass
+            if stt_enabled:
+                c.fail("faster-whisper", "not installed in Hermes venv (STT enabled in config)")
+            else:
+                c.skip("faster-whisper", "not installed; STT not enabled in config")
     else:
         c.skip("faster-whisper", "no ~/.hermes/hermes-agent venv in this environment")
 

@@ -792,9 +792,15 @@ function resolvePersonaKey({ key, prompt, voiceName }) {
   );
   if (fromPrompt) return fromPrompt[1].toLowerCase();
   const name = String(voiceName || '').trim().toLowerCase();
-  if (!name) return null;
+  // Check known sample voices first so defined sample keys (e.g. 'cartman' for 'Eric Cartman') take precedence
   const byName = SAMPLE_VOICES.find((s) => s.name.toLowerCase() === name);
-  return byName ? byName.key : null;
+  if (byName) return byName.key;
+  // For custom personas (e.g. Voldemort), generate a fallback key from the voice name
+  if (name) {
+    const slug = name.replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+    if (slug) return slug;
+  }
+  return null;
 }
 
 async function desktopConfigPutPersonality(systemPrompt, profile, { personaKey = null } = {}) {
@@ -829,115 +835,62 @@ async function desktopConfigPutPersonality(systemPrompt, profile, { personaKey =
 /**
  * Apply a voice persona the Hermes-native way.
  *
- * IMPORTANT: gateway `config.set personality` ONLY accepts named keys from
- * `agent.personalities` (or none/default/neutral). Sending the full prompt
- * text always fails with "Unknown personality".
+ * Session-scoped only: uses config.set personality=<key> which is
+ * per-session, NOT a permanent write to agent.personality in config.yaml.
+ * This way switching voices changes persona for the current session
+ * without leaving stale persona references after a voice profile is deleted.
  *
- * Order:
- * 1) Resolve sample key (explicit / seed marker / voice name)
- * 2) config.set personality=<key>
- * 3) Desktop PUT registers key + system_prompt, then retry named set
- * 4) Last resort: config.set prompt=<text> (custom_prompt)
+ * If the new voice has no persona, clears any previously applied
+ * personality so the agent reverts to its default system prompt.
  */
 async function applyHermesPersona({ key, prompt, voiceName }) {
   const sessionId =
     typeof host.state?.activeSessionId?.get === 'function'
       ? host.state.activeSessionId.get()
       : null;
-  const hermesProfile = readActiveHermesProfile();
   const modes = [];
   const errors = [];
   const personaKey = resolvePersonaKey({ key, prompt, voiceName });
-  const cleanPrompt = displayPersonaPrompt(prompt) || prompt;
-  const sample = personaKey ? SAMPLE_VOICES.find((s) => s.key === personaKey) : null;
-  const systemPrompt = sample
-    ? samplePersonalityForHermes({ ...sample, personality: cleanPrompt || sample.personality })
-    : cleanPrompt;
 
-  if (!systemPrompt && !personaKey) {
-    throw new Error('No persona prompt or named key to apply');
-  }
-
-  let personalitySet = false;
-
-  if (personaKey) {
+  if (!personaKey) {
+    // Voice has no persona → clear any previously applied persona
+    // so the agent reverts to its default system prompt.
     try {
-      await configSetPersonality(personaKey, sessionId);
-      modes.push(`named:${personaKey}`);
-      personalitySet = true;
+      await configSetPersonality('default', sessionId);
+      modes.push('cleared:default');
     } catch (err) {
-      errors.push(`named:${err?.message || err}`);
-      console.warn('Named personality set skipped:', err);
+      console.warn('Persona clear skipped:', err);
     }
+    return { modes, errors, personaKey: null, sessionId, voiceName };
   }
 
-  if (!personalitySet) {
+  // For custom personas (not from SAMPLE_VOICES), write the persona text
+  // to agent.personalities so the gateway can resolve the key.
+  if (prompt && !key) {
     try {
-      const via = await desktopConfigPutPersonality(systemPrompt, hermesProfile, {
-        personaKey,
+      // Only write the personalities entry (not system_prompt)
+      const p = normalizeHermesProfile(readActiveHermesProfile());
+      await window.hermesDesktop.api({
+        path: '/api/config',
+        method: 'PUT',
+        body: { config: { agent: { personalities: { [personaKey]: prompt } } } },
+        profile: p,
       });
-      modes.push(via);
-      personalitySet = true;
-      if (personaKey) {
-        try {
-          await configSetPersonality(personaKey, sessionId);
-          modes.push(`named-retry:${personaKey}`);
-        } catch (err) {
-          errors.push(`named-retry:${err?.message || err}`);
-        }
-      }
+      modes.push('stored:custom');
     } catch (err) {
-      errors.push(`desktop-put:${err?.message || err}`);
-      console.warn('Desktop PUT personality failed:', err);
+      console.warn('Persona storage failed:', err);
     }
   }
 
-  if (!personalitySet && systemPrompt) {
-    // custom_prompt path — not a named personality, but still overlays tone.
-    try {
-      const payload = { key: 'prompt', value: systemPrompt };
-      if (sessionId) {
-        try {
-          await host.request('config.set', { ...payload, session_id: sessionId });
-        } catch (_) {
-          await host.request('config.set', payload);
-        }
-      } else {
-        await host.request('config.set', payload);
-      }
-      modes.push('custom_prompt');
-      personalitySet = true;
-    } catch (err) {
-      errors.push(`prompt:${err?.message || err}`);
-      console.warn('custom_prompt set failed:', err);
-    }
-  }
-
-  if (!personalitySet) {
+  try {
+    await configSetPersonality(personaKey, sessionId);
+    modes.push(`named:${personaKey}`);
+  } catch (err) {
+    errors.push(`named:${err?.message || err}`);
+    console.warn('Named personality set skipped:', err);
     throw new Error(
       `Hermes rejected persona update (${errors.join(' | ') || 'config.set personality'})`
     );
-  }
-
-  // Named path already writes agent.system_prompt; still try when we only got
-  // custom_prompt / PUT so session overlay stays consistent.
-  if (!modes.some((m) => m.startsWith('named'))) {
-    try {
-      const payload = { key: 'agent.system_prompt', value: systemPrompt };
-      // May be rejected as unknown key on some builds — ignore.
-      if (sessionId) {
-        try {
-          await host.request('config.set', { ...payload, session_id: sessionId });
-        } catch (_) {
-          await host.request('config.set', payload);
-        }
-      } else {
-        await host.request('config.set', payload);
-      }
-      modes.push('agent.system_prompt');
-    } catch (err) {
-      console.warn('agent.system_prompt update skipped:', err);
-    }
   }
 
   return { sessionId, modes, voiceName, personaKey };
@@ -1099,6 +1052,9 @@ function VoiceboxView() {
   const [audioBlob, setAudioBlob]         = useState(null);
   const [audioDuration, setAudioDuration] = useState(null);
   const [isSaving, setIsSaving]           = useState(false);
+  const [samplePlayingId, setSamplePlayingId] = useState(null);
+  const samplePlaybackRef = useRef(null);
+  const [replacingSampleId, setReplacingSampleId] = useState(null);
   const [isPlaying, setIsPlaying]         = useState(false);
   const [fishCloneBusy, setFishCloneBusy] = useState(false);
   const [fishCloningId, setFishCloningId] = useState(null);
@@ -1546,7 +1502,11 @@ function VoiceboxView() {
     setActiveProvider(provider);
     setProviderBusy(true);
     try {
-      const label = fishVoiceLabel || deriveFishLabel(activeVoiceName);
+      // Always derive the Fish label from the currently selected voice,
+      // not from a stale label. This prevents pinning to a previous voice
+      // (e.g. 'kitt') when switching providers after selecting a new voice.
+      const label = deriveFishLabel(activeVoiceName) || fishVoiceLabel || 'jarvis';
+      setFishVoiceLabel(label);
       await desktopConfigPutProvider(provider, label, fishApiKey, hermesProfile);
       host.notify({
         kind: 'success',
@@ -1602,7 +1562,7 @@ function VoiceboxView() {
     setFishKeyBusy(true);
     try {
       // Persist into the fish provider block so the bridge reads it after restart.
-      const label = fishVoiceLabel || deriveFishLabel(activeVoiceName);
+      const label = deriveFishLabel(activeVoiceName) || fishVoiceLabel || 'jarvis';
       await desktopConfigPutProvider(activeProvider, label, val || undefined, hermesProfile);
       if (val) {
         host.notify({
@@ -1848,6 +1808,106 @@ function VoiceboxView() {
       setIsDeleting(false);
     }
   };
+
+  // ── Play voice sample audio ───────────────────
+  // Each voice card gets a play button that fetches the reference sample from
+  // Voicebox (/profiles/{id}/samples → /samples/{id}) and plays it. Tapping
+  // again stops it.
+  const stopSamplePlayback = useCallback(() => {
+    if (samplePlaybackRef.current) {
+      try {
+        samplePlaybackRef.current.pause();
+        samplePlaybackRef.current.src = '';
+      } catch (_) {}
+      samplePlaybackRef.current = null;
+    }
+    setSamplePlayingId(null);
+  }, []);
+
+  const handlePlaySample = useCallback(async (voice) => {
+    if (!voice) return;
+    // Toggle off if same voice is playing
+    if (samplePlayingId === String(voice.id)) {
+      stopSamplePlayback();
+      return;
+    }
+    stopSamplePlayback();
+    try {
+      const samples = await apiFetch(`/profiles/${voice.id}/samples`).catch(() => []);
+      const list = Array.isArray(samples) ? samples : (samples.samples || samples.items || []);
+      const sample = list[0];
+      if (!sample || !sample.id) {
+        throw new Error(`No reference sample for "${voice.name}".`);
+      }
+      const audioRes = await fetch(`${BACKEND_URL}/samples/${sample.id}`);
+      if (!audioRes.ok) throw new Error(`Sample fetch failed (${audioRes.status}).`);
+      const blob = await audioRes.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      samplePlaybackRef.current = audio;
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        setSamplePlayingId(null);
+        samplePlaybackRef.current = null;
+      };
+      audio.onerror = () => {
+        URL.revokeObjectURL(url);
+        setSamplePlayingId(null);
+        samplePlaybackRef.current = null;
+      };
+      setSamplePlayingId(String(voice.id));
+      await audio.play();
+    } catch (err) {
+      host.notify({ kind: 'warning', title: 'Play Sample Failed',
+        message: err?.message || 'Could not load sample audio.' });
+      stopSamplePlayback();
+    }
+  }, [samplePlayingId, stopSamplePlayback]);
+
+  // ── Replace voice sample ──────────────────────
+  // Voicebox only supports appending samples (no DELETE endpoint), so
+  // "replace" uploads a new sample that gets mixed with existing ones
+  // for TTS. The new sample becomes the primary reference.
+  const handleReplaceSample = useCallback(async (voice) => {
+    if (!voice) return;
+    if (!window.hermesDesktop?.selectPaths || !window.hermesDesktop?.readFileDataUrl) {
+      host.notify({ kind: 'error', title: 'Upload Unsupported',
+        message: 'Desktop file API is unavailable.' });
+      return;
+    }
+    setReplacingSampleId(String(voice.id));
+    try {
+      const paths = await window.hermesDesktop.selectPaths({
+        properties: ['openFile'],
+        filters: [{ name: 'Audio Files', extensions: ['wav', 'mp3', 'm4a', 'ogg', 'flac', 'aac', 'webm', 'opus'] }]
+      });
+      if (!paths || !paths.length) return;
+      const filePath = paths[0];
+      const dataUrl = await window.hermesDesktop.readFileDataUrl(filePath);
+      // Convert data URL to Blob
+      const res = await fetch(dataUrl);
+      const blob = await res.blob();
+      const form = new FormData();
+      form.append('file', blob, filePath.split(/[/\\]/).pop() || 'sample.wav');
+      form.append('reference_text', 'Reference sample for ' + voice.name);
+      const uploadRes = await fetch(`${BACKEND_URL}/profiles/${voice.id}/samples`, {
+        method: 'POST',
+        body: form
+      });
+      if (!uploadRes.ok) {
+        const errData = await uploadRes.json().catch(() => ({}));
+        throw new Error(errData.detail || `Sample upload returned ${uploadRes.status}`);
+      }
+      host.notify({ kind: 'success', title: 'Sample Replaced',
+        message: `New reference sample added to "${voice.name}".` });
+      await fetchProfilesAndConfig();
+    } catch (err) {
+      host.notify({ kind: 'error', title: 'Replace Sample Failed',
+        message: err?.message || 'Could not upload sample.' });
+    } finally {
+      setReplacingSampleId(null);
+    }
+  }, []);
 
   // ── Clone a voice to Fish Audio (hosted) ──
   // For ANY cloned/preset voice in the list: pull its sample audio from the
@@ -2332,6 +2392,19 @@ function VoiceboxView() {
                             }, 'Cancel')
                           ]
                         : [
+                            React.createElement(Button, {
+                              key: 'play', variant: 'ghost', size: 'sm',
+                              className: 'text-muted-foreground hover:text-green-400 hover:bg-green-400/10',
+                              title: samplePlayingId === String(v.id) ? 'Stop sample' : `Play reference sample for “${v.name}”`,
+                              onClick: () => handlePlaySample(v)
+                            }, samplePlayingId === String(v.id) ? '⏹️ Stop' : '▶️ Play'),
+                            React.createElement(Button, {
+                              key: 'replace', variant: 'ghost', size: 'sm',
+                              className: 'text-muted-foreground hover:text-amber-400 hover:bg-amber-400/10',
+                              disabled: replacingSampleId === String(v.id),
+                              title: replacingSampleId === String(v.id) ? 'Uploading…' : `Replace reference sample for "${v.name}"`,
+                              onClick: () => handleReplaceSample(v)
+                            }, replacingSampleId === String(v.id) ? '🔄 …' : '🔄 Replace Sample'),
                             React.createElement(Button, {
                               key: 'fish', variant: 'ghost', size: 'sm',
                               className: 'text-muted-foreground hover:text-sky-400 hover:bg-sky-400/10',
