@@ -13,7 +13,7 @@ on:
 jobs:
   test:
     name: Windows / py${{ matrix.python }}
-    runs-on: windows-latest
+    runs-on: [self-hosted, local-windows]
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +64,7 @@ jobs:
   line-endings:
     name: line-ending hygiene
     continue-on-error: true
-    runs-on: windows-latest
+    runs-on: [self-hosted, local-windows]
     steps:
       - uses: actions/checkout@v4
 
