@@ -156,6 +156,20 @@ Both:
   `.github/workflows/cross-platform.yml`, including a line-ending hygiene job.
 - Manual sanity review of plugin fetch/error paths when UI tests are unavailable
 
+### Required agent-skill gates
+
+Before opening a pull request, run these Hermes skills against the branch diff
+and record their verdict in the PR body under "Validation":
+
+- `requesting-code-review` — pre-commit review: security scan, quality gates,
+  auto-fix. Applies to every change.
+- `hermes-security:security-audit` — threat model and audit. **Required** for any
+  change touching the installer, the localhost control API, voice credential
+  storage, or cross-platform service definitions.
+
+A gate that fails or is skipped must be stated in the PR with the reason. Do not
+merge with an unaddressed critical finding.
+
 ## Stop conditions
 
 Stop and ask for authorization when work would:
